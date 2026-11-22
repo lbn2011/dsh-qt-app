@@ -12,6 +12,13 @@
 // window-level `themeChanged` broadcast that the settings UI (t17) and any
 // imperative code can hook into.
 //
+// Phase 2l connects the window to the Node host. `dshQt` is now a QObject
+// (DshQtBridge in native/main.cpp), so the window can *ask* for things instead
+// of only reading constants: composing a turn, parsing Markdown into the AST the
+// message delegate renders, and persisting settings all travel through it and
+// come back as signals. Nothing in this file waits for a reply — the composer
+// appends optimistically and corrects itself on `deliveryReported`.
+//
 // Phase 2h mounts the settings pane in a right-hand Drawer (SettingsPanel.qml):
 // the sidebar's footer button, the session header's gear and `Ctrl+,` all open
 // it, and the theme controls
@@ -47,6 +54,25 @@ ApplicationWindow {
 
     /** Active scheme id, mirrored for bindings that only need the name. */
     readonly property string themeId: theme.themeId
+
+    /**
+     * The Node bridge (`dshQt`), or null outside the native host.
+     *
+     * qmltestrunner and qmllint have no `dshQt` context property, so every use
+     * is guarded: the window must stay fully usable without Node, just with local
+     * echo instead of a real reply.
+     */
+    // qmllint disable unqualified
+    readonly property QtObject qtBridge: (typeof dshQt !== "undefined" && dshQt !== null
+                                          && typeof dshQt.request === "function") ? dshQt : null
+    // qmllint enable unqualified
+
+    /** True when the host is listening for requests on its stdio transport. */
+    readonly property bool nodeConnected: window.qtBridge !== null
+                                          && window.qtBridge.transportState === "connected"
+
+    /** Delivery request id → model row, so a late verdict finds its message. */
+    property var pendingSends: ({})
 
     /**
      * Broadcast after the palette has been swapped.
@@ -103,12 +129,82 @@ ApplicationWindow {
         const body = String(text).trim()
         if (body === "")
             return
-        chatModel.appendUserMessage(body)
+        const index = chatModel.appendUserMessage(body)
+        // The composer already handed the turn to Node; remember which row its
+        // verdict belongs to. `lastRequestId` is set before `send` is emitted.
+        const requestId = String(messageInput.lastRequestId)
+        if (requestId !== "") {
+            chatModel.updateMessage(index, body, window.nodeConnected)
+            window.pendingSends[requestId] = index
+        }
         session.messageCount = chatModel.count
         if (!session.hasSession) {
             session.title = body.length > 40 ? body.slice(0, 40) + "…" : body
             sessionIndexModel.append({ "title": session.title })
         }
+    }
+
+    /**
+     * Settle an optimistic send.
+     *
+     * The row was appended immediately; here it either loses its pending flag or
+     * gains a system note saying delivery failed. Silently dropping the failure
+     * would leave a message that looks sent but never was.
+     */
+    function finishSend(id, text, accepted, error) {
+        const row = window.pendingSends[id]
+        if (row === undefined)
+            return
+        delete window.pendingSends[id]
+        if (accepted) {
+            chatModel.updateMessage(row, String(text), false)
+            return
+        }
+        chatModel.updateMessage(row, String(text), false)
+        chatModel.appendSystemMessage(qsTr("Delivery failed: ") + (error !== "" ? error : qsTr("no reply")))
+        session.messageCount = chatModel.count
+    }
+
+    /**
+     * Apply a scheme mode through the bridge.
+     *
+     * The settings pane already wrote to `ctx.theme` for the instant repaint;
+     * this call additionally announces the change to Node (so plugins and the
+     * persisted file agree) and resolves "auto" against the platform scheme.
+     */
+    function applyThemeMode(mode) {
+        if (window.qtBridge !== null) {
+            window.qtBridge.applyTheme(String(mode))
+            return
+        }
+        if (theme.bridge !== null && String(mode) !== "auto")
+            theme.bridge.themeId = String(mode)
+    }
+
+    /** Apply a font scale through the bridge; the host clamps to 0.8 … 1.5. */
+    function applyFontScale(scale) {
+        if (window.qtBridge !== null) {
+            window.qtBridge.setFontScale(Number(scale))
+            return
+        }
+        if (theme.bridge !== null)
+            theme.bridge.fontScale = Number(scale)
+    }
+
+    /**
+     * Settings catalogue for the forms in the pane.
+     *
+     * Left null on purpose: a QML-side descriptor object would have to be pushed
+     * from Node, and until that exists the forms use the fallback descriptors they
+     * ship with (`ThemeForm.fallbackFields`, …). Edits still reach the store
+     * through `saveSetting()`, so this is a display-only gap, not a write-path one.
+     */
+    readonly property var settingsBridge: null
+
+    /** Persist one setting; the schema is validated on the Node side. */
+    function saveSetting(name, value) {
+        if (window.qtBridge !== null)
+            window.qtBridge.saveSetting(String(name), value)
     }
 
     /** Start over: drop the conversation and reset the session metadata. */
@@ -140,6 +236,7 @@ ApplicationWindow {
         objectName: "chatView"
         theme: theme
         messageModel: chatModel
+        qtBridge: window.qtBridge
         title: session.title
         status: session.status
         modelName: session.model
@@ -149,6 +246,44 @@ ApplicationWindow {
         anchors.bottom: messageInput.top
         onNewSessionRequested: window.newSession()
         onSettingsRequested: settingsDrawer.open()
+        onMarkdownParsed: function (index, document, error) {
+            if (error !== "" && error !== undefined)
+                console.warn("markdown parse failed for row", index, ":", error)
+        }
+        Component.onCompleted: window.requestRenderedBody()
+    }
+
+    /**
+     * Parse the turns that have no Markdown yet.
+     *
+     * Deliberately not called for every keystroke: `sendMessage()` appends the
+     * row and the delegate already shows its plain text, so parsing can happen
+     * whenever it is cheapest. Rows that already carry a document are skipped.
+     */
+    function requestRenderedBody() {
+        if (chatView === null || !window.nodeConnected)
+            return
+        chatView.requestMarkdownForAll()
+    }
+
+    /**
+     * Mirror the settings pane's own edits into the bridge.
+     *
+     * The pane writes `ctx.theme` first for an instant repaint; these handlers
+     * additionally announce the change through `dshQt` so Node persists the same
+     * value and "auto" resolves against the platform scheme.
+     */
+    Connections {
+        target: settingsPanel.themeSettings
+        ignoreUnknownSignals: true
+
+        function onSchemeApplied(mode) {
+            window.applyThemeMode(mode)
+        }
+
+        function onFontScaleApplied(scale) {
+            window.applyFontScale(scale)
+        }
     }
 
     MessageInput {
@@ -159,8 +294,12 @@ ApplicationWindow {
         anchors.left: sidebar.right
         anchors.right: parent.right
         anchors.bottom: parent.bottom
+        qtBridge: window.qtBridge
         onSend: function (text) {
             window.sendMessage(text)
+        }
+        onDeliveryReported: function (id, text, accepted, error) {
+            window.finishSend(id, text, accepted, error)
         }
     }
 
@@ -189,6 +328,10 @@ ApplicationWindow {
             objectName: "settingsPanelMount"
             anchors.fill: parent
             theme: theme
+            settingsBridge: window.settingsBridge
+            onSettingEdited: function (name, value) {
+                window.saveSetting(name, value)
+            }
             onCloseRequested: settingsDrawer.close()
         }
     }

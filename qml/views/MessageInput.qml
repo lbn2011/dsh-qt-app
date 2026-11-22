@@ -3,6 +3,14 @@
 // Emits `send(text)` when the user submits; it deliberately does not touch the
 // model itself, so the same component works in main.qml (wired to the session)
 // and in the Qt Quick Test suite (wired to a SignalSpy).
+//
+// Phase 2l hands the composed turn to the Node host: `submit()` asks `dshQt`
+// (the DshQtBridge QObject published by native/main.cpp) to deliver the message
+// and remembers the request id, then emits `send` so the window can append the
+// turn locally at once. The delivery verdict arrives asynchronously on
+// `deliveryReported`; sending stays optimistic because the user must see their
+// own text immediately, and a failure corrects the record afterwards instead of
+// freezing the composer on a round trip.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -32,10 +40,39 @@ Rectangle {
     /** Placeholder text of the editor. */
     property string placeholder: qsTr("Send a message…")
 
+    /**
+     * The Node bridge, or null when no host is attached.
+     *
+     * Injected by main.qml; it stays null under qmltestrunner, which is exactly
+     * why `submit()` still works without it.
+     */
+    property QtObject qtBridge: null
+
+    /** Id of the most recent delivery request, or "". */
+    readonly property string lastRequestId: internal.lastRequestId
+
+    /** Asynchronous verdict for the turn submitted most recently. */
+    signal deliveryReported(string id, string text, bool accepted, string error)
+
     /** Emitted with the trimmed message body. */
     signal send(string text)
 
     readonly property bool canSend: !messageInput.busy && messageInput.text.trim() !== ""
+
+    QtObject {
+        id: internal
+
+        property string lastRequestId: ""
+    }
+
+    Connections {
+        target: messageInput.qtBridge
+        ignoreUnknownSignals: true
+
+        function onMessageSent(id, text, accepted, error) {
+            messageInput.deliveryReported(id, text, accepted, error)
+        }
+    }
 
     implicitHeight: theme.composerHeight
     color: theme.surface
@@ -46,6 +83,11 @@ Rectangle {
         if (messageInput.busy || body === "")
             return
         messageInput.text = ""
+        // Id first, then the signal: the window maps the request id to the model
+        // row inside its `onSend` handler, so the id must be readable by then.
+        internal.lastRequestId = messageInput.qtBridge !== null
+                ? String(messageInput.qtBridge.sendMessage(body))
+                : ""
         messageInput.send(body)
     }
 

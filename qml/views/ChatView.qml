@@ -27,6 +27,19 @@ Rectangle {
     // qmllint enable unqualified
     property Theme theme: Theme { bridge: themeBridge }
     /** Message model to render; null renders the empty state only. */
+    /**
+     * The Node bridge (`dshQt`), or null when no host is attached.
+     *
+     * ChatView parses Markdown through it: the AST the message delegate renders
+     * cannot be produced in QML, so the text is sent to Node and the reply is
+     * attached to the model row. Null is a supported state — the delegate falls
+     * back to the plain-text body.
+     */
+    property QtObject qtBridge: null
+
+    /** In-flight parse requests, `request id → model row`. */
+    readonly property var pendingParses: internal.pendingParses
+
     property ListModel messageModel: null
 
     // Re-exported header state so main.qml wires a single source of truth.
@@ -133,6 +146,106 @@ Rectangle {
         for (let position = 0; position < ids.length; ++position)
             copy.push(ids[position])
         chatView.streamBlockIds[index] = copy
+    }
+
+    /** Emitted once a Node-side parse produced a renderable document. */
+    signal markdownParsed(int index, var document, string error)
+
+    /** Emitted once Node rendered a message to HTML (used for export/copy). */
+    signal markdownRendered(string id, string html, string error)
+
+    /** Emitted once Node highlighted a code block. */
+    signal codeHighlighted(string id, string markup, string error)
+
+    QtObject {
+        id: internal
+
+        property var pendingParses: ({})
+        property var pendingRenders: ({})
+        property var pendingHighlights: ({})
+    }
+
+    Connections {
+        target: chatView.qtBridge
+        ignoreUnknownSignals: true
+
+        /**
+         * One funnel for every reply: the bridge reports `requestReplied` for all
+         * methods, so the view keeps its own id → row bookkeeping rather than
+         * depending on a reply signal per method.
+         */
+        function onRequestReplied(id, method, ok, result, error) {
+            if (method === "markdown.parse") {
+                const index = internal.pendingParses[id]
+                if (index === undefined)
+                    return
+                delete internal.pendingParses[id]
+                const document = ok && result ? result.document : null
+                chatView.markdownParsed(index, document, error)
+                if (ok && document && chatView.messageModel !== null
+                        && typeof chatView.messageModel.setMessageMarkdown === "function")
+                    chatView.messageModel.setMessageMarkdown(index, document)
+            } else if (method === "markdown.render") {
+                if (internal.pendingRenders[id] === undefined)
+                    return
+                delete internal.pendingRenders[id]
+                chatView.markdownRendered(id, ok && result ? String(result.html) : "", error)
+            } else if (method === "code.highlight") {
+                if (internal.pendingHighlights[id] === undefined)
+                    return
+                delete internal.pendingHighlights[id]
+                chatView.codeHighlighted(id, ok && result ? String(result.markup) : "", error)
+            }
+        }
+    }
+
+    /**
+     * Ask Node to parse `text` and attach the AST to row `index`.
+     *
+     * Returns the request id, or "" when no bridge is attached — callers treat
+     * both the same way, because the delegate already renders plain text.
+     */
+    function requestMarkdown(index, text) {
+        if (chatView.qtBridge === null || text === undefined || String(text) === "")
+            return ""
+        const id = String(chatView.qtBridge.request("markdown.parse", { "text": String(text) }))
+        internal.pendingParses[id] = index
+        return id
+    }
+
+    /** Ask Node to render `text` to HTML; the reply arrives on `markdownRendered`. */
+    function renderMarkdown(text) {
+        if (chatView.qtBridge === null)
+            return ""
+        const id = String(chatView.qtBridge.renderMarkdown(String(text)))
+        internal.pendingRenders[id] = true
+        return id
+    }
+
+    /** Ask Node to highlight `code`; the reply arrives on `codeHighlighted`. */
+    function highlightCode(code, language) {
+        if (chatView.qtBridge === null)
+            return ""
+        const id = String(chatView.qtBridge.highlightCode(String(code), String(language)))
+        internal.pendingHighlights[id] = true
+        return id
+    }
+
+    /** Parse every non-empty row that has no Markdown yet (session restore). */
+    function requestMarkdownForAll() {
+        if (chatView.messageModel === null)
+            return 0
+        let queued = 0
+        for (let index = 0; index < chatView.messageModel.count; ++index) {
+            const row = chatView.messageModel.get(index)
+            if (row === undefined || row === null)
+                continue
+            if (row.markdown !== undefined && row.markdown !== null && row.markdown !== "")
+                continue
+            if (chatView.requestMarkdown(index, row.text) !== "")
+                ++queued
+        }
+        return queued
     }
 
     color: theme.background
