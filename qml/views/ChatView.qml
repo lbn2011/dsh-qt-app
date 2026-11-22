@@ -25,7 +25,14 @@ Rectangle {
 
     signal newSessionRequested()
 
-    readonly property int messageCount: messageList.count
+    /**
+     * Rows currently held by the model.
+     *
+     * Deliberately derived from the *model*, not from ListView.count: the view's
+     * count is refreshed internally and was observed to go stale across a
+     * model reset, which left the empty state hidden on an empty model.
+     */
+    readonly property int messageCount: chatView.messageModel ? chatView.messageModel.count : 0
 
     color: theme.background
 
