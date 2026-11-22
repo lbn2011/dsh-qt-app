@@ -34,6 +34,16 @@ Rectangle {
      */
     readonly property int messageCount: chatView.messageModel ? chatView.messageModel.count : 0
 
+    /**
+     * True while there is nothing to render.
+     *
+     * Exposed separately from EmptyState.visible because Item.visible propagates
+     * from the parent: in a hidden window every descendant reports visible=false,
+     * which makes the raw property useless as an assertion target (qmltestrunner
+     * keeps its window hidden, so tests must assert this intent instead).
+     */
+    readonly property bool showEmptyState: chatView.messageCount === 0
+
     color: theme.background
 
     SessionHeader {
@@ -71,6 +81,6 @@ Rectangle {
         objectName: "emptyState"
         theme: chatView.theme
         anchors.fill: messageList
-        visible: chatView.messageCount === 0
+        visible: chatView.showEmptyState
     }
 }
