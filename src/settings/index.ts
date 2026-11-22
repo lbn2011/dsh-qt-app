@@ -6,9 +6,14 @@
 //   schema.ts  — what a setting is, the built-in catalogue, strict validation
 //   paths.ts   — where settings live, atomic writes, corrupt-file recovery
 //   store.ts   — SettingsStore: get / set / watch over that file
+//   forms.ts   — schema entry + value → a descriptor a QML control can draw
+//   slots.ts   — validation and registry for plugin settings contributions
+//   qml-bridge.ts — the plain-object seam QML calls into
 export {
   BUILTIN_SETTINGS,
   DEFAULT_SETTINGS,
+  SETTING_COLOR_PATTERN,
+  isSettingColor,
   MAX_FONT_SIZE,
   MAX_HIGHLIGHT_CHARS,
   MIN_FONT_SIZE,
@@ -76,3 +81,51 @@ export type {
   SettingsSetResult,
   SettingsStoreOptions
 } from './store.js'
+
+export {
+  RENDERABLE_UI_TYPES,
+  coerceFieldInput,
+  describeSetting,
+  formatFieldDisplay,
+  humaniseSection,
+  humaniseSettingName,
+  isRenderableUiType,
+  normaliseFieldInput,
+  optionIndexOf,
+  settingsFieldDescriptors,
+  settingsFormSections
+} from './forms.js'
+
+export type {
+  SettingsFieldDescriptor,
+  SettingsFieldOption,
+  SettingsFormSection
+} from './forms.js'
+
+export {
+  DEFAULT_FORM_SECTION,
+  SETTINGS_FORM_SURFACE,
+  SETTINGS_SECTION_SURFACE,
+  SettingsSlotRegistry,
+  createSettingsSlotRegistry,
+  normaliseSettingsSlotContribution,
+  settingsFormFields,
+  usesGeneratedForm
+} from './slots.js'
+
+export type {
+  SettingsSlotContribution,
+  SettingsSlotIssue,
+  SettingsSlotNormalisation,
+  SettingsSlotRefusal,
+  SettingsSlotRegisterResult,
+  SettingsSlotRegistration
+} from './slots.js'
+
+export {
+  createInMemorySettingsBridge,
+  createSettingsQmlBridge,
+  settingSchemaOrNull
+} from './qml-bridge.js'
+
+export type { SettingsBridgeLogger, SettingsQmlBridge } from './qml-bridge.js'

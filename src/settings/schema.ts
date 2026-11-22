@@ -21,7 +21,7 @@ export type SettingValue = string | number | boolean
 export type SettingType = 'string' | 'number' | 'boolean'
 
 /** Widget the settings pane should use for an entry. */
-export type SettingUiType = 'select' | 'slider' | 'toggle' | 'text' | 'number'
+export type SettingUiType = 'select' | 'slider' | 'toggle' | 'text' | 'number' | 'color'
 
 /** One legal choice of a `select` entry. */
 export interface SettingOption {
@@ -112,6 +112,7 @@ export interface SettingValidationIssue {
     | 'too-short'
     | 'too-long'
     | 'not-finite'
+    | 'not-a-colour'
   /** Human sentence, suitable for a log line or a tooltip. */
   readonly message: string
 }
@@ -322,6 +323,23 @@ function findOption(entry: SettingsSchema, value: SettingValue): SettingOption |
  * a number must also be finite, because `NaN` and `Infinity` survive JSON.parse
  * as `null` and would otherwise corrupt the file on the next save.
  */
+/**
+ * Colour grammar accepted by a `color` control.
+ *
+ * Deliberately narrower than Qt's own colour parser: a settings file must stay
+ * portable and diffable, so only `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa` and the
+ * literal `transparent` are stored. `red` and `rgb(255,0,0)` are rejected rather
+ * than normalised — the same rule src/theme/validate.ts applies to theme files.
+ */
+export const SETTING_COLOR_PATTERN = /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/
+
+/** True when `value` is a colour this catalogue is willing to store. */
+export function isSettingColor(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  if (value === 'transparent') return true
+  return SETTING_COLOR_PATTERN.test(value)
+}
+
 export function validateSettingValue(entry: SettingsSchema, value: unknown): SettingValidationResult {
   if (!matchesType(entry.type, value)) {
     return {
@@ -366,6 +384,12 @@ export function validateSettingValue(entry: SettingsSchema, value: unknown): Set
 
   if (entry.type === 'string') {
     const text = value as string
+    if (entry.ui.type === 'color' && !isSettingColor(text)) {
+      return {
+        ok: false,
+        issue: issue(entry.name, 'not-a-colour', 'must be #rgb, #rrggbb or transparent')
+      }
+    }
     if (entry.minLength !== undefined && text.length < entry.minLength) {
       return {
         ok: false,
@@ -476,6 +500,9 @@ export function validateSchemaSet(schemaSet: SettingsSchemaSet = BUILTIN_SETTING
       problems.push(issue(entry.name, 'below-minimum', 'minimum is greater than maximum'))
     }
 
+    if (entry.ui.type === 'color' && entry.type !== 'string') {
+      problems.push(issue(entry.name, 'wrong-type', 'a color control needs a string setting'))
+    }
     if (entry.ui.type === 'select' && (entry.options === undefined || entry.options.length === 0)) {
       problems.push(issue(entry.name, 'not-an-option', 'a select control needs options'))
     }

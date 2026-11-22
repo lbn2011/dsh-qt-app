@@ -59,6 +59,19 @@ Rectangle {
     property string title: qsTr("Settings")
 
     /** Emitted when the user asks to leave the panel. */
+    /**
+     * Settings bridge (`get`/`set`/`fields`), or null.
+     *
+     * The panel does not own the store — C++ and the Node side do — so it accepts
+     * whatever bridge the host injects and passes it down. With no bridge the
+     * forms still render and still report edits; they simply cannot persist,
+     * which is what a QML test wants.
+     */
+    property var settingsBridge: null
+
+    /** Emitted when any hosted form reports a user edit. */
+    signal settingEdited(string name, var value)
+
     signal closeRequested()
 
     /**
@@ -239,6 +252,7 @@ Rectangle {
             "theme": root.theme,
             "bridge": root.bridge,
             "panel": root,
+            "settings": root.settingsBridge,
             "closeRequested": function () {
                 root.closeRequested()
             }
@@ -451,24 +465,21 @@ Rectangle {
                         Layout.fillWidth: true
                     }
 
-                    // Deliberately a disabled control rather than an empty
-                    // section: it documents the intent without pretending to
-                    // work. The renderer is English-only until Phase 3.
-                    ComboBox {
-                        objectName: "settingsLanguageCombo"
-                        model: [qsTr("English (default)")]
-                        enabled: false
+                    // The generated form replaces t19's disabled placeholder:
+                    // `language` is a real setting with `requiresRestart`, so
+                    // the row is live (one option for now) and says so, instead
+                    // of pretending the setting does not exist. More languages
+                    // arrive with Phase 3 localisation — the option list grows,
+                    // this file does not change.
+                    LanguageForm {
+                        objectName: "settingsLanguageForm"
                         Layout.fillWidth: true
-                        implicitHeight: root.theme.controlHeight
-                    }
+                        theme: root.theme
+                        settingsBridge: root.settingsBridge
 
-                    Label {
-                        objectName: "settingsLanguageHint"
-                        text: qsTr("Additional languages arrive with interface localisation.")
-                        color: root.theme.textMuted
-                        font.pixelSize: root.theme.fontSmall
-                        wrapMode: Text.Wrap
-                        Layout.fillWidth: true
+                        onValueEdited: function (name, value) {
+                            root.settingEdited(name, value)
+                        }
                     }
                 }
             }

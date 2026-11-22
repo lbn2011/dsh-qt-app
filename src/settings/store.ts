@@ -224,6 +224,17 @@ export class SettingsStore {
     return this.revision_
   }
 
+  /**
+   * The catalogue this store enforces.
+   *
+   * Exposed because a settings *view* needs the same entries the store
+   * validates against — reading them from the store guarantees a form cannot
+   * describe a control the writer would refuse.
+   */
+  get schema(): SettingsSchemaSet {
+    return this.schema_
+  }
+
   /** On-disk format version currently in force. */
   get schemaVersion(): number {
     return this.schemaVersion_

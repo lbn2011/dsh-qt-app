@@ -11,6 +11,9 @@
 //   contribution.url          a URL to load
 //   contribution.order        optional sort key
 //   contribution.properties   optional map assigned onto the loaded item
+//   contribution.schema       optional SettingsSchema entries; rendered by
+//                             SettingsForm, so a plugin can ship settings with
+//                             no QML at all
 //
 // Two rules worth stating, because both are easy to get wrong:
 //
@@ -57,6 +60,23 @@ Item {
         && typeof root.contribution.url === "string"
         && root.contribution.url.length > 0
 
+    /**
+     * True when the contribution asks the built-in generator to draw its form.
+     *
+     * A plugin that only declares schema entries never supplies a component, so
+     * without this branch its tab would render the "nothing provided" message
+     * while looking like a bug rather than an empty slot.
+     */
+    readonly property bool hasSchema: root.contribution !== null
+        && typeof root.contribution === "object"
+        && root.contribution.schema !== undefined
+        && root.contribution.schema !== null
+        && root.contribution.schema.length !== undefined
+        && root.contribution.schema.length > 0
+
+    /** True when the generator, not a plugin component, draws this slot. */
+    readonly property bool usesGeneratedForm: root.hasSchema && !root.hasComponent && !root.hasUrl
+
     /** Heading for the contribution, or an empty string. */
     readonly property string heading: (root.contribution !== null
         && typeof root.contribution === "object"
@@ -75,6 +95,9 @@ Item {
 
     /** Emitted when a slot fails to load; the panel logs it. */
     signal failed(string id, string reason)
+
+    /** Emitted when a generated form reports a user edit. */
+    signal formValueEdited(string name, var value)
 
     implicitWidth: 320
     implicitHeight: column.implicitHeight
@@ -122,6 +145,22 @@ Item {
             Layout.fillWidth: true
         }
 
+        SettingsForm {
+            objectName: "settingsSlotGeneratedForm"
+            visible: root.usesGeneratedForm
+            Layout.fillWidth: true
+            theme: root.theme
+            schema: root.hasSchema ? root.contribution.schema : []
+            settings: (root.slotContext !== null && root.slotContext !== undefined
+                && root.slotContext.settings !== undefined)
+                ? root.slotContext.settings
+                : null
+
+            onValueEdited: function (name, value) {
+                root.formValueEdited(name, value)
+            }
+        }
+
         Loader {
             id: loader
 
@@ -130,6 +169,7 @@ Item {
             visible: status !== Loader.Null && status !== Loader.Error
             sourceComponent: root.hasComponent ? root.contribution.component : null
             source: root.hasUrl ? root.contribution.url : ""
+            active: !root.usesGeneratedForm
 
             onStatusChanged: {
                 if (loader.status === Loader.Ready)
@@ -141,7 +181,7 @@ Item {
 
         Label {
             objectName: "settingsSlotEmpty"
-            visible: !root.hasComponent && !root.hasUrl && !root.failedToLoad
+            visible: !root.hasComponent && !root.hasUrl && !root.hasSchema && !root.failedToLoad
             text: qsTr("This plugin has not provided a settings view yet.")
             color: root.theme.textMuted
             font.pixelSize: root.theme.fontSmall
