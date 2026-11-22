@@ -78,6 +78,22 @@ TestCase {
         signalName: "newSessionRequested"
     }
 
+    function test_zz_debugState() {
+        // Temporary diagnostics: QML cannot be run on the dev machine, so this
+        // prints the observed state into the CI log.
+        const empty = findChild(chatView, "emptyState")
+        const list = findChild(chatView, "messageList")
+        console.log("DEBUG empty=" + empty
+                    + " empty.visible=" + (empty ? empty.visible : "n/a")
+                    + " empty.objectName=" + (empty ? empty.objectName : "n/a")
+                    + " list=" + list
+                    + " list.count=" + (list ? list.count : "n/a")
+                    + " messageCount=" + chatView.messageCount
+                    + " modelCount=" + model.count
+                    + " chatView.visible=" + chatView.visible
+                    + " testCase.visible=" + testCase.visible)
+    }
+
     function test_newSessionSignalPropagates() {
         newSessionSpy.clear()
 
