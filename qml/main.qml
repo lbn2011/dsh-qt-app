@@ -11,11 +11,17 @@
 // window in place. This file owns the one place that cannot be a binding: the
 // window-level `themeChanged` broadcast that the settings UI (t17) and any
 // imperative code can hook into.
+//
+// Phase 2h mounts the settings pane in a right-hand Drawer (SettingsPanel.qml):
+// the sidebar's footer button and `Ctrl+,` both open it, and the theme controls
+// inside write straight to `ctx.theme`, so a scheme or font-scale change is
+// visible in the chat behind the drawer while it is still open.
 import QtQuick
 import QtQuick.Controls
 import "components"
 import "models"
 import "views"
+import "views/settings"
 
 ApplicationWindow {
     id: window
@@ -79,6 +85,13 @@ ApplicationWindow {
         onActivated: window.toggleTheme()
     }
 
+    /** Ctrl+, / Cmd+, opens the settings pane — the platform convention. */
+    Shortcut {
+        sequences: ["Ctrl+,", "Meta+,"]
+        context: Qt.ApplicationShortcut
+        onActivated: settingsDrawer.open()
+    }
+
     /**
      * Append a user turn locally.
      *
@@ -114,6 +127,7 @@ ApplicationWindow {
         anchors.top: parent.top
         anchors.bottom: parent.bottom
         onNewSessionRequested: window.newSession()
+        onSettingsRequested: settingsDrawer.open()
         onSessionSelected: function (index) {
             window.newSession()
             session.title = sessionIndexModel.get(index).title
@@ -145,6 +159,35 @@ ApplicationWindow {
         anchors.bottom: parent.bottom
         onSend: function (text) {
             window.sendMessage(text)
+        }
+    }
+
+    /**
+     * Settings pane.
+     *
+     * A Drawer rather than a page because settings are a detour, not a
+     * destination: the chat stays visible (and, with modal: true, dimmed but
+     * still repainting) while the theme is being changed, which is the whole
+     * point of live switching.
+     */
+    Drawer {
+        id: settingsDrawer
+
+        objectName: "settingsDrawer"
+        edge: Qt.RightEdge
+        width: Math.min(420, Math.round(window.width * 0.4))
+        height: window.height
+        modal: true
+        interactive: true
+        padding: 0
+
+        SettingsPanel {
+            id: settingsPanel
+
+            objectName: "settingsPanelMount"
+            anchors.fill: parent
+            theme: theme
+            onCloseRequested: settingsDrawer.close()
         }
     }
 }

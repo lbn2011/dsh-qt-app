@@ -31,6 +31,8 @@ Rectangle {
 
     signal newSessionRequested()
     signal sessionSelected(int index)
+    /** The user asked for the settings pane (t17). */
+    signal settingsRequested()
 
     implicitWidth: theme.sidebarWidth
     color: theme.surface
@@ -72,7 +74,9 @@ Rectangle {
             id: sessionListView
             objectName: "sessionList"
             width: parent.width
-            height: parent.height - y
+            // Leave room for the settings entry pinned below the list; the
+            // footer's height is an implicitHeight, so this cannot cycle.
+            height: parent.height - y - sidebarFooter.height - sidebar.theme.spacing
             clip: true
             spacing: 2
             model: sidebar.sessionList
@@ -112,6 +116,27 @@ Rectangle {
                     onClicked: sidebar.sessionSelected(sessionRow.index)
                 }
             }
+        }
+
+        /**
+         * Settings entry.
+         *
+         * Pinned to the bottom of the column so it reads as a global action
+         * rather than a per-session one. main.qml opens the settings Drawer on
+         * `settingsRequested()`; the Ctrl+, shortcut lives there too.
+         */
+        Button {
+            id: sidebarFooter
+
+            objectName: "sidebarSettingsButton"
+            text: qsTr("Settings")
+            width: parent.width
+            implicitHeight: sidebar.theme.controlHeight
+            palette.button: sidebar.theme.surfaceAlt
+            palette.buttonText: sidebar.theme.text
+            palette.highlight: sidebar.theme.accent
+            palette.highlightedText: sidebar.theme.textInverse
+            onClicked: sidebar.settingsRequested()
         }
     }
 }
