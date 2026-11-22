@@ -65,10 +65,23 @@ test('apply() starts the event loop through ctx.effect when enabled', async () =
   assert.equal(stats.bridgeSource, 'explicit')
 })
 
-test('renderMarkdown()/highlightCode() delegate to the N-API bridge', async () => {
+test('renderMarkdown() delegates to the N-API bridge', async () => {
   const ctx = mount()
   assert.equal(await ctx.qtRenderer.renderMarkdown('# title'), '<p># title</p>')
-  assert.equal(await ctx.qtRenderer.highlightCode('let a = 1', 'ts'), '<code data-lang="ts">let a = 1</code>')
+})
+
+test('highlightCode() returns Qt rich-text markup without consulting the addon', async () => {
+  // Phase 2 decision D1: highlighting lives in TypeScript. The addon still parses
+  // Markdown (above) but deliberately does no colouring, so this must not return
+  // the addon's plain <code data-lang="…"> wrapper.
+  const ctx = mount()
+  const html = await ctx.qtRenderer.highlightCode('let a = 1', 'ts')
+  assert.ok(html.includes('<font color="'), 'expected coloured runs')
+  assert.ok(html.includes('let'))
+  assert.equal(html.includes('<code data-lang='), false)
+
+  const plain = await ctx.qtRenderer.highlightCode('plain <words>', 'text')
+  assert.equal(plain, 'plain &lt;words&gt;')
 })
 
 test('a missing addon degrades to escaped plain text instead of throwing', async () => {

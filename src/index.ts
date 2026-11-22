@@ -26,6 +26,7 @@ import {
   QML_ENTRY_URL,
 } from './constants.js'
 import { EventLoopBridge, createEventLoopBridge } from './event-loop/timer.js'
+import { highlight as highlightSource } from './highlight/index.js'
 import type { EventLoopBridgeOptions, EventLoopStats } from './event-loop/timer.js'
 import { loadNapiModule } from './qt-bridge/napi-loader.js'
 import type { NapiBridge, NapiLoadResult } from './qt-bridge/napi-loader.js'
@@ -165,9 +166,20 @@ export class QtRendererService extends Service {
     return await this.bridge.renderMarkdown(text, options)
   }
 
-  /** Highlight a code block through the N-API addon (or the fallback). */
+  /**
+   * Highlight a code block as Qt rich-text markup.
+   *
+   * Phase 2 decision D1: highlighting is a pure-TypeScript concern. Shiki is used
+   * when the host happens to have it installed, otherwise the built-in tokenizer
+   * answers, and a block longer than `maxHighlightChars` is returned uncoloured
+   * rather than tokenized. The N-API addon deliberately does no highlighting, so
+   * it is not consulted here.
+   */
   async highlightCode(code: string, language?: string, options?: CodeBlockOptions): Promise<string> {
-    return await this.bridge.highlightCode(code, language, options)
+    const result = await highlightSource(code, language, {
+      ...(options?.theme === undefined ? {} : { scheme: options.theme }),
+    })
+    return result.html
   }
 
   /**

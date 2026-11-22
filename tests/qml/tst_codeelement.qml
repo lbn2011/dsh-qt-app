@@ -1,9 +1,9 @@
 // tst_codeelement.qml — CodeBlock.qml behaviour.
 //
-// t12 renders code blocks as plain monospace text; syntax highlighting is t13's
-// job. These tests therefore pin the *absence* of highlighting (the text is the
-// source verbatim), the panel chrome, the language label and the dual block /
-// inline role.
+// Phase 2d: the block asks ctx.qtRenderer.highlightCode() for Qt rich text. In the
+// test runner there is no Cordis context, so the block must fall back to plain
+// text; a stand-in renderer injected through `rendererOverride` exercises the
+// highlighted path deterministically (synchronously — no Promise needed here).
 import QtQuick
 import QtTest
 import "../../qml/markdown"
@@ -28,6 +28,9 @@ TestCase {
     })
 
     readonly property string source: "function add(a, b) {\n    return a + b;\n}"
+
+    /** Records what the last highlight request carried (set by the stand-ins). */
+    property var lastHighlightRequest: null
 
     Component {
         id: codeComponent
@@ -62,14 +65,79 @@ TestCase {
         compare(text.text, testCase.source, "source is rendered verbatim")
     }
 
-    function test_noHighlightingInPhase2c() {
+    function test_withoutARendererTheBlockStaysPlainText() {
+        // qmltestrunner publishes no `ctx`, so this is the no-service path: the
+        // block must still show the source verbatim rather than nothing.
         const block = createCode()
         const text = findChild(block, "markdownCodeText")
 
-        // t13 will replace this with a highlighted RichText fragment. Until then
-        // the text must stay plain so the absence of highlighting is explicit.
-        compare(text.textFormat, Text.PlainText, "phase 2c renders code as plain text")
-        compare(text.text.indexOf("<span"), -1, "no markup is injected")
+        compare(block.renderer, null, "no renderer without a host")
+        compare(block.isHighlighted, false, "nothing is highlighted")
+        compare(text.textFormat, TextEdit.TextPlain, "plain text is the fallback format")
+        compare(text.text, testCase.source, "the source is shown verbatim")
+    }
+
+    function test_rendererMarkupIsPaintedAsRichText() {
+        const block = createCode()
+        block.rendererOverride = {
+            "highlightCode": function (code, language, options) {
+                testCase.lastHighlightRequest = { "code": code, "language": language, "options": options }
+                return "<font color=\"#6ba1ff\">const</font> x = 1"
+            }
+        }
+
+        const text = findChild(block, "markdownCodeText")
+        compare(block.isHighlighted, true, "markup from the renderer is used")
+        compare(text.textFormat, TextEdit.RichText, "highlighted code is rich text")
+        compare(text.text, "<font color=\"#6ba1ff\">const</font> x = 1")
+        compare(text.plainText, testCase.source, "the raw source stays available")
+
+        // the request carried the code, the fence language and the scheme
+        compare(testCase.lastHighlightRequest.code, testCase.source)
+        compare(testCase.lastHighlightRequest.language, "js")
+        compare(testCase.lastHighlightRequest.options.theme, "dark")
+    }
+
+    function test_aThrowingRendererLeavesTheBlockPlain() {
+        const block = createCode()
+        block.rendererOverride = {
+            "highlightCode": function () { throw new Error("boom") }
+        }
+
+        compare(block.isHighlighted, false, "a failing renderer must not break the block")
+        compare(findChild(block, "markdownCodeText").text, testCase.source)
+    }
+
+    function test_aNullAnswerLeavesTheBlockPlain() {
+        const block = createCode()
+        block.rendererOverride = { "highlightCode": function () { return null } }
+
+        compare(block.isHighlighted, false)
+        compare(findChild(block, "markdownCodeText").text, testCase.source)
+    }
+
+    function test_lightThemeAsksForTheLightScheme() {
+        const block = createCode()
+        block.theme = { "appearance": "light", "text": "#1b1c1f", "fontNormal": 13, "spacing": 8,
+                        "radius": 8, "codeBackground": "#f3f4f7", "codeBorder": "#dde0e6",
+                        "surfaceAlt": "#f1f2f5", "border": "#d8dbe2" }
+        block.rendererOverride = {
+            "highlightCode": function (code, language, options) {
+                testCase.lastHighlightRequest = { "code": code, "language": language, "options": options }
+                return "light markup"
+            }
+        }
+        compare(testCase.lastHighlightRequest.options.theme, "light")
+    }
+
+    function test_codeIsSelectableButNotEditable() {
+        // A read-only TextEdit rather than a Text: the snippet can be selected and
+        // copied, and the user cannot accidentally type into the transcript.
+        const block = createCode()
+        const text = findChild(block, "markdownCodeText")
+        compare(text.readOnly, true, "code blocks are read-only")
+        compare(text.selectByMouse, true, "code can be selected with the mouse")
+        compare(text.wrapMode, TextEdit.NoWrap, "code never re-wraps")
     }
 
     function test_monospaceFont() {
