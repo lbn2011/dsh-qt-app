@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  // Typecheck-only config: covers src/ and tests/ without emitting. Tests run
+  // through tsx (see package.json "test"), which resolves the ".js" specifiers
+  // in test files back to their ".ts" sources.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["node_modules", "lib", "dist", "build"]
+}

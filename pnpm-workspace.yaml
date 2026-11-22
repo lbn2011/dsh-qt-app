@@ -1,0 +1,13 @@
+# pnpm workspace and settings for dsh-qt-app.
+#
+# The package is a single-package workspace today: everything lives in the
+# repository root. A `packages/*` glob is added when the sibling packages from
+# the implementation plan (dsh-qt-sdk, example plugins) appear.
+packages:
+  - "."
+
+# tsx runs the TypeScript tests and depends on esbuild, whose install script
+# links the platform binary. pnpm >= 10 blocks dependency build scripts unless
+# they are listed here, which would fail `pnpm install`.
+allowBuilds:
+  esbuild: true

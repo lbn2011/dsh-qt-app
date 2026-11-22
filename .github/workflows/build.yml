@@ -1,0 +1,95 @@
+# Build the Qt6/QML host on Windows, Linux and macOS.
+#
+# All C++/Qt compilation happens here — never on the development machine.
+# The workflow assumes the repository root is dsh-qt-app/ (the package is
+# mirrored to its own repository for CI; see docs/ci.md).
+name: build
+
+on:
+  push:
+    branches: [main, dev/**]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: 6.7.3
+  NODE_VERSION: "22.19.0"
+
+jobs:
+  qt-build:
+    name: qt6 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-14]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # pnpm version comes from "packageManager" in package.json; passing an
+      # explicit `version:` as well makes action-setup fail.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build TypeScript
+        run: pnpm build
+
+      - name: Install Linux Qt dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          # Qt Quick Controls 2 ships with qtdeclarative in Qt 6, so no extra
+          # module is requested here (a Qt 5 style "qtquickcontrols2" module
+          # would fail to resolve for 6.x).
+          cache: true
+
+      - name: Configure (CMake)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (CMake)
+        run: cmake --build build --config Release --parallel
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ -d build/Release ]; then
+            find build/Release -maxdepth 1 -type f \( -name 'dsh-qt-app*' \) -exec cp {} dist/ \;
+          fi
+          find build -maxdepth 1 -type f -name 'dsh-qt-app*' -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-qt-app-${{ runner.os }}-${{ runner.arch }}
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 14

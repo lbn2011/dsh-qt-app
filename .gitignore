@@ -1,0 +1,54 @@
+# --- Node / TypeScript -------------------------------------------------------
+node_modules/
+lib/
+lib-test/
+dist/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+coverage/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# --- CMake / Qt --------------------------------------------------------------
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+*.user
+*.autosave
+.qmlls.ini
+*.qmlc
+*.jsc
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.node
+qt.conf
+
+# --- Platform packaging ------------------------------------------------------
+*.app/
+*.dmg
+*.exe
+*.msi
+*.AppImage
+*.deb
+*.rpm
+
+# --- Editors / OS ------------------------------------------------------------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+*.swp

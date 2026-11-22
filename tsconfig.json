@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  // Build config: src/**.ts -> lib/**.js (+ .d.ts). rootDir is src/ so the
+  // package entrypoint stays lib/index.js and the Cordis loader can resolve it
+  // straight from package.json "main".
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    // cordis 4.x is ESM-only ("type": "module"), so the plugin must be ESM too.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "rootDir": "src",
+    "outDir": "lib",
+    "declaration": true,
+    "sourceMap": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmitOnError": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "lib", "dist", "build", "tests"]
+}

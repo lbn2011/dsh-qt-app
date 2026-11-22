@@ -1,0 +1,108 @@
+# Run the TypeScript typecheck, the unit tests and the QML lint.
+#
+# All test execution happens here — never on the development machine.
+# The workflow assumes the repository root is dsh-qt-app/ (see docs/ci.md).
+name: test
+
+on:
+  push:
+    branches: [main, dev/**]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: 6.7.3
+  NODE_VERSION: "22.19.0"
+
+jobs:
+  typescript:
+    name: typescript (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-14]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # pnpm version comes from "packageManager" in package.json; passing an
+      # explicit `version:` as well makes action-setup fail.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (src + tests)
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+  qml-lint:
+    name: qml lint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          # Qt Quick Controls 2 ships with qtdeclarative in Qt 6, so no extra
+          # module is requested here (a Qt 5 style "qtquickcontrols2" module
+          # would fail to resolve for 6.x).
+          cache: true
+
+      - name: qmllint qml/
+        run: |
+          find qml -name '*.qml' -print0 | xargs -0 -r qmllint
+
+      - name: Configure (CMake, checks Qt6 requirements resolve)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+  qml-tests:
+    name: qml tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      # Qt Quick Test drives the QML components headless through the offscreen
+      # platform plugin; without it the runner needs a real display.
+      - name: Install runtime libraries for the offscreen platform
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libegl1
+
+      - name: Run Qt Quick Test suites
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          qmltestrunner -input tests/qml -import qml

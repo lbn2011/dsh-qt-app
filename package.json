@@ -1,0 +1,57 @@
+{
+  "name": "@deepseek-ai/dsh-qt-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH Qt6/QML native UI profile: a Cordis plugin that drives a Qt Quick window through an N-API bridge, replacing the Tauri WebUI shell",
+  "keywords": [
+    "dsh",
+    "cordis",
+    "qt6",
+    "qml",
+    "desktop",
+    "profile"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "qml/",
+    "native/",
+    "docs/",
+    "CMakeLists.txt",
+    "README.md",
+    "LICENSE"
+  ],
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": ">=22.19.0",
+    "pnpm": ">=12.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "tsx --test tests/*.test.ts",
+    "clean": "node -e \"import('node:fs').then(({rmSync})=>{for(const d of ['lib','dist','build']) rmSync(d,{recursive:true,force:true})})\"",
+    "cmake:configure": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release",
+    "cmake:build": "cmake --build build --config Release"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
+    "@deepseek-ai/cordis-plugin-include": "~1.1.0",
+    "@deepseek-ai/cordis-plugin-loader": "~1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}
