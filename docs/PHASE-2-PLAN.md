@@ -27,7 +27,7 @@ What is already in the tree (and therefore reusable):
 | Renderer API | `renderMarkdown`, `highlightCode`, `showDialog`/`resolveDialog`, `registerView`/`listViews`, `registerSlot`/`unregisterSlot`/`listSlots`, `declareSurface`/`listSurfaces`, `stats` | `src/index.ts` |
 | Native bridge | `loadNapiModule()` discovers `dsh-qt-napi`, never throws, degrades to an HTML-escaped fallback | `src/qt-bridge/napi-loader.ts` |
 | Event loop | 10 ms `setInterval` drain loop, bounded drop-oldest queue, re-entrancy guard, error isolation | `src/event-loop/timer.ts` |
-| Design tokens | 30 hard-coded tokens (colours, fonts, spacing, radii, sizes) | `qml/components/Theme.qml` |
+| Design tokens | 27 hard-coded tokens — 13 colours, 13 ints (font sizes, spacing, radii, sizes, animation), 1 font family string | `qml/components/Theme.qml` |
 | Chat UI | `ChatView` (ListView + `showEmptyState`), `MessageDelegate` (plain text), `MessageInput` (`signal send(string)`), `SessionSidebar`, `SessionHeader`, `EmptyState` | `qml/views/`, `qml/components/` |
 | Models | `MessageModel` (role/text/timestamp/pending), `SessionModel` | `qml/models/` |
 | Shell | `main.qml` — 1280×800 `ApplicationWindow`, local echo only, **no Node side attached** | `qml/main.qml` |
@@ -257,7 +257,7 @@ boundary inside a table row.
 ### T — Theme
 
 #### t15 — Theme token schema and ThemeManager
-**Objective**: move today's 30 `Theme.qml` tokens into the typed `ThemeDefinition` schema,
+**Objective**: move today's 27 `Theme.qml` tokens (13 colours, 13 ints, 1 font family) into the typed `ThemeDefinition` schema,
 ship `dark` (identical to current values) and `light` palettes, implement `ThemeManager`
 with `setActive`/`setFontScale`/`onChange`, persistence of the chosen theme id, and schema
 validation for user-supplied theme files.
@@ -357,9 +357,11 @@ ubuntu + windows, QML test suites for the new components, settings/theme persist
 the TS side, artifact staging including the native module, and `docs/ci.md` updated.
 **In scope**: `dsh-qt-app/.github/workflows/`, `dsh-qt-app/docs/ci.md`, `dsh-qt-app/CMakeLists.txt`.
 **Acceptance**: build.yml and test.yml green on ubuntu + windows (macOS still blocked, see
-§6); qmllint covers `qml/markdown/` and `qml/views/settings/`; the packaged artifact contains
-the native module and the app starts in degraded mode when it is removed; `docs/ci.md`
-documents every job and its failure modes.
+§6); the existing `qml-lint` and `qml-tests` jobs report the new `qml/markdown/` and
+`qml/views/settings/` suites without new wiring (GLOB_RECURSE + `find qml` already cover
+them — assert the new suites appear in the job log, do not re-add the jobs); the packaged
+artifact contains the native module and the app starts in degraded mode when it is removed;
+`docs/ci.md` documents every job and its failure modes.
 **Verify**: CI green + `grep -q 'native' dsh-qt-app/.github/workflows/build.yml`.
 **Estimate**: 1.5 d.
 
@@ -373,8 +375,8 @@ deviations list; `docs/PHASE-2-PLAN.md` is updated to mark each task's final sta
 **Verify**: `grep -q 'actions/runs' dsh-qt-app/docs/test-records/phase-2-results.md` + review pass.
 **Estimate**: 0.5 d.
 
-**Total**: ~21 developer-days of work, ~12 days on the critical path with the three tracks
-running in parallel.
+**Total**: 21.5 developer-days of work, ~12 days on the critical path with the three tracks
+running in parallel (Markdown 9, Theme 3.5, Settings 5, Integration 4).
 
 ---
 
@@ -590,7 +592,35 @@ See §9 for the mapping.
 | Role | Person | Statement | State |
 | --- | --- | --- | --- |
 | Author | dev-qiu (t6) | Plan written and revised to revision 4; interfaces, task contracts, risks and the DAG above are what the phase will be implemented against | signed |
-| Reviewer | reviewer-glm5 | Plan is implementable, risks are acceptable, task graph is acyclic and complete | **pending — comment on this document's commit** |
+| Reviewer | reviewer-glm5 | Plan is implementable, risks are acceptable, task graph is acyclic and complete | **signed — `APPROVED`** on commit `7dcaccb`, 2026-11-22 |
+
+### 8.1 The approval, and what it covers
+
+reviewer-glm5 approved commit `7dcaccb` (this document at revision 4) with the GitHub comment
+`APPROVED — Phase 2 Core UI plan (settings · theme · Markdown), commit 7dcaccb, revision 4`,
+after independently re-running the §7.1 script against that commit (14 tasks, 16 edges, cycle
+check none, same critical path) and reviewing §3/§4/§6 against the Phase 1 record. The
+rulings, which are now decisions of record:
+
+- **Id range**: t10–t23 accepted (§7.2). The "t6–t20" wording in the t6 acceptance criterion
+  predates the Phase 1 gates that consumed t7–t9; no change required.
+- **Decomposition**: keep 14 tasks / ~21.5 dev-days. The settings track is explicitly **not**
+  to be merged — t18 is pure-TS and unit-testable, t19/t20 are CI-only QML verification, and
+  merging them would mix both in one contract and invent a theme↔settings dependency.
+- **D1** Shiki, lazily loaded, behind `maxHighlightChars` (accepted).
+- **D2** modal settings pane in t19, promotable to a page later (accepted).
+- **D3** `apiKeyRef` env-var references only in Phase 2, OS keyring in Phase 4 (accepted).
+
+Conditions carried into the phase (non-blocking for the sign-off): the captain must run
+`agent_teams_status` after creating t10–t23 to confirm the edges and acyclicity in team state;
+t22 must confirm the existing `GLOB_RECURSE` in `qt_add_resources` picks up the new
+`qml/markdown/` and `qml/views/settings/` trees (it will — `CONFIGURE_DEPENDS` over `qml/*.qml`)
+rather than re-adding them by hand, since the qmltestrunner job and the lint glob already exist
+from Phase 1 t4; macOS stays an accepted gap (R1).
+
+Post-approval edit note: the only content change after `7dcaccb` is this §8 recording plus a
+correction in §1/§4 — the token count said 30, the file actually declares 27. The reviewer's
+verdict covers the plan's structure, which this does not alter.
 
 Sign-off procedure: reviewer-glm5 comments on the commit that adds/updates this file
 (`lbn2011/dsh-qt-app@dev/phase-1`, `dsh-qt-app/docs/PHASE-2-PLAN.md`; the commit is the
@@ -644,7 +674,10 @@ Notes for creation:
 4. After creation, run `agent_teams_status` and confirm the 16 edges in §2 appear exactly once
    each and the list reports no cycle. If any mismatch appears, correct the task records
    rather than this document.
-5. Carried over from Phase 1 and still open for `t22` (not fixed yet): `CMakeLists.txt`
-   registers only `qml/main.qml` in `qt_add_resources`, so `components/`, `models/`, `views/`
-   and the new `markdown/` directory must be registered or the built app cannot resolve its
-   imports; `test.yml` has no qmltestrunner job for `tests/qml`.
+5. Phase 1 leftovers are **already closed** by t4, contrary to §4's original wording: `CMakeLists.txt`
+   registers `qml/*.qml` via `file(GLOB_RECURSE ... CONFIGURE_DEPENDS)`, and `test.yml` has a
+   `qml-tests` job running `qmltestrunner -input tests/qml -import qml` plus a `qml-lint` job
+   covering the whole tree. So `t22` must **not** re-add either; it only has to confirm the
+   GLOB still matches the new `qml/markdown/` and `qml/views/settings/` trees and cover the
+   genuinely new pieces: the `native` job building `dsh-qt-napi`, artifact staging of the
+   native module, the settings/theme persistence tests on the TS side, and `docs/ci.md`.
