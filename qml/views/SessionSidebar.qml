@@ -3,6 +3,8 @@
 // Phase 1c renders the list of known sessions and the "New session" action. The
 // model is a plain ListModel with a single `title` role; Phase 2 binds it to the
 // Cordis session registry through the event-loop bridge.
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Controls
 import "../components"

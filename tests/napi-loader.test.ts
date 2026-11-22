@@ -56,8 +56,10 @@ test('discoverCandidates() is ordered explicit -> env -> package -> local build'
   assert.equal(candidates[1], '/env/qt-bridge.node')
   assert.equal(candidates[2], `${NAPI_PACKAGE_NAME}/prebuild/linux-x64/${NAPI_BINARY_NAME}.node`)
   assert.equal(candidates[3], NAPI_PACKAGE_NAME)
-  assert.ok(candidates.includes(`/repo/${NAPI_PACKAGE_NAME}/build/Release/${NAPI_BINARY_NAME}.node`))
-  assert.ok(candidates.includes(`/repo/${NAPI_PACKAGE_NAME}/build/${NAPI_BINARY_NAME}.node`))
+  // Root-derived candidates are built with path.join(), so the expectations must
+  // use the platform separator too (this test runs on Windows and macOS in CI).
+  assert.ok(candidates.includes(join('/repo', NAPI_PACKAGE_NAME, 'build', 'Release', `${NAPI_BINARY_NAME}.node`)))
+  assert.ok(candidates.includes(join('/repo', NAPI_PACKAGE_NAME, 'build', `${NAPI_BINARY_NAME}.node`)))
   // No duplicates, even if an explicit path repeats a discovered one.
   assert.equal(new Set(candidates).size, candidates.length)
 })

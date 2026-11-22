@@ -64,6 +64,6 @@ Rectangle {
         objectName: "emptyState"
         theme: chatView.theme
         anchors.fill: messageList
-        visible: messageList.count === 0
+        visible: chatView.messageCount === 0
     }
 }

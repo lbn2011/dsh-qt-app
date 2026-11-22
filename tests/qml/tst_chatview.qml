@@ -48,7 +48,12 @@ TestCase {
     function test_emptyStateTogglesWithContent() {
         const empty = findChild(chatView, "emptyState")
         verify(empty !== null, "empty state must exist")
-        compare(empty.visible, true, "empty state shows on an empty model")
+
+        // Let the ListView finish populating before reading the derived state.
+        tryCompare(chatView, "messageCount", 0)
+        verify(empty.visible === true,
+               "empty state must show on an empty model (count=" + chatView.messageCount
+               + ", visible=" + empty.visible + ")")
 
         model.appendUserMessage("hello")
         tryCompare(chatView, "messageCount", 1)
