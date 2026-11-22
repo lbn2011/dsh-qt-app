@@ -42,7 +42,8 @@
     "test": "tsx --test tests/*.test.ts",
     "clean": "node -e \"import('node:fs').then(({rmSync})=>{for(const d of ['lib','dist','build']) rmSync(d,{recursive:true,force:true})})\"",
     "cmake:configure": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release",
-    "cmake:build": "cmake --build build --config Release"
+    "cmake:build": "cmake --build build --config Release",
+    "package": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release --target package-app"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "^4.1.0",

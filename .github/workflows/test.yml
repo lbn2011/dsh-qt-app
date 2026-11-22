@@ -1,4 +1,5 @@
-# Run the TypeScript typecheck, the unit tests and the QML lint.
+# Run the TypeScript typecheck, the unit tests, the QML lint, the Qt Quick Test
+# suites and the dsh-qt-napi addon build.
 #
 # All test execution happens here — never on the development machine.
 # The workflow assumes the repository root is dsh-qt-app/ (see docs/ci.md).
@@ -20,8 +21,77 @@ permissions:
 env:
   QT_VERSION: 6.7.3
   NODE_VERSION: "22.19.0"
+  # The Markdown/GFM parser lives in its own repository; the addon job checks it
+  # out as a sibling directory and the Qt jobs consume its prebuild artifact.
+  NAPI_REPO: lbn2011/dsh-qt-napi
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # dsh-qt-napi: compile the cmark-gfm N-API addon from source.
+  #
+  # This is what proves the "cmark-gfm 0.30+" criterion in CI: the addon vendors
+  # cmark-gfm and compiles it into qt-bridge.node. The Qt host never links cmark
+  # itself (it talks to Node over the stdio bridge and receives an AST), so the
+  # addon build is the only place cmark is compiled — and therefore the job that
+  # has to stay green for Markdown rendering to work at all.
+  # ---------------------------------------------------------------------------
+  napi:
+    name: napi (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is intentionally absent: the shared macOS runner pool is an
+        # accepted gap for this project (see docs/ci.md § Known gaps).
+        os: [ubuntu-22.04, windows-2022]
+
+    steps:
+      - name: Checkout dsh-qt-napi
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.NAPI_REPO }}
+          path: dsh-qt-napi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Python (node-gyp)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # --ignore-scripts keeps the install hook from compiling before the
+      # explicit build step, so a compile failure is reported against "Build"
+      # rather than buried inside dependency installation.
+      - name: Install addon dependencies
+        working-directory: dsh-qt-napi
+        run: npm install --ignore-scripts
+
+      - name: Build addon (compiles vendored cmark-gfm)
+        working-directory: dsh-qt-napi
+        run: npm run build
+
+      - name: Verify addon
+        working-directory: dsh-qt-napi
+        run: npm run verify
+
+      - name: Addon unit tests
+        working-directory: dsh-qt-napi
+        run: npm test
+
+      # The loader in src/qt-bridge/napi-loader.ts discovers the addon through
+      # prebuild/<platform>-<arch>/, which is exactly what gets uploaded here.
+      - name: Upload prebuild artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-prebuild-${{ runner.os }}-${{ runner.arch }}
+          path: dsh-qt-napi/prebuild/
+          if-no-files-found: error
+          retention-days: 7
+
   typescript:
     name: typescript (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -54,6 +124,84 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
+  # ---------------------------------------------------------------------------
+  # napi integration: run the TypeScript suite with a real addon on disk.
+  #
+  # The unit suite is hermetic (it must pass on a machine without the addon), so
+  # it cannot prove the napi-loader discovery path works against a real binary.
+  # This job downloads the prebuild and asserts the loader finds and uses it.
+  # ---------------------------------------------------------------------------
+  napi-integration:
+    name: napi integration
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: napi
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download addon prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: napi-prebuild-Linux-X64
+          path: dsh-qt-napi/prebuild
+
+      - name: Build TypeScript
+        run: pnpm build
+
+      # Two discovery paths matter and both are checked here, because they fail
+      # independently: an explicit DSH_QT_NAPI_PATH (what CI sets) and the
+      # search-root rule `<root>/dsh-qt-napi/prebuild/<triple>/`, which is how a
+      # packaged app finds the addon with no environment help at all.
+      - name: Addon is discovered via DSH_QT_NAPI_PATH
+        env:
+          DSH_QT_NAPI_PATH: ${{ github.workspace }}/dsh-qt-napi/prebuild/linux-x64/qt-bridge.node
+        run: |
+          node --input-type=commonjs - <<'JS'
+          const loader = require('./lib/qt-bridge/napi-loader.js');
+          const loaded = loader.loadNapiModule({ searchRoots: [] , env: process.env });
+          if (!loaded || loaded.degraded || !loaded.bridge) {
+            console.error('addon not discovered via env:', JSON.stringify(loaded && loaded.source));
+            process.exit(1);
+          }
+          if (loaded.source !== 'env') {
+            console.error('expected source "env", got', loaded.source);
+            process.exit(1);
+          }
+          console.log('discovered via', loaded.source);
+          JS
+
+      - name: Addon is discovered by search root (packaged-app layout)
+        run: |
+          node --input-type=commonjs - <<'JS'
+          const loader = require('./lib/qt-bridge/napi-loader.js');
+          // env: {} keeps DSH_QT_NAPI_PATH from the previous step out of the way,
+          // so only the <root>/<package>/prebuild/<triple>/ rule can succeed.
+          const loaded = loader.loadNapiModule({ searchRoots: [process.cwd()], env: {} });
+          if (!loaded || loaded.degraded || !loaded.bridge) {
+            console.error('addon not discovered by search root:', JSON.stringify(loaded && loaded.source));
+            process.exit(1);
+          }
+          console.log('discovered via', loaded.source, '(search root)');
+          JS
+
+      - name: Full suite with the real addon present
+        env:
+          DSH_QT_NAPI_PATH: ${{ github.workspace }}/dsh-qt-napi/prebuild/linux-x64/qt-bridge.node
+        run: pnpm test
+
   qml-lint:
     name: qml lint
     runs-on: ubuntu-22.04
@@ -79,10 +227,19 @@ jobs:
       - name: Configure (CMake, checks Qt6 requirements resolve)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
+  # ---------------------------------------------------------------------------
+  # qml tests: every TestCase under tests/qml/, executed headless.
+  #
+  # `qmltestrunner -input <dir> -import <dir>` discovers every tst_*.qml in the
+  # directory, so a new suite is picked up without editing this file. The
+  # "Assert every suite ran" step is what keeps that convenient behaviour honest:
+  # a suite that fails to load can be silently skipped, so the number of executed
+  # suites is compared against the number of tst_*.qml files on disk.
+  # ---------------------------------------------------------------------------
   qml-tests:
     name: qml tests
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -101,8 +258,123 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libgl1 libegl1
 
+      - name: Count expected suites
+        id: expected
+        run: |
+          count=$(ls tests/qml/tst_*.qml | wc -l)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Expecting $count QML suites:"
+          ls -1 tests/qml/tst_*.qml
+
       - name: Run Qt Quick Test suites
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          qmltestrunner -input tests/qml -import qml
+          set -o pipefail
+          qmltestrunner -input tests/qml -import qml 2>&1 | tee qmltest.log
+
+      # A suite whose imports fail is reported as an error by qmltestrunner but
+      # the process can still exit 0 on some Qt versions, so both the exit code
+      # (via pipefail above) and the executed-suite count are checked here.
+      - name: Assert every suite ran
+        run: |
+          # qmltestrunner prints QtTest's banner, which is NINE asterisks:
+          #   ********* Start testing of ChatView *********
+          # so the pattern must be '^\*+ Start testing of ', not '^\*\*\* '.
+          executed=$(grep -cE '^\*+ Start testing of ' qmltest.log || true)
+          expected="${{ steps.expected.outputs.count }}"
+          echo "executed=$executed expected=$expected"
+          if [ "$executed" -lt "$expected" ]; then
+            echo "::error::only $executed of $expected QML suites executed — see qmltest.log"
+            exit 1
+          fi
+
+      - name: Fail if any suite reported failures
+        run: |
+          # QtTest summarises each suite as
+          #   Totals: 12 passed, 0 failed, 0 skipped, 0 blacklisted, 5ms
+          # and there is no "Failures: N | Errors: N" line — checking for one
+          # would make this step silently inert.
+          failed_lines=$(grep -E '^Totals: [0-9]+ passed, [1-9][0-9]* failed' qmltest.log || true)
+          if [ -n "$failed_lines" ]; then
+            echo "::error::at least one QML suite reported failures"
+            echo "$failed_lines"
+            grep -E '^FAIL!' qmltest.log || true
+            exit 1
+          fi
+          if ! grep -qE '^Totals: ' qmltest.log; then
+            echo "::error::qmltestrunner produced no Totals line — see qmltest.log"
+            exit 1
+          fi
+
+      - name: Upload QML test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qmltest-log
+          path: qmltest.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # packaging: prove `pnpm package` produces an installable artifact.
+  #
+  # This runs in the test workflow as well as the build workflow because it is a
+  # cheap correctness check on CMakeLists.txt (install rules + CPack generators),
+  # whereas build.yml packages the real cross-platform release artifacts.
+  # ---------------------------------------------------------------------------
+  packaging:
+    name: packaging (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Build TypeScript
+        run: pnpm build
+
+      - name: Package
+        run: pnpm package
+
+      - name: Assert an artifact exists
+        shell: bash
+        run: |
+          shopt -s nullglob
+          artifacts=(dist/package/*.tar.gz dist/package/*.zip dist/package/*.dmg dist/package/*.exe)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "::error::pnpm package produced no artifact in dist/package/"
+            ls -la dist/package 2>/dev/null || true
+            exit 1
+          fi
+          ls -la "${artifacts[@]}"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-qt-app-package-${{ runner.os }}-${{ runner.arch }}
+          path: dist/package/
+          if-no-files-found: error
+          retention-days: 7

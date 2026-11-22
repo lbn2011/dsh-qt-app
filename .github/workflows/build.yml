@@ -1,8 +1,24 @@
-# Build the Qt6/QML host on Windows, Linux and macOS.
+# Build the Qt application and produce installable packages.
 #
-# All C++/Qt compilation happens here — never on the development machine.
-# The workflow assumes the repository root is dsh-qt-app/ (the package is
-# mirrored to its own repository for CI; see docs/ci.md).
+# Three things happen here that are worth knowing before editing:
+#
+# 1. The dsh-qt-napi addon is built in its own job, because it lives in a
+#    separate repository (lbn2011/dsh-qt-napi) and compiles vendored cmark-gfm.
+#    The Qt matrix consumes its prebuild artifact instead of compiling cmark
+#    itself: the Qt executable never parses Markdown (Node does, and hands QML an
+#    AST over the stdio bridge), so linking cmark-gfm here would duplicate
+#    symbols and ship a parser that is never called.
+#
+# 2. DSH_QT_NAPI_DIR points the CMake install rules at that artifact so CPack
+#    bundles qt-bridge.node next to the executable, in the
+#    dsh-qt-napi/prebuild/<platform>-<arch>/ layout the loader expects.
+#
+# 3. `pnpm package` both compiles and packages (see CMakeLists.txt), so the
+#    artifact upload is the real proof that install rules and CPack work.
+#
+# macOS is in the matrix but is an accepted gap: the shared macOS runner pool is
+# unavailable to this project, so those legs are cancelled before step 1. See
+# docs/ci.md § Known gaps.
 name: build
 
 on:
@@ -21,12 +37,67 @@ permissions:
 env:
   QT_VERSION: 6.7.3
   NODE_VERSION: "22.19.0"
+  NAPI_REPO: lbn2011/dsh-qt-napi
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Build the Markdown addon (compiles vendored cmark-gfm) and publish its
+  # prebuild/ tree as an artifact for the Qt matrix.
+  # ---------------------------------------------------------------------------
+  napi:
+    name: napi (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+
+    steps:
+      - name: Checkout dsh-qt-napi
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.NAPI_REPO }}
+          path: dsh-qt-napi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Python (node-gyp)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install addon dependencies
+        working-directory: dsh-qt-napi
+        run: npm install --ignore-scripts
+
+      - name: Build addon
+        working-directory: dsh-qt-napi
+        run: npm run build
+
+      - name: Verify addon
+        working-directory: dsh-qt-napi
+        run: npm run verify
+
+      - name: Upload prebuild artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-prebuild-${{ runner.os }}-${{ runner.arch }}
+          path: dsh-qt-napi/prebuild/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Compile the Qt app, then package it.
+  # ---------------------------------------------------------------------------
   qt-build:
-    name: qt6 (${{ matrix.os }})
+    name: qt build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    needs: napi
     strategy:
       fail-fast: false
       matrix:
@@ -41,12 +112,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      # pnpm version comes from "packageManager" in package.json; passing an
-      # explicit `version:` as well makes action-setup fail.
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
 
-      - name: Install JavaScript dependencies
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Build TypeScript
@@ -57,39 +126,93 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
-            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
-            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
+            libgl1-mesa-dev libxkbcommon-dev libxcb-cursor0 libfuse2 pigz
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          # Qt Quick Controls 2 ships with qtdeclarative in Qt 6, so no extra
-          # module is requested here (a Qt 5 style "qtquickcontrols2" module
-          # would fail to resolve for 6.x).
           cache: true
+
+      # The addon artifact is unpacked into the sibling layout the loader and the
+      # CMake staging logic both understand: <root>/dsh-qt-napi/prebuild/<triple>/.
+      - name: Download addon prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: napi-prebuild-${{ runner.os }}-${{ runner.arch }}
+          path: dsh-qt-napi/prebuild
+
+      - name: Show addon layout
+        shell: bash
+        run: ls -la dsh-qt-napi/prebuild/*/ || true
+
+      # Writing DSH_QT_NAPI_DIR into GITHUB_ENV makes it visible to every later
+      # step, including `pnpm package`, which CMakeLists.txt picks up through the
+      # environment fallback (no -D flag needs threading through npm scripts).
+      - name: Point CMake at the addon
+        shell: bash
+        run: echo "DSH_QT_NAPI_DIR=${GITHUB_WORKSPACE}/dsh-qt-napi" >> "$GITHUB_ENV"
 
       - name: Configure (CMake)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build (CMake)
+      - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Stage artifacts
+      - name: Package
+        run: pnpm package
+
+      - name: Assert packaging bundled the addon
         shell: bash
         run: |
-          mkdir -p dist
-          if [ -d build/Release ]; then
-            find build/Release -maxdepth 1 -type f \( -name 'dsh-qt-app*' \) -exec cp {} dist/ \;
+          # A package without qt-bridge.node still starts, but silently loses the
+          # Native Markdown renderer — exactly the regression this check exists for.
+          if [ ! -f build/CPackConfig.cmake ]; then
+            echo "::error::CPack was not configured"
+            exit 1
           fi
-          find build -maxdepth 1 -type f -name 'dsh-qt-app*' -exec cp {} dist/ \;
-          ls -la dist
+          if ! grep -qi 'qt-bridge.node' build/cmake_install.cmake; then
+            echo "::error::install rules do not mention qt-bridge.node"
+            exit 1
+          fi
+          ls -la dist/package/ 2>/dev/null || true
 
-      - name: Upload build artifacts
+      - name: Stage executable
+        shell: bash
+        run: |
+          # dist/bin keeps the staged executable separate from dist/package/,
+          # otherwise the two uploads would nest one artifact inside the other.
+          mkdir -p dist/bin
+          found=0
+          for candidate in \
+            build/dsh-qt-app \
+            build/dsh-qt-app.exe \
+            build/Release/dsh-qt-app.exe \
+            build/dsh-qt-app.app; do
+            if [ -e "$candidate" ]; then
+              cp -R "$candidate" dist/bin/ 2>/dev/null || true
+              echo "staged $candidate"
+              found=1
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no built executable found under build/"
+            find build -maxdepth 3 -name 'dsh-qt-app*' -print 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
           name: dsh-qt-app-${{ runner.os }}-${{ runner.arch }}
-          path: dist/
-          if-no-files-found: warn
-          retention-days: 14
+          path: dist/bin/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-qt-app-package-${{ runner.os }}-${{ runner.arch }}
+          path: dist/package/
+          if-no-files-found: error
+          retention-days: 7
