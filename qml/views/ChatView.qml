@@ -36,6 +36,9 @@ Rectangle {
 
     signal newSessionRequested()
 
+    /** Re-emitted from the header so a host can open its settings surface. */
+    signal settingsRequested()
+
     /**
      * Re-emitted from the model for every streamed delta.
      *
@@ -141,6 +144,7 @@ Rectangle {
         anchors.right: parent.right
         anchors.top: parent.top
         onNewSessionRequested: chatView.newSessionRequested()
+        onSettingsRequested: chatView.settingsRequested()
     }
 
     ListView {

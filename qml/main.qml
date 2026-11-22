@@ -13,7 +13,8 @@
 // imperative code can hook into.
 //
 // Phase 2h mounts the settings pane in a right-hand Drawer (SettingsPanel.qml):
-// the sidebar's footer button and `Ctrl+,` both open it, and the theme controls
+// the sidebar's footer button, the session header's gear and `Ctrl+,` all open
+// it, and the theme controls
 // inside write straight to `ctx.theme`, so a scheme or font-scale change is
 // visible in the chat behind the drawer while it is still open.
 import QtQuick
@@ -147,6 +148,7 @@ ApplicationWindow {
         anchors.top: parent.top
         anchors.bottom: messageInput.top
         onNewSessionRequested: window.newSession()
+        onSettingsRequested: settingsDrawer.open()
     }
 
     MessageInput {

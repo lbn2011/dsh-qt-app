@@ -55,12 +55,17 @@ Item {
             textFormat: Text.PlainText
         }
 
-        Markdown {
+        Loader {
             id: body
             objectName: "markdownListItemBody"
             width: row.width - markerText.width - row.spacing
-            document: root.blocks
-            theme: root.theme
+            source: "Markdown.qml"
+            onLoaded: {
+                item.document = root.blocks
+                item.theme = root.theme
+            }
+            Binding { target: body.item; property: "document"; value: root.blocks }
+            Binding { target: body.item; property: "theme"; value: root.theme }
         }
     }
 }

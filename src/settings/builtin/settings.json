@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "values": {
+    "codeFontFamily": "monospace",
+    "fontSize": 1,
+    "hideSystemMessages": false,
+    "language": "en",
+    "maxHighlightChars": 20000,
+    "showTimestamps": false,
+    "theme": "auto"
+  }
+}

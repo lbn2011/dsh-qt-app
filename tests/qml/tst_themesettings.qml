@@ -15,7 +15,7 @@
 //   * the slider drives the font scale, which moves text metrics and leaves the
 //     layout rhythm alone
 //   * out-of-range and non-numeric scales are clamped, not propagated
-//   * the panel exposes the Theme / Language / Plugins sections
+//   * the panel exposes the Theme / Language / Plugins / About tabs
 //   * a stub bridge receives the writes instead of the local fallbacks
 import QtQuick
 import QtTest
@@ -285,18 +285,21 @@ TestCase {
     }
 
     // ---- Panel shell ------------------------------------------------------
-    function test_panelExposesAllThreeSections() {
+    function test_panelExposesTheBuiltinTabs() {
         const panel = settingsPanelComponent.createObject(testCase, {})
         verify(panel !== null, "SettingsPanel could not be created")
 
-        compare(panel.sections.length, 3)
+        // Phase 2j turned the stacked sections into tabs and added About.
+        compare(panel.sections.length, 4)
         compare(panel.sections[0], "theme")
         compare(panel.sections[1], "language")
         compare(panel.sections[2], "plugins")
+        compare(panel.sections[3], "about")
 
         verify(findChild(panel, "settingsSectionTheme") !== null, "Theme section is present")
         verify(findChild(panel, "settingsSectionLanguage") !== null, "Language section is present")
         verify(findChild(panel, "settingsSectionPlugins") !== null, "Plugins section is present")
+        verify(findChild(panel, "settingsSectionAbout") !== null, "About section is present")
         verify(findChild(panel, "settingsTitle") !== null, "the panel has a title")
 
         panel.destroy()

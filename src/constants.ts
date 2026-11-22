@@ -44,6 +44,23 @@ export const DEFAULT_WINDOW_WIDTH = 1280
 export const DEFAULT_WINDOW_HEIGHT = 800
 
 /**
+ * Slot surfaces owned by the settings panel (`qml/views/settings/`).
+ *
+ * `conversation.settings.section` contributions become extra tabs next to the
+ * built-in Theme / Plugins / About ones; `conversation.settings.form`
+ * contributions are rendered as forms *inside* the tab named by their
+ * `section` field. Keeping them separate lets a plugin ship a whole tab without
+ * having to learn the panel's layout.
+ */
+export const SETTINGS_SLOT_SURFACES = [
+  'conversation.settings.section',
+  'conversation.settings.form',
+] as const
+
+/** A surface the settings panel hosts. */
+export type SettingsSlotSurface = (typeof SETTINGS_SLOT_SURFACES)[number]
+
+/**
  * Slot surfaces that the native Qt UI renders itself instead of falling back to
  * an embedded WebView (implementation plan §1.2 "插件集成点").
  */
@@ -54,6 +71,7 @@ export const NATIVE_SLOT_SURFACES = [
   'sidebar.left.panel',
   'settings.general',
   'session.panel.section',
+  ...SETTINGS_SLOT_SURFACES,
 ] as const
 
 export type NativeSlotSurface = (typeof NATIVE_SLOT_SURFACES)[number]

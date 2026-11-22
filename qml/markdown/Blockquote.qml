@@ -37,7 +37,7 @@ Item {
         color: root.base.tokens.border
     }
 
-    Markdown {
+    Loader {
         id: content
         objectName: "markdownBlockquoteBody"
         anchors.left: rule.right
@@ -45,7 +45,12 @@ Item {
         anchors.right: parent.right
         anchors.top: parent.top
         anchors.topMargin: Math.round(root.base.tokens.spacing / 2)
-        document: root.children
-        theme: root.theme
+        source: "Markdown.qml"
+        onLoaded: {
+            item.document = root.children
+            item.theme = root.theme
+        }
+        Binding { target: content.item; property: "document"; value: root.children }
+        Binding { target: content.item; property: "theme"; value: root.theme }
     }
 }

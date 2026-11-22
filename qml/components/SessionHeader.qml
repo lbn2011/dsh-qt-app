@@ -29,6 +29,16 @@ Rectangle {
 
     signal newSessionRequested()
 
+    /**
+     * Emitted when the settings button is activated.
+     *
+     * The header does not own the settings panel: it only announces intent, and
+     * whichever host owns the panel (main.qml today) decides how to show it.
+     * Same shape as SessionSidebar.settingsRequested(), so both entry points can
+     * be wired to one action.
+     */
+    signal settingsRequested()
+
     implicitHeight: theme.headerHeight
     color: theme.surface
 
@@ -101,6 +111,21 @@ Rectangle {
                     anchors.verticalCenter: parent.verticalCenter
                 }
             }
+        }
+
+        Button {
+            objectName: "sessionSettingsButton"
+            text: "\u2699" // gear, so no icon asset is needed
+            flat: true
+            implicitWidth: Math.round(header.theme.controlHeight * 1.15)
+            implicitHeight: Math.round(header.theme.controlHeight * 0.85)
+            palette.buttonText: header.theme.textMuted
+            palette.highlight: header.theme.accent
+            palette.highlightedText: header.theme.textInverse
+            ToolTip.visible: hovered
+            ToolTip.text: qsTr("Settings (Ctrl+,)")
+            ToolTip.delay: 400
+            onClicked: header.settingsRequested()
         }
 
         Button {

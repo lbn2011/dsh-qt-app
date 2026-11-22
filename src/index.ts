@@ -25,6 +25,7 @@ import {
   PLUGIN_VERSION,
   QML_ENTRY_URL,
 } from './constants.js'
+import type { SettingsSlotSurface } from './constants.js'
 import { EventLoopBridge, createEventLoopBridge } from './event-loop/timer.js'
 import { highlight as highlightSource } from './highlight/index.js'
 import type { EventLoopBridgeOptions, EventLoopStats } from './event-loop/timer.js'
@@ -51,6 +52,21 @@ export type {
 } from './event-loop/timer.js'
 export { createFallbackBridge, discoverCandidates, escapeHtml, isNapiBridge, loadNapiModule, prebuildTriple } from './qt-bridge/napi-loader.js'
 export type { NapiBridge, NapiLoadOptions, NapiLoadResult, NapiSource } from './qt-bridge/napi-loader.js'
+
+/**
+ * Slot surfaces the settings panel (`qml/views/settings/`) hosts.
+ *
+ * `conversation.settings.section` contributions become extra tabs alongside the
+ * built-in Theme / Plugins / About tabs, and `conversation.settings.form`
+ * contributions are rendered as forms inside the tab named by their `section`
+ * field. Declared here as well as in `constants.ts` so the plugin entry is the
+ * one place a plugin author reads to discover what the native UI accepts;
+ * `tests/settings-slots.test.ts` keeps the two declarations identical.
+ */
+export const SETTINGS_SLOT_SURFACES = [
+  'conversation.settings.section',
+  'conversation.settings.form',
+] as const satisfies readonly SettingsSlotSurface[]
 
 /** Cordis plugin display name. */
 export const name = PLUGIN_NAME
