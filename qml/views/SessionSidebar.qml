@@ -12,7 +12,18 @@ import "../components"
 Rectangle {
     id: sidebar
 
-    property Theme theme: Theme {}
+    /**
+     * Live theme source published by native/main.cpp as `ctx.theme`.
+     *
+     * Declared per component (not only in Theme.qml) because a component may be
+     * instantiated on its own — a QML test, a settings preview — and it must
+     * still follow the live palette. When a parent injects its own `theme`, that
+     * instance already carries the bridge and this one is simply unused.
+     */
+    // qmllint disable unqualified
+    readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
+    // qmllint enable unqualified
+    property Theme theme: Theme { bridge: themeBridge }
     /** Sessions to show; expected roles: title. */
     property ListModel sessionList: null
     /** Index of the active session, -1 when none is selected. */
@@ -50,6 +61,10 @@ Rectangle {
             text: qsTr("New session")
             width: parent.width
             implicitHeight: sidebar.theme.controlHeight
+            palette.button: sidebar.theme.surfaceAlt
+            palette.buttonText: sidebar.theme.text
+            palette.highlight: sidebar.theme.accent
+            palette.highlightedText: sidebar.theme.textInverse
             onClicked: sidebar.newSessionRequested()
         }
 

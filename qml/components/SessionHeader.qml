@@ -11,7 +11,18 @@ import QtQuick.Layouts
 Rectangle {
     id: header
 
-    property Theme theme: Theme {}
+    /**
+     * Live theme source published by native/main.cpp as `ctx.theme`.
+     *
+     * Declared per component (not only in Theme.qml) because a component may be
+     * instantiated on its own — a QML test, a settings preview — and it must
+     * still follow the live palette. When a parent injects its own `theme`, that
+     * instance already carries the bridge and this one is simply unused.
+     */
+    // qmllint disable unqualified
+    readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
+    // qmllint enable unqualified
+    property Theme theme: Theme { bridge: themeBridge }
     property string title: qsTr("New session")
     property string status: "idle"
     property string model: ""
@@ -95,6 +106,12 @@ Rectangle {
         Button {
             objectName: "newSessionButton"
             text: qsTr("New session")
+            // The Basic style paints buttons from the palette; without these the
+            // light scheme would keep dark-on-dark button text.
+            palette.button: header.theme.surfaceAlt
+            palette.buttonText: header.theme.text
+            palette.highlight: header.theme.accent
+            palette.highlightedText: header.theme.textInverse
             onClicked: header.newSessionRequested()
         }
     }

@@ -4,6 +4,13 @@
 // composer. There is no Node side attached yet, so `sendMessage()` echoes the
 // turn into the model locally; Phase 2 replaces that body with a call into
 // `ctx.qtRenderer` over the 10 ms event-loop bridge (src/event-loop/timer.ts).
+//
+// Phase 2g adds live theming. The C++ host (native/main.cpp) publishes
+// `ctx.theme` — a ThemeBridge owning the scheme id and the font scale — and
+// `Theme.qml` turns it into bindings, so switching scheme or scale repaints the
+// window in place. This file owns the one place that cannot be a binding: the
+// window-level `themeChanged` broadcast that the settings UI (t17) and any
+// imperative code can hook into.
 import QtQuick
 import QtQuick.Controls
 import "components"
@@ -24,10 +31,53 @@ ApplicationWindow {
     color: theme.background
 
     // ---- Shared state -----------------------------------------------------
+    // `Theme` picks up `ctx.theme` on its own (see components/Theme.qml), so the
+    // whole tree below follows the live palette without further wiring.
     Theme { id: theme }
     MessageModel { id: chatModel }
     SessionModel { id: session }
     ListModel { id: sessionIndexModel }
+
+    /** Active scheme id, mirrored for bindings that only need the name. */
+    readonly property string themeId: theme.themeId
+
+    /**
+     * Broadcast after the palette has been swapped.
+     *
+     * Everything that is a pure binding has already repainted by the time this
+     * fires; the signal exists for the parts that cannot be (a settings pane
+     * re-reading the list of schemes, the Markdown renderer re-highlighting with
+     * the new code colours).
+     */
+    signal themeChanged(string themeId)
+
+    /**
+     * Cycle dark → light → dark.
+     *
+     * The real switch lives in the bridge so the choice is persisted to
+     * theme.json and picked up by the next start; this is the manual hook the
+     * settings UI and `Ctrl+Shift+T` both use.
+     */
+    function toggleTheme() {
+        if (theme.bridge !== null)
+            theme.bridge.toggle()
+    }
+
+    // The bridge is null outside the native host (qmltestrunner, qmllint).
+    Connections {
+        target: theme.bridge
+        ignoreUnknownSignals: true
+
+        function onThemeChanged() {
+            window.themeChanged(theme.themeId)
+        }
+    }
+
+    Shortcut {
+        sequences: ["Ctrl+Shift+T", "Meta+Shift+T"]
+        context: Qt.ApplicationShortcut
+        onActivated: window.toggleTheme()
+    }
 
     /**
      * Append a user turn locally.

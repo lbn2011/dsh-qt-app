@@ -9,7 +9,18 @@ import QtQuick.Controls
 Item {
     id: emptyState
 
-    property Theme theme: Theme {}
+    /**
+     * Live theme source published by native/main.cpp as `ctx.theme`.
+     *
+     * Declared per component (not only in Theme.qml) because a component may be
+     * instantiated on its own — a QML test, a settings preview — and it must
+     * still follow the live palette. When a parent injects its own `theme`, that
+     * instance already carries the bridge and this one is simply unused.
+     */
+    // qmllint disable unqualified
+    readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
+    // qmllint enable unqualified
+    property Theme theme: Theme { bridge: themeBridge }
     property string title: qsTr("No messages yet")
     property string hint: qsTr("Type a message below to start a session.")
 

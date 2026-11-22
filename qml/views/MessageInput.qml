@@ -11,7 +11,18 @@ import "../components"
 Rectangle {
     id: messageInput
 
-    property Theme theme: Theme {}
+    /**
+     * Live theme source published by native/main.cpp as `ctx.theme`.
+     *
+     * Declared per component (not only in Theme.qml) because a component may be
+     * instantiated on its own — a QML test, a settings preview — and it must
+     * still follow the live palette. When a parent injects its own `theme`, that
+     * instance already carries the bridge and this one is simply unused.
+     */
+    // qmllint disable unqualified
+    readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
+    // qmllint enable unqualified
+    property Theme theme: Theme { bridge: themeBridge }
     /** Two-way access to the editor contents (handy for tests and shortcuts). */
     property alias text: editor.text
     /** While busy the send action is disabled but typing stays possible. */
@@ -65,6 +76,12 @@ Rectangle {
             color: messageInput.theme.text
             placeholderTextColor: messageInput.theme.textMuted
             font.pixelSize: messageInput.theme.fontNormal
+            // Cursor, selection and platform text colour follow the scheme too;
+            // `color` above only covers the glyphs themselves.
+            palette.text: messageInput.theme.text
+            palette.base: messageInput.theme.background
+            palette.highlight: messageInput.theme.accent
+            palette.highlightedText: messageInput.theme.textInverse
             selectByMouse: true
             wrapMode: Text.WordWrap
             maximumLength: messageInput.maxLength
@@ -82,6 +99,10 @@ Rectangle {
             text: qsTr("Send")
             enabled: messageInput.canSend
             implicitHeight: messageInput.theme.controlHeight
+            palette.button: messageInput.theme.accent
+            palette.buttonText: messageInput.theme.textInverse
+            palette.highlight: messageInput.theme.accentHover
+            palette.highlightedText: messageInput.theme.textInverse
             onClicked: messageInput.submit()
         }
     }

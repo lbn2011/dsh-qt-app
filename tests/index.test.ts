@@ -11,7 +11,7 @@ import { test } from 'node:test'
 
 import { Context } from '@deepseek-ai/cordis'
 
-import plugin, { QtRendererService, apply, inject, name, version } from '../src/index.js'
+import plugin, { QtRendererService, apply, inject, loadNapiModule, name, version } from '../src/index.js'
 import type { QtPluginConfig } from '../src/index.js'
 import { NATIVE_SLOT_SURFACES, PLUGIN_NAME, PLUGIN_VERSION, QML_ENTRY_URL } from '../src/constants.js'
 import type { NapiBridge } from '../src/qt-bridge/napi-loader.js'
@@ -72,17 +72,34 @@ test('renderMarkdown()/highlightCode() delegate to the N-API bridge', async () =
 })
 
 test('a missing addon degrades to escaped plain text instead of throwing', async () => {
-  const ctx = new Context()
-  apply(ctx, { autoStartEventLoop: false, napiPath: '/nonexistent/dsh-qt-napi/qt-bridge.node' })
+  // Hermetic on purpose: discovery also looks for a sibling `dsh-qt-napi`
+  // checkout in the parent directory, and the N-API task builds a real addon
+  // there. The search roots are therefore pinned empty, so this assertion tests
+  // the loader's degradation path rather than whatever happens to be on disk.
+  const result = loadNapiModule({
+    explicitPath: '/nonexistent/dsh-qt-napi/qt-bridge.node',
+    searchRoots: [],
+    env: {},
+  })
+  assert.equal(result.degraded, true)
+  assert.equal(result.source, 'fallback')
+  assert.ok(result.attempted.length > 0)
 
-  const stats = ctx.qtRenderer.stats
-  assert.equal(stats.bridgeDegraded, true)
-  assert.equal(stats.bridgeSource, 'fallback')
-  assert.ok(ctx.qtRenderer.bridgeLoad.attempted.length > 0)
-
-  const html = await ctx.qtRenderer.renderMarkdown('<script>alert(1)</script>')
+  const html = await result.bridge.renderMarkdown('<script>alert(1)</script>')
   assert.ok(html.includes('&lt;script&gt;'), 'fallback must escape markup')
   assert.equal(html.includes('<script>'), false)
+})
+
+test('apply() tolerates an unusable addon path and still renders', async () => {
+  const ctx = new Context()
+  // No searchRoots knob through the plugin config, so the outcome depends on
+  // whether a local addon exists: assert only what must always hold.
+  apply(ctx, { autoStartEventLoop: false, napiPath: '/nonexistent/dsh-qt-napi/qt-bridge.node' })
+
+  assert.ok(ctx.qtRenderer.bridgeLoad.attempted.length > 0)
+  const html = await ctx.qtRenderer.renderMarkdown('hello *world*')
+  assert.equal(typeof html, 'string')
+  assert.ok(html.length > 0)
 })
 
 test('showDialog() posts to the event loop and settles via resolveDialog()', async () => {

@@ -14,7 +14,18 @@ import "../components"
 Rectangle {
     id: chatView
 
-    property Theme theme: Theme {}
+    /**
+     * Live theme source published by native/main.cpp as `ctx.theme`.
+     *
+     * Declared per component (not only in Theme.qml) because a component may be
+     * instantiated on its own — a QML test, a settings preview — and it must
+     * still follow the live palette. When a parent injects its own `theme`, that
+     * instance already carries the bridge and this one is simply unused.
+     */
+    // qmllint disable unqualified
+    readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
+    // qmllint enable unqualified
+    property Theme theme: Theme { bridge: themeBridge }
     /** Message model to render; null renders the empty state only. */
     property ListModel messageModel: null
 
@@ -67,7 +78,10 @@ Rectangle {
         spacing: chatView.theme.spacingLarge
         boundsBehavior: Flickable.StopAtBounds
         model: chatView.messageModel
-        ScrollBar.vertical: ScrollBar {}
+        ScrollBar.vertical: ScrollBar {
+            palette.mid: chatView.theme.border
+            palette.dark: chatView.theme.textMuted
+        }
 
         delegate: MessageDelegate {
             theme: chatView.theme

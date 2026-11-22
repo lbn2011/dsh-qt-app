@@ -1,0 +1,53 @@
+{
+  "id": "light",
+  "name": "Light",
+  "appearance": "light",
+  "palette": {
+    "background": "#f7f8fa",
+    "surface": "#ffffff",
+    "surfaceAlt": "#f1f2f5",
+    "surfaceAccent": "#dbe8ff",
+    "border": "#d8dbe2",
+    "text": "#1b1c1f",
+    "textMuted": "#5c626d",
+    "textInverse": "#ffffff",
+    "accent": "#2f6fd0",
+    "accentHover": "#2559ad",
+    "danger": "#c93c34",
+    "warning": "#8a5d00",
+    "success": "#1f7f36",
+    "codeBackground": "#f3f4f7",
+    "codeBorder": "#dde0e6",
+    "linkColor": "#1f5fbf"
+  },
+  "typography": {
+    "fontFamily": "Inter",
+    "codeFontFamily": "JetBrains Mono",
+    "fontScale": 1,
+    "fontSmall": 11,
+    "fontNormal": 13,
+    "fontLarge": 16,
+    "fontTitle": 20
+  },
+  "spacing": {
+    "unit": 8,
+    "large": 12
+  },
+  "radius": {
+    "base": 8,
+    "large": 12
+  },
+  "shadow": {
+    "none": "",
+    "sm": "0 1px 2px rgba(16,24,40,0.08)",
+    "md": "0 4px 12px rgba(16,24,40,0.12)",
+    "lg": "0 12px 32px rgba(16,24,40,0.16)"
+  },
+  "metrics": {
+    "controlHeight": 32,
+    "composerHeight": 96,
+    "sidebarWidth": 240,
+    "headerHeight": 48,
+    "animationDuration": 120
+  }
+}
