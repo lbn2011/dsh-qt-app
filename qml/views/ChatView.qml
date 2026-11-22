@@ -37,6 +37,25 @@ Rectangle {
     signal newSessionRequested()
 
     /**
+     * Re-emitted from the model for every streamed delta.
+     *
+     * @param index row being updated
+     * @param delta the characters that just arrived
+     * @param text the accumulated body so far
+     */
+    signal chunk(int index, string delta, string text)
+
+    /**
+     * Stable block ids per row, captured from the last parser snapshot.
+     *
+     * The delegate needs the ids (not just the document) to update a single block
+     * in place: `streamBlockIds[index]` is the id array reported by
+     * `DeltaMarkdownParser.blockIds`. Kept here rather than in the model because
+     * it is view state — the model only carries the document.
+     */
+    property var streamBlockIds: ({})
+
+    /**
      * Rows currently held by the model.
      *
      * Deliberately derived from the *model*, not from ListView.count: the view's
@@ -54,6 +73,64 @@ Rectangle {
      * keeps its window hidden, so tests must assert this intent instead).
      */
     readonly property bool showEmptyState: chatView.messageCount === 0
+
+    /** Block ids recorded for `index`, or an empty array. */
+    function blockIdsFor(index) {
+        const ids = chatView.streamBlockIds[index]
+        return ids === undefined || ids === null ? [] : ids
+    }
+
+    /**
+     * Append one streamed delta to row `index`.
+     *
+     * Forwards to the model when it exposes `appendChunk()` (the QML MessageModel
+     * and the planned C++ model both do) and re-emits `chunk`. The parser snapshot
+     * is stored per row so the delegate can address individual blocks by id.
+     *
+     * @returns the snapshot, or null when the model has no parser
+     */
+    function appendChunk(index, delta) {
+        if (chatView.messageModel === null || chatView.messageModel === undefined)
+            return null
+        if (typeof chatView.messageModel.appendChunk !== "function")
+            return null
+        const snapshot = chatView.messageModel.appendChunk(index, delta)
+        chatView.recordSnapshot(index, snapshot)
+        return snapshot
+    }
+
+    /** Start a streamed assistant message; returns its row index. */
+    function beginStream(role) {
+        if (chatView.messageModel === null || chatView.messageModel === undefined)
+            return -1
+        if (typeof chatView.messageModel.beginStream !== "function")
+            return -1
+        const index = chatView.messageModel.beginStream(role)
+        chatView.streamBlockIds[index] = []
+        return index
+    }
+
+    /** Finish a streamed message (clears `pending`, flushes a held surrogate). */
+    function endStream(index) {
+        if (chatView.messageModel === null || chatView.messageModel === undefined)
+            return null
+        if (typeof chatView.messageModel.endStream !== "function")
+            return null
+        const snapshot = chatView.messageModel.endStream(index)
+        chatView.recordSnapshot(index, snapshot)
+        return snapshot
+    }
+
+    /** Remember the block ids a snapshot reported for one row. */
+    function recordSnapshot(index, snapshot) {
+        if (snapshot === null || snapshot === undefined || snapshot.blockIds === undefined)
+            return
+        const ids = snapshot.blockIds
+        const copy = []
+        for (let position = 0; position < ids.length; ++position)
+            copy.push(ids[position])
+        chatView.streamBlockIds[index] = copy
+    }
 
     color: theme.background
 
@@ -89,6 +166,14 @@ Rectangle {
 
         // Keep the newest message in view, including while a reply streams in.
         onCountChanged: messageList.positionViewAtEnd()
+    }
+
+    // Re-emit the model's streaming signals so a host can listen on the view.
+    Connections {
+        target: chatView.messageModel
+        ignoreUnknownSignals: true
+        function onChunk(index, delta, text) { chatView.chunk(index, delta, text) }
+        function onPartialMarkdown(index, snapshot) { chatView.recordSnapshot(index, snapshot) }
     }
 
     EmptyState {

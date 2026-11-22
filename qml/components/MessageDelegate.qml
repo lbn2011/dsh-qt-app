@@ -26,6 +26,16 @@ Item {
     /** Emitted when the user activates a link inside the body. */
     signal linkActivated(string href)
 
+    /**
+     * In-place document override for a streaming reply.
+     *
+     * While an assistant reply streams in, the body is updated through
+     * `replace()` / `applyStreamSnapshot()` instead of round-tripping through the
+     * model: a model write re-evaluates the role and the whole delegate, which is
+     * exactly what streaming must avoid. Null means "use the `markdown` role".
+     */
+    property var streamDocument: null
+
     // ---- Styling ----------------------------------------------------------
     /**
      * Live theme source published by native/main.cpp as `ctx.theme`.
@@ -68,8 +78,12 @@ Item {
      * An empty document is treated as "no markdown" so a reply whose parse
      * produced nothing still shows its plain text instead of a blank bubble.
      */
+    readonly property var bodyDocument: delegate.streamDocument !== null
+                                       ? delegate.streamDocument
+                                       : delegate.markdown
+
     readonly property bool hasMarkdown: {
-        const node = delegate.markdown
+        const node = delegate.bodyDocument
         if (node === null || node === undefined)
             return false
         if (typeof node !== "object")
@@ -129,7 +143,7 @@ Item {
                 objectName: "messageMarkdownBody"
                 width: content.width
                 visible: delegate.hasMarkdown
-                document: delegate.markdown
+                document: delegate.bodyDocument
                 theme: delegate.theme
                 onLinkActivated: function(href) { delegate.linkActivated(href) }
             }
@@ -146,5 +160,63 @@ Item {
                 textFormat: Text.PlainText
             }
         }
+    }
+
+    // ---- streaming API -----------------------------------------------------
+
+    /**
+     * Replace the rendered body in place.
+     *
+     * Accepts either a full document node (a reset or a correction) or a
+     * `StreamSnapshot` from `DeltaMarkdownParser`, whose `updates` are mirrored
+     * onto the existing blocks so only the changed row re-renders.
+     *
+     * @returns true when something was applied
+     */
+    function replace(markdown) {
+        if (markdown === null || markdown === undefined) {
+            delegate.streamDocument = null
+            return false
+        }
+        if (markdown.updates !== undefined && markdown.updates !== null)
+            return delegate.applyStreamSnapshot(markdown) >= 0
+        if (markdown.type === "document") {
+            delegate.streamDocument = markdown
+            markdownBody.replaceDocument(markdown)
+            return true
+        }
+        return false
+    }
+
+    /** Apply one streaming snapshot to the body. Returns the number of updates. */
+    function applyStreamSnapshot(snapshot) {
+        if (snapshot === null || snapshot === undefined)
+            return 0
+        if (snapshot.document !== undefined && snapshot.document !== null) {
+            // Keep the fallback flag in sync: an empty document means plain text.
+            delegate.streamDocument = snapshot.document
+        }
+        return markdownBody.applySnapshot(snapshot)
+    }
+
+    /** Update a single block by id; true when the id existed. */
+    function replaceNode(nodeId, node) {
+        return markdownBody.updateNode(nodeId, node)
+    }
+
+    /** Append one block; returns the id used. */
+    function appendNode(node, nodeId) {
+        return markdownBody.appendNode(node, nodeId)
+    }
+
+    /** Remove one block by id. */
+    function removeNode(nodeId) {
+        return markdownBody.removeNode(nodeId)
+    }
+
+    /** Drop the streaming override and go back to the `markdown` role. */
+    function clearStream() {
+        delegate.streamDocument = null
+        markdownBody.streaming = false
     }
 }

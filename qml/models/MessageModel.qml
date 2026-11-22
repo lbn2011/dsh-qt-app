@@ -32,6 +32,38 @@ ListModel {
     readonly property string roleTool: "tool"
 
     /**
+     * Emitted for every streamed delta.
+     *
+     * @param index row being updated
+     * @param delta the characters that just arrived
+     * @param text the accumulated body so far
+     */
+    signal chunk(int index, string delta, string text)
+
+    /**
+     * Emitted once the parser has turned the accumulated text into a document.
+     *
+     * @param index row being updated
+     * @param snapshot the `StreamSnapshot` (updates + document + blockIds)
+     */
+    signal partialMarkdown(int index, var snapshot)
+
+    /**
+     * Optional incremental parser (`DeltaMarkdownParser` from src/markdown).
+     *
+     * The parser lives in TypeScript, so the host injects it: native/main.cpp can
+     * expose the Node parser over the bridge, and a test can inject a stub. When it
+     * is null `appendChunk()` still accumulates text and emits `chunk`, which keeps
+     * the model usable without a parser attached.
+     */
+    property var parser: null
+
+    /** Most recent snapshot, or null. */
+    readonly property var lastSnapshot: model.internalSnapshot
+
+    property var internalSnapshot: null
+
+    /**
      * Append one message.
      *
      * @param role one of roleUser / roleAssistant / roleSystem / roleTool
@@ -116,5 +148,66 @@ ListModel {
     /** Drop every message (new session). */
     function clearMessages() {
         model.clear()
+    }
+
+    // ---- streaming ---------------------------------------------------------
+
+    /**
+     * Append one streamed delta to a message.
+     *
+     * The text role is updated immediately so a plain-text fallback stays current,
+     * then the delta is handed to `parser` (when present) and the resulting
+     * snapshot is emitted. Nothing here re-parses Markdown in QML: the AST always
+     * comes from TypeScript, so there is exactly one parser in the system.
+     *
+     * @returns the snapshot, or null when no parser is attached
+     */
+    function appendChunk(index, delta) {
+        const text = typeof delta === "string" ? delta : String(delta)
+        if (index < 0 || index >= model.count)
+            return null
+        const row = model.get(index)
+        const accumulated = (row.text === undefined || row.text === null ? "" : row.text) + text
+        model.setProperty(index, "text", accumulated)
+
+        model.chunk(index, text, accumulated)
+
+        if (model.parser === null || model.parser === undefined) {
+            model.internalSnapshot = null
+            return null
+        }
+
+        const snapshot = model.parser.onChunk(text)
+        model.internalSnapshot = snapshot
+        if (snapshot !== null && snapshot !== undefined && snapshot.document !== undefined)
+            model.setProperty(index, "markdown", snapshot.document)
+        model.partialMarkdown(index, snapshot)
+        return snapshot
+    }
+
+    /** Start a fresh streamed message and return its row index. */
+    function beginStream(role) {
+        const rowRole = (role === undefined || role === null || role === "")
+                        ? model.roleAssistant : String(role)
+        const index = model.appendMessage(rowRole, "", new Date().toISOString(), true, null)
+        if (model.parser !== null && model.parser !== undefined && typeof model.parser.reset === "function")
+            model.parser.reset()
+        model.internalSnapshot = null
+        return index
+    }
+
+    /** Finish a streamed message: clear `pending` and flush a held surrogate. */
+    function endStream(index) {
+        if (index < 0 || index >= model.count)
+            return null
+        if (model.parser !== null && model.parser !== undefined && typeof model.parser.flush === "function") {
+            const snapshot = model.parser.flush()
+            model.internalSnapshot = snapshot
+            if (snapshot !== null && snapshot !== undefined && snapshot.document !== undefined)
+                model.setProperty(index, "markdown", snapshot.document)
+            model.partialMarkdown(index, snapshot)
+        }
+        model.setProperty(index, "pending", false)
+        return model.internalSnapshot
     }
 }
