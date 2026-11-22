@@ -167,3 +167,5 @@ pnpm build                # tsc emit
 cmake -S . -B /tmp/check  # fails at find_package(Qt6) without a Qt toolchain,
                           # but parses everything before it
 ```
+
+<!-- CI re-triggered to verify F3-b fix (binding.gyp 6c505c6) -->
