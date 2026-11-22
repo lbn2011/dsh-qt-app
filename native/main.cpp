@@ -361,7 +361,15 @@ public:
 
     void stop()
     {
-        if (!active_ && readNotifier_ == nullptr && pollTimer_ == nullptr)
+        // Each platform declares exactly one of the two readiness members, so the
+        // idle check has to name only the one that exists in this build. Naming
+        // both fails to compile on the other platform.
+#if defined(Q_OS_WIN)
+        const bool idle = !active_ && pollTimer_ == nullptr;
+#else
+        const bool idle = !active_ && readNotifier_ == nullptr;
+#endif
+        if (idle)
             return;
         active_ = false;
 #ifndef Q_OS_WIN

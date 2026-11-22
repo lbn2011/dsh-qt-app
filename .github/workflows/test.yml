@@ -70,13 +70,56 @@ jobs:
         working-directory: dsh-qt-napi
         run: npm install --ignore-scripts
 
+      # node-gyp is invoked through the node binary instead of through
+      # scripts/build.mjs. That script resolves node-gyp to a local
+      # node_modules/.bin shim and otherwise falls back to `npx` — on Windows both
+      # are `.cmd` files, and spawning a `.cmd` without a shell throws EINVAL on
+      # Node >= 18.20 / 20.12 (the CVE-2024-27980 hardening). Pinning the Node
+      # version does not undo that, so the JS entry point is called directly and
+      # the toolchain version is pinned here instead. scripts/build.mjs remains
+      # what local builds use; the two steps below reproduce it for CI.
+      - name: Install pinned node-gyp
+        working-directory: dsh-qt-napi
+        # --ignore-scripts matters: without it npm would also run this package's
+        # own install hook, which compiles through the very shim we are avoiding.
+        run: npm install --no-save --ignore-scripts node-gyp@11
+
       - name: Build addon (compiles vendored cmark-gfm)
         working-directory: dsh-qt-napi
-        run: npm run build
+        run: node node_modules/node-gyp/bin/node-gyp.js rebuild
+
+      # Mirrors the staging half of scripts/build.mjs: the loader and the uploaded
+      # artifact both expect prebuild/<platform>-<arch>/qt-bridge.node. Kept as a
+      # node one-liner so it behaves identically in bash and in PowerShell.
+      - name: Stage prebuild binary
+        working-directory: dsh-qt-napi
+        run: |
+          node -e "const{existsSync,mkdirSync,copyFileSync}=require('node:fs');const t=process.platform+'-'+process.arch;const src='build/Release/qt-bridge.node';if(!existsSync(src)){console.error('missing '+src);process.exit(1)}mkdirSync('prebuild/'+t,{recursive:true});copyFileSync(src,'prebuild/'+t+'/qt-bridge.node');console.log('staged prebuild/'+t+'/qt-bridge.node')"
 
       - name: Verify addon
         working-directory: dsh-qt-napi
         run: npm run verify
+
+      # The addon's loader-integration suite drives the *host* loader
+      # (dsh-qt-app/lib/qt-bridge/napi-loader.js) against this package, and resolves
+      # the host as a sibling directory literally named dsh-qt-app. Without a
+      # compiled host present, that suite fails with 'run "pnpm -C dsh-qt-app build"
+      # first', so the host is checked out and built here as well.
+      - name: Checkout dsh-qt-app (host loader under test)
+        uses: actions/checkout@v4
+        with:
+          path: dsh-qt-app
+
+      # This job's workspace root is the addon checkout, which has no package.json,
+      # so pnpm/action-setup cannot infer the version from the default location;
+      # point it at the host's manifest to keep packageManager the single source.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: dsh-qt-app/package.json
+
+      - name: Build host TypeScript package
+        run: pnpm -C dsh-qt-app install --frozen-lockfile && pnpm -C dsh-qt-app build
 
       - name: Addon unit tests
         working-directory: dsh-qt-napi

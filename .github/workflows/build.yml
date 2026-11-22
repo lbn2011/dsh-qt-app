@@ -74,9 +74,31 @@ jobs:
         working-directory: dsh-qt-napi
         run: npm install --ignore-scripts
 
-      - name: Build addon
+      # node-gyp is invoked through the node binary instead of through
+      # scripts/build.mjs. That script resolves node-gyp to a local
+      # node_modules/.bin shim and otherwise falls back to `npx` — on Windows both
+      # are `.cmd` files, and spawning a `.cmd` without a shell throws EINVAL on
+      # Node >= 18.20 / 20.12 (the CVE-2024-27980 hardening). Pinning the Node
+      # version does not undo that, so the JS entry point is called directly and
+      # the toolchain version is pinned here instead. scripts/build.mjs remains
+      # what local builds use; the two steps below reproduce it for CI.
+      - name: Install pinned node-gyp
         working-directory: dsh-qt-napi
-        run: npm run build
+        # --ignore-scripts matters: without it npm would also run this package's
+        # own install hook, which compiles through the very shim we are avoiding.
+        run: npm install --no-save --ignore-scripts node-gyp@11
+
+      - name: Build addon (compiles vendored cmark-gfm)
+        working-directory: dsh-qt-napi
+        run: node node_modules/node-gyp/bin/node-gyp.js rebuild
+
+      # Mirrors the staging half of scripts/build.mjs: the loader and the uploaded
+      # artifact both expect prebuild/<platform>-<arch>/qt-bridge.node. Kept as a
+      # node one-liner so it behaves identically in bash and in PowerShell.
+      - name: Stage prebuild binary
+        working-directory: dsh-qt-napi
+        run: |
+          node -e "const{existsSync,mkdirSync,copyFileSync}=require('node:fs');const t=process.platform+'-'+process.arch;const src='build/Release/qt-bridge.node';if(!existsSync(src)){console.error('missing '+src);process.exit(1)}mkdirSync('prebuild/'+t,{recursive:true});copyFileSync(src,'prebuild/'+t+'/qt-bridge.node');console.log('staged prebuild/'+t+'/qt-bridge.node')"
 
       - name: Verify addon
         working-directory: dsh-qt-napi
