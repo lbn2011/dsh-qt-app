@@ -1,11 +1,16 @@
 // MessageDelegate.qml — one row of the chat flow.
 //
-// Phase 1c renders plain text in a role-dependent bubble. Phase 2 swaps the
-// Label for a Markdown-rendering item fed by `ctx.qtRenderer.renderMarkdown()`;
-// the four roles below are the contract with MessageModel.qml (and, later, with
-// the C++ `MessageListModel : QAbstractListModel`), so that swap stays local.
+// Phase 1c rendered plain text in a role-dependent bubble. Phase 2 renders the
+// body through qml/markdown/Markdown.qml when the model carries a parsed
+// MarkdownNode document (`markdown` role) and keeps the plain-text Label as the
+// fallback, so a model filled by hand — or a reply whose parse has not finished —
+// still renders.
+//
+// The import is one-way on purpose: this file imports qml/markdown/, and no file
+// under qml/markdown/ imports qml/components/, which would be a cycle.
 import QtQuick
 import QtQuick.Controls
+import "../markdown"
 
 Item {
     id: delegate
@@ -15,6 +20,11 @@ Item {
     required property string text
     required property string timestamp
     required property bool pending
+    /** Optional MarkdownNode document for the body; null/undefined = plain text. */
+    required property var markdown
+
+    /** Emitted when the user activates a link inside the body. */
+    signal linkActivated(string href)
 
     // ---- Styling ----------------------------------------------------------
     /**
@@ -50,6 +60,24 @@ Item {
         if (delegate.fromTool)
             return qsTr("Tool")
         return qsTr("Assistant")
+    }
+
+    /**
+     * True when the model supplied a parsed document worth rendering.
+     *
+     * An empty document is treated as "no markdown" so a reply whose parse
+     * produced nothing still shows its plain text instead of a blank bubble.
+     */
+    readonly property bool hasMarkdown: {
+        const node = delegate.markdown
+        if (node === null || node === undefined)
+            return false
+        if (typeof node !== "object")
+            return false
+        if (node.type === "document")
+            return node.children !== undefined && node.children !== null
+                   && node.children.length > 0
+        return true
     }
 
     // The bubble never fills the full row: chat bubbles read better at ~86% and
@@ -94,8 +122,23 @@ Item {
                 }
             }
 
-            Label {
+            // Structured body. Column/Row skip invisible children, so exactly one
+            // of the two body items contributes to the layout.
+            Markdown {
+                id: markdownBody
+                objectName: "messageMarkdownBody"
                 width: content.width
+                visible: delegate.hasMarkdown
+                document: delegate.markdown
+                theme: delegate.theme
+                onLinkActivated: function(href) { delegate.linkActivated(href) }
+            }
+
+            Label {
+                id: plainBody
+                objectName: "messagePlainBody"
+                width: content.width
+                visible: !delegate.hasMarkdown
                 text: delegate.text
                 color: delegate.theme.text
                 font.pixelSize: delegate.theme.fontNormal
