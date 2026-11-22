@@ -130,3 +130,12 @@ qmltestrunner -input tests/qml -import qml
    when the QML tree grows a real `main.qml` window test.
 3. The QML resource list is globbed with `CONFIGURE_DEPENDS`, so new `.qml` files are picked
    up automatically — do not reintroduce a hand-maintained file list.
+
+## 9. Addendum — the record commit itself
+
+This file was pushed as commit `4db4e953dda6092af963eb059a447f3231e529ca` (source
+`011865a41f7fd5279705a804128be416cd6eca2c`) and re-ran both workflows with the same
+outcome as §3: build <https://github.com/lbn2011/dsh-qt-app/actions/runs/45021733593>
+(ubuntu success, windows success, macos-14 cancelled) and test
+<https://github.com/lbn2011/dsh-qt-app/actions/runs/45021733677> (typescript ubuntu +
+windows success, qml lint success, qml tests success, macos-14 cancelled).
