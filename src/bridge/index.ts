@@ -38,6 +38,35 @@ export {
 } from './qml-bridge.js'
 
 export {
+  MAX_INBOUND_FRAME_BYTES,
+  MAX_OUTBOUND_FRAME_BYTES,
+  NdjsonDecoder,
+  PROTOCOL_ERRORS,
+  PROTOCOL_VERSION,
+  decodeFrame,
+  encodeFrame,
+  isRpcErrorCode,
+  makeError,
+  type DecodeBatch,
+  type DecodeResult,
+  type EncodeResult,
+  type Envelope,
+  type EventTopic,
+  type EvtFrame,
+  type HelloAckFrame,
+  type HelloFrame,
+  type NackFrame,
+  type NdjsonDecoderOptions,
+  type ProtocolError,
+  type ProtocolErrorCode,
+  type ReqFrame,
+  type ResErrFrame,
+  type ResFrame,
+  type ResOkFrame,
+  type RpcErrorCode,
+} from './protocol.js'
+
+export {
   composerFromHandler,
   fallbackParserAdapter,
   createContextBridge,

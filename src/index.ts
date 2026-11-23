@@ -1,8 +1,9 @@
 /**
  * Cordis plugin entry point for the DSH Qt6/QML profile.
  *
- * The plugin provides a single service, `ctx.qtRenderer`, which is the API the
- * QML host and other plugins talk to:
+ * The plugin provides two services:
+ *
+ *  - `ctx.qtRenderer` — the API the QML host and other plugins talk to:
  *
  *  - Markdown / code highlighting, delegated to the `dsh-qt-napi` addon with a
  *    degraded fallback so a missing binary never breaks the host.
@@ -26,6 +27,14 @@ import {
   QML_ENTRY_URL,
 } from './constants.js'
 import type { SettingsSlotSurface } from './constants.js'
+import {
+  QML_BRIDGE_METHODS,
+  createServiceBridge,
+  isRpcErrorCode,
+} from './bridge/index.js'
+import type { QmlBridge, QmlBridgeRequest } from './bridge/index.js'
+import { HostBridgeError, HostBridgeService } from './host/bridge-service.js'
+import type { HostBridgeConfig, HostBridgeLogger } from './host/bridge-service.js'
 import { EventLoopBridge, createEventLoopBridge } from './event-loop/timer.js'
 import { highlight as highlightSource } from './highlight/index.js'
 import type { EventLoopBridgeOptions, EventLoopStats } from './event-loop/timer.js'
@@ -96,6 +105,25 @@ export interface QtPluginConfig {
   napiPath?: string
   /** Register the native slot surfaces on mount; defaults to true. */
   declareNativeSurfaces?: boolean
+  /**
+   * Spawn the Qt binary when the plugin mounts; defaults to true.
+   *
+   * Tests and headless tooling set this to false and attach a fake transport
+   * instead, so mounting the plugin never starts a GUI process by accident.
+   */
+  autoLaunch?: boolean
+  /** Explicit Qt binary; otherwise the launcher searches the build tree. */
+  appBinary?: string
+  /** Extra environment for the Qt child (e.g. `QT_QPA_PLATFORM=offscreen`). */
+  hostEnv?: NodeJS.ProcessEnv
+  /** Composer handler used by the legacy `composer.submit` route. */
+  composer?: (text: string) => unknown
+  /** Default timeout for host → Qt calls; defaults to 5000 ms. */
+  hostRequestTimeoutMs?: number
+  /** Deadline for the v1 handshake; defaults to 5000 ms. */
+  hostHandshakeTimeoutMs?: number
+  /** Logger handed to the bridge services (Cordis's logger is compatible). */
+  logger?: HostBridgeLogger
 }
 
 /** Snapshot returned by `ctx.qtRenderer.stats`. */
@@ -316,6 +344,75 @@ export function apply(ctx: Context, config: QtPluginConfig = {}): void {
         renderer.eventLoop.stop()
       }
     }, 'dsh-qt-app: event loop')
+  }
+
+  const hostConfig: HostBridgeConfig = {
+    autoLaunch: config.autoLaunch ?? true,
+    ...(config.appBinary === undefined ? {} : { binaryPath: config.appBinary }),
+    ...(config.hostEnv === undefined ? {} : { launchEnv: config.hostEnv }),
+    ...(config.hostRequestTimeoutMs === undefined
+      ? {}
+      : { requestTimeoutMs: config.hostRequestTimeoutMs }),
+    ...(config.hostHandshakeTimeoutMs === undefined
+      ? {}
+      : { handshakeTimeoutMs: config.hostHandshakeTimeoutMs }),
+    ...(config.logger === undefined ? {} : { logger: config.logger }),
+  }
+  const host = new HostBridgeService(ctx, hostConfig)
+
+  // The legacy 11 QML methods answer through the same primitive set the Phase 2
+  // bridge used; each one is now a v1 method on the host side of the pipe.
+  const qmlBridge = createServiceBridge(
+    {
+      renderer,
+      ...(config.composer === undefined ? {} : { composer: config.composer }),
+    },
+    { ...(config.logger === undefined ? {} : { logger: config.logger }) },
+  )
+  registerLegacyMethods(host, qmlBridge)
+
+  ctx.effect(() => {
+    host.start()
+    return () => {
+      host.dispose()
+      qmlBridge.dispose()
+    }
+  }, 'dsh-qt-app: host bridge')
+}
+
+function isParamsRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * Route the Phase 2 `QML_BRIDGE_METHODS` onto the v1 host bridge.
+ *
+ * The Qt side kept its method names and result shapes, so the Phase 2 QML keeps
+ * working; what changed is the transport underneath (NDJSON envelopes instead
+ * of the old flat `{id,method,params}` frames).
+ */
+function registerLegacyMethods(host: HostBridgeService, bridge: QmlBridge): void {
+  let sequence = 0
+  for (const method of QML_BRIDGE_METHODS) {
+    host.register(method, async (params: unknown) => {
+      if (params !== undefined && !isParamsRecord(params)) {
+        throw new HostBridgeError('bad-params', `${method} expects an object of parameters`)
+      }
+      const request: QmlBridgeRequest = {
+        id: `legacy-${++sequence}`,
+        method,
+        ...(params === undefined ? {} : { params }),
+      }
+      const reply = await bridge.dispatch(request)
+      if (!reply.ok) {
+        const failure = reply.error
+        throw new HostBridgeError(
+          failure !== undefined && isRpcErrorCode(failure.code) ? failure.code : 'internal',
+          failure?.message ?? `${method} failed`,
+        )
+      }
+      return reply.result
+    })
   }
 }
 
