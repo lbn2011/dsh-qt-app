@@ -47,6 +47,9 @@ QtObject {
     /** Active scheme id; falls back to the dark palette without a host. */
     property string themeId: root.bridge ? String(root.bridge.themeId) : root.fallbackThemeId
 
+    /** Resolved scheme, "dark" | "light"; the palette actually in use. */
+    readonly property string appearance: root.themeId === "light" ? "light" : "dark"
+
     /** User font scale, 0.8 … 1.5 (the bridge clamps; this mirrors it). */
     property real fontScale: root.bridge ? Number(root.bridge.fontScale) : root.fallbackFontScale
 

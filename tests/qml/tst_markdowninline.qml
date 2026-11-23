@@ -88,7 +88,7 @@ TestCase {
             { "type": "link", "href": "javascript:alert(1)",
               "children": [{ "type": "text", "value": "click" }] }
         ])
-        tryCompare(run, "markup", "click", "a blocked scheme keeps the text but loses the anchor")
+        compare(run.markup, "click", "a blocked scheme keeps the text but loses the anchor")
     }
 
     function test_rawHtmlIsEscapedNotInterpreted() {
@@ -103,7 +103,7 @@ TestCase {
 
     function test_unknownInlineTypeFallsBackToItsText() {
         const run = inline([{ "type": "mark", "children": [{ "type": "text", "value": "hi" }] }])
-        tryCompare(run, "markup", "hi", "an unknown inline node keeps its children")
+        compare(run.markup, "hi", "an unknown inline node keeps its children")
     }
 
     function test_boldFlagAppliesToTheWholeRun() {

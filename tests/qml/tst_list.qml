@@ -39,10 +39,10 @@ TestCase {
     function createList(props) {
         const view = createTemporaryObject(listComponent, testCase)
         verify(view !== null, "List must instantiate")
-        if (props !== undefined) {
-            for (const key in props)
-                view[key] = props[key]
-        }
+        // `items`, `ordered` and `start` are derived from the AST node and are
+        // readonly, so the harness feeds the whole node in instead of assigning
+        // the roles directly.
+        view.node = Object.assign({ "type": "list" }, props === undefined ? {} : props)
         return view
     }
 

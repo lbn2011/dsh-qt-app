@@ -3,6 +3,7 @@
 // Used for `ui.type: "color"`: FormControl draws the label and description, and
 // ColorPicker does the picking.
 import QtQuick
+import QtQuick.Layouts
 
 FormControl {
     id: root

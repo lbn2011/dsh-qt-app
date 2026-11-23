@@ -36,7 +36,12 @@ Item {
     property string type: "document"
     property string role: "block"
     property string content: ""
-    property var children: root.blocks
+    // NOTE: deliberately *not* named `children`. Item.children is the list of
+    // visual children, and Qt Quick Test's findChild() walks exactly that list —
+    // shadowing it with an AST role property made every findChild() call on a
+    // Markdown root return null (the AST array has no objectName). The role
+    // property keeps its meaning under `nodes`, matching MarkdownBase.
+    property var nodes: root.blocks
 
     /** The document to render (alias of `node` that reads better at call sites). */
     property var document: root.node
@@ -227,9 +232,15 @@ Item {
         if (index < 0 || node === null)
             return false
         const nextType = String(node.type === undefined || node.type === null ? "" : node.type)
-        if (streamModel.get(index).nodeType !== nextType)
-            streamModel.setProperty(index, "nodeType", nextType)
-        streamModel.setProperty(index, "node", node)
+        // Replace the whole row rather than re-assigning roles one by one: a role's
+        // type is fixed when the row is created, so setProperty(index, "node", …)
+        // fails with "Can't assign to existing role of different type" whenever the
+        // new node has a different shape (e.g. a list instead of a map).
+        streamModel.set(index, {
+            "nodeId": streamModel.get(index).nodeId,
+            "nodeType": nextType,
+            "node": node,
+        })
         root.streaming = true
         root.nodeUpdated(nodeId)
         return true

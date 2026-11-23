@@ -229,6 +229,19 @@ message(STATUS "dsh-qt-app: napi prebuild triple is ${DSH_QT_NAPI_TRIPLE}")
 #
 # QML lives inside the executable's resource bundle, so no qml/ tree is installed.
 # ---------------------------------------------------------------------------
+# `package-app` runs `install` and `cpack`, and both honour CMAKE_INSTALL_PREFIX.
+# Left at the CMake default that is /usr/local (or Program Files on Windows), which
+# a CI runner cannot write, so packaging failed with
+#   file cannot create directory: /usr/local/dsh-qt-napi/prebuild/...
+# Default it into the build tree instead; an explicit -DCMAKE_INSTALL_PREFIX still
+# wins because the guard only fires while the value is still the initialized
+# default. Destinations below stay relative, so the archive keeps the documented
+# layout whatever the prefix is.
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/stage"
+    CACHE PATH "Install prefix (defaults into the build tree so packaging needs no root)" FORCE)
+endif()
+
 install(TARGETS dsh-qt-app
   BUNDLE  DESTINATION .
   RUNTIME DESTINATION bin)

@@ -91,7 +91,7 @@ TestCase {
         ))
         tryCompare(view, "blockCount", 1)
 
-        const block = view.children[0].item
+        const block = findChild(view, "markdownBlock0").item
         verify(block !== null && block !== undefined, "block item must exist")
         compare(block.type, "code", "type mirrors the AST node type")
         compare(block.role, "block", "a fenced code block is a block-level node")

@@ -149,9 +149,15 @@ QtObject {
         case "link": {
             const href = root.sanitizeHref(node.href !== undefined && node.href !== null ? String(node.href) : "")
             const inner = root.inlineMarkupFor(kids)
+            // The title is metadata for tooltips; it is attribute-escaped like href
+            // so a quote inside it cannot break out of the tag.
+            const title = node.title !== undefined && node.title !== null ? String(node.title) : ""
+            const titleAttribute = title.length === 0
+                ? ""
+                : " title=\"" + root.escapeAttribute(title) + "\""
             return href.length === 0
                 ? inner
-                : "<a href=\"" + root.escapeAttribute(href) + "\">" + inner + "</a>"
+                : "<a href=\"" + root.escapeAttribute(href) + "\"" + titleAttribute + ">" + inner + "</a>"
         }
         case "image": {
             // No image pipeline yet; the alt text is the honest rendering.
