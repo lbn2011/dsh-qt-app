@@ -41,6 +41,7 @@
 #include <QStringList>
 #include <QStyleHints>
 #include <QTimer>
+#include <QUuid>
 #include <QUrl>
 #include <QVariant>
 #include <QVariantMap>
@@ -53,6 +54,8 @@
 #include <cstring>
 #include <unistd.h>
 #endif
+
+#include <cstdio>
 
 #include "config.h"
 
@@ -614,13 +617,39 @@ public:
     int defaultWindowWidth() const { return DSH_QT_DEFAULT_WINDOW_WIDTH; }
     int defaultWindowHeight() const { return DSH_QT_DEFAULT_WINDOW_HEIGHT; }
 
-    QString transportState() const { return transport_->describe(); }
+    QString transportState() const
+    {
+        if (connecting_)
+            return QStringLiteral("connecting");
+        if (connected_)
+            return QStringLiteral("connected");
+        return QStringLiteral("disconnected");
+    }
     int pendingRequests() const { return static_cast<int>(pending_.size()); }
 
     ThemeBridge *theme() const { return theme_; }
 
-    /** Start listening on stdin. Safe to call once; a no-op when already live. */
-    Q_INVOKABLE bool connectToNode() { return transport_->start(); }
+    /**
+     * Start listening on stdin and announce this session with a `hello` frame.
+     *
+     * The bridge stays in `connecting` until the host answers `hello.ack`.
+     * There is deliberately no optimistic "connected": before protocol v1 the
+     * UI reported connected as soon as stdin was open, which made a standalone
+     * launch wait five seconds for a reply that could never arrive.
+     */
+    Q_INVOKABLE bool connectToNode()
+    {
+        if (transport_->isActive())
+            return false;
+        connecting_ = true;
+        if (!transport_->start()) {
+            connecting_ = false;
+            emit transportStateChanged();
+            return false;
+        }
+        beginHandshake_();
+        return true;
+    }
 
     Q_INVOKABLE QString renderMarkdown(const QString &text)
     {
@@ -644,54 +673,21 @@ public:
      */
     Q_INVOKABLE QString applyTheme(const QString &mode)
     {
-        const QString id = mintId_(QStringLiteral("theme"));
+        // Repaint first: the host owns theme.json and must not wait for a round
+        // trip, but the change is still announced so Node-side plugins observe
+        // it. The reply carries the effective id back into QML.
         const QString requested = mode.trimmed().toLower();
         const QString resolved = (requested.isEmpty() || requested == QLatin1String("auto")) ? systemScheme_() : requested;
         theme_->setThemeId(resolved);
-        const QString effective = theme_->themeId();
-        notifyNode_(QStringLiteral("theme.apply"),
-                    QJsonObject{{QStringLiteral("mode"), requested.isEmpty() ? QStringLiteral("auto") : requested},
-                                {QStringLiteral("themeId"), effective}});
-
-        Pending pending;
-        pending.method = QStringLiteral("theme.apply");
-        pending.startedMs = elapsed_.elapsed();
-        pending_.insert(id, pending);
-        emit pendingRequestsChanged();
-
-        const QString announced = requested.isEmpty() ? QStringLiteral("auto") : requested;
-        QMetaObject::invokeMethod(
-            this,
-            [this, id, announced, effective]() {
-                complete_(id, true, QVariantMap{{QStringLiteral("mode"), announced},
-                                                {QStringLiteral("themeId"), effective}},
-                          QString(), QStringLiteral("theme.apply"));
-            },
-            Qt::QueuedConnection);
-        return id;
+        return submit_(QStringLiteral("theme.apply"),
+                       QJsonObject{{QStringLiteral("mode"), requested.isEmpty() ? QStringLiteral("auto") : requested},
+                                   {QStringLiteral("themeId"), theme_->themeId()}});
     }
 
     Q_INVOKABLE QString setFontScale(qreal scale)
     {
-        const QString id = mintId_(QStringLiteral("scale"));
         theme_->setFontScale(scale);
-        const qreal effective = theme_->fontScale();
-        notifyNode_(QStringLiteral("theme.scale"), QJsonObject{{QStringLiteral("scale"), effective}});
-
-        Pending pending;
-        pending.method = QStringLiteral("theme.scale");
-        pending.startedMs = elapsed_.elapsed();
-        pending_.insert(id, pending);
-        emit pendingRequestsChanged();
-
-        QMetaObject::invokeMethod(
-            this,
-            [this, id, effective]() {
-                complete_(id, true, QVariantMap{{QStringLiteral("scale"), effective}},
-                          QString(), QStringLiteral("theme.scale"));
-            },
-            Qt::QueuedConnection);
-        return id;
+        return submit_(QStringLiteral("theme.scale"), QJsonObject{{QStringLiteral("scale"), theme_->fontScale()}});
     }
 
     Q_INVOKABLE QString getSetting(const QString &name)
@@ -728,7 +724,7 @@ public:
 
     Q_INVOKABLE QVariantMap stats() const
     {
-        return QVariantMap{{QStringLiteral("transport"), transport_->describe()},
+        return QVariantMap{{QStringLiteral("transport"), transportState()},
                            {QStringLiteral("pending"), pendingRequests()},
                            {QStringLiteral("handled"), handled_},
                            {QStringLiteral("failed"), failed_},
@@ -759,9 +755,11 @@ private:
         QString method;
         QJsonObject params;
         qint64 startedMs = 0;
+        bool sent = false;
     };
 
     static constexpr int kRequestTimeoutMs = 5000;
+    static constexpr int kHandshakeTimeoutMs = 5000;
 
     QString mintId_(const QString &prefix)
     {
@@ -771,15 +769,21 @@ private:
     QString submit_(const QString &method, const QJsonObject &params)
     {
         const QString id = mintId_(QStringLiteral("req"));
-        if (!transport_->isActive()) {
+        Pending pending;
+        pending.method = method;
+        pending.params = params;
+        pending.startedMs = elapsed_.elapsed();
+        pending_.insert(id, pending);
+        emit pendingRequestsChanged();
+
+        if (connecting_) {
+            // Held until hello.ack: the hello frame must be the first frame the
+            // host sees, so requests may only follow the handshake.
+            return id;
+        }
+        if (!connected_) {
             // Deterministic failure instead of a request that never answers:
             // QML shows the plain-text fallback and can retry later.
-            Pending pending;
-            pending.method = method;
-            pending.params = params;
-            pending.startedMs = elapsed_.elapsed();
-            pending_.insert(id, pending);
-            emit pendingRequestsChanged();
             QMetaObject::invokeMethod(
                 this,
                 [this, id]() {
@@ -789,42 +793,141 @@ private:
                 Qt::QueuedConnection);
             return id;
         }
-
-        Pending pending;
-        pending.method = method;
-        pending.params = params;
-        pending.startedMs = elapsed_.elapsed();
-        pending_.insert(id, pending);
-        emit pendingRequestsChanged();
-
-        transport_->send(QJsonObject{{QStringLiteral("id"), id},
-                                     {QStringLiteral("method"), method},
-                                     {QStringLiteral("params"), params}});
+        flushPending_(id);
         return id;
     }
 
-    void notifyNode_(const QString &method, const QJsonObject &params)
+    /** Write a queued request once the handshake finished. */
+    void flushPending_(const QString &id)
+    {
+        auto it = pending_.find(id);
+        if (it == pending_.end() || it->sent)
+            return;
+        QJsonObject frame{{QStringLiteral("kind"), QStringLiteral("req")},
+                          {QStringLiteral("id"), id},
+                          {QStringLiteral("method"), it->method}};
+        if (!it->params.isEmpty())
+            frame.insert(QStringLiteral("params"), it->params);
+        if (!sendFrame_(frame)) {
+            complete_(id, false, QVariant(), QStringLiteral("unavailable: could not write to the Node host"),
+                      it->method, it->params);
+            return;
+        }
+        it->sent = true;
+    }
+
+    void flushAllPending_()
+    {
+        const QList<QString> ids = pending_.keys();
+        for (const QString &id : ids)
+            flushPending_(id);
+    }
+
+    /**
+     * Add the protocol version and write one frame.
+     *
+     * @returns false when the transport is no longer live, so callers can turn
+     *   that into a request failure instead of a silent drop.
+     */
+    bool sendFrame_(const QJsonObject &frame)
+    {
+        if (!transport_->isActive())
+            return false;
+        QJsonObject outbound = frame;
+        outbound.insert(QStringLiteral("v"), 1);
+        transport_->send(outbound);
+        return true;
+    }
+
+    /** Tell Node what the UI is showing; seq is monotonic for this epoch. */
+    void announceState_()
     {
         if (!transport_->isActive())
             return;
-        transport_->send(QJsonObject{{QStringLiteral("type"), QStringLiteral("qml.notify")},
-                                     {QStringLiteral("payload"), QJsonObject{{QStringLiteral("method"), method},
-                                                                             {QStringLiteral("params"), params}}}});
+        sendFrame_(QJsonObject{{QStringLiteral("kind"), QStringLiteral("evt")},
+                               {QStringLiteral("seq"), eventSeq_++},
+                               {QStringLiteral("epoch"), epoch_},
+                               {QStringLiteral("name"), QStringLiteral("transport.state")},
+                               {QStringLiteral("payload"), QJsonObject{{QStringLiteral("state"), transportState()}}}});
     }
 
-    void handleMessage_(const QJsonObject &message)
+    void beginHandshake_()
     {
-        const QString type = message.value(QStringLiteral("type")).toString();
-        if (type == QLatin1String("qml.event")) {
-            handleEvent_(message.value(QStringLiteral("payload")).toObject());
+        epoch_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        connected_ = false;
+        lastError_.clear();
+        eventSeq_ = 0;
+
+        const QJsonObject hello{{QStringLiteral("kind"), QStringLiteral("hello")},
+                                {QStringLiteral("role"), QStringLiteral("qt")},
+                                {QStringLiteral("epoch"), epoch_},
+                                {QStringLiteral("app"), QStringLiteral(DSH_QT_APP_NAME) + QLatin1Char('/') + QStringLiteral(DSH_QT_APP_VERSION)},
+                                {QStringLiteral("qt"), QString::fromLatin1(qVersion())},
+                                {QStringLiteral("caps"), QJsonArray{
+                                     QStringLiteral("markdown.parse"),
+                                     QStringLiteral("markdown.render"),
+                                     QStringLiteral("code.highlight"),
+                                     QStringLiteral("theme.apply"),
+                                     QStringLiteral("theme.scale"),
+                                     QStringLiteral("settings.get"),
+                                     QStringLiteral("settings.set"),
+                                     QStringLiteral("settings.save"),
+                                     QStringLiteral("settings.all"),
+                                     QStringLiteral("composer.submit"),
+                                     QStringLiteral("ping"),
+                                 }}};
+        if (!sendFrame_(hello)) {
+            failConnection_(QStringLiteral("could not write hello to the Node host"));
             return;
         }
+        announceState_();
+
+        if (handshakeTimer_ == nullptr) {
+            handshakeTimer_ = new QTimer(this);
+            handshakeTimer_->setSingleShot(true);
+            connect(handshakeTimer_, &QTimer::timeout, this, &DshQtBridge::handshakeTimedOut_);
+        }
+        handshakeTimer_->start(kHandshakeTimeoutMs);
+    }
+
+    void handshakeTimedOut_()
+    {
+        if (connected_ || !connecting_)
+            return;
+        failConnection_(QStringLiteral("timeout: no hello.ack within 5 s"));
+    }
+
+    void handleHelloAck_(const QJsonObject &frame)
+    {
+        if (!connecting_)
+            return; // duplicate ack: the first one already won
+        const QString epoch = frame.value(QStringLiteral("epoch")).toString();
+        if (epoch != epoch_) {
+            rejectProtocol_(QStringLiteral("protocol"), QStringLiteral("hello.ack epoch does not match this session"));
+            return;
+        }
+        connecting_ = false;
+        connected_ = true;
+        hadConnected_ = true;
+        if (handshakeTimer_ != nullptr)
+            handshakeTimer_->stop();
+        emit transportStateChanged();
+        announceState_();
+        flushAllPending_();
+    }
+
+    void handleReply_(const QJsonObject &message)
+    {
         const QString id = message.value(QStringLiteral("id")).toString();
         if (id.isEmpty())
             return;
-        if (!pending_.contains(id))
-            return; // late reply for a cancelled or timed-out request
-        const Pending pending = pending_.take(id);
+        auto it = pending_.find(id);
+        if (it == pending_.end())
+            return; // late reply for a cancelled, timed-out or flushed request
+        const Pending pending = *it;
+        pending_.remove(id);
+        emit pendingRequestsChanged();
+
         const bool ok = message.value(QStringLiteral("ok")).toBool();
         const QVariant result = message.value(QStringLiteral("result")).toVariant();
         QString error;
@@ -834,31 +937,140 @@ private:
             const QString text = failure.value(QStringLiteral("message")).toString();
             error = code.isEmpty() ? text : code + QStringLiteral(": ") + text;
         }
-        emit pendingRequestsChanged();
         complete_(id, ok, result, error, pending.method, pending.params);
     }
 
-    void handleEvent_(const QJsonObject &payload)
+    /** Answer a request the host sent to this UI process. */
+    void handleHostRequest_(const QJsonObject &frame)
     {
-        const QString event = payload.value(QStringLiteral("event")).toString();
-        if (event == QLatin1String("theme.reload"))
+        const QString id = frame.value(QStringLiteral("id")).toString();
+        if (id.isEmpty()) {
+            rejectProtocol_(QStringLiteral("bad-params"), QStringLiteral("req.id must be a non-empty string"));
+            return;
+        }
+        const QString method = frame.value(QStringLiteral("method")).toString();
+        if (!connected_) {
+            sendRes_(id, false, QJsonValue(), QStringLiteral("unavailable"),
+                     QStringLiteral("the Qt host is not connected"));
+            return;
+        }
+        if (method == QLatin1String("host.ping")) {
+            sendRes_(id, true, QJsonObject{{QStringLiteral("state"), transportState()},
+                                           {QStringLiteral("pending"), pendingRequests()}});
+            return;
+        }
+        if (method == QLatin1String("host.quit")) {
+            sendRes_(id, true, QJsonObject{{QStringLiteral("accepted"), true}});
+            QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+            return;
+        }
+        sendRes_(id, false, QJsonValue(), QStringLiteral("unknown-method"),
+                 QStringLiteral("unknown Qt method: ") + method);
+    }
+
+    void sendRes_(const QString &id, bool ok, const QJsonValue &result,
+                  const QString &code = QString(), const QString &message = QString())
+    {
+        QJsonObject frame{{QStringLiteral("kind"), QStringLiteral("res")},
+                          {QStringLiteral("id"), id},
+                          {QStringLiteral("ok"), ok}};
+        if (ok) {
+            if (!result.isUndefined() && !result.isNull())
+                frame.insert(QStringLiteral("result"), result);
+        } else {
+            frame.insert(QStringLiteral("error"),
+                         QJsonObject{{QStringLiteral("code"), code.isEmpty() ? QStringLiteral("internal") : code},
+                                     {QStringLiteral("message"), message}});
+        }
+        sendFrame_(frame);
+    }
+
+    void handleMessage_(const QJsonObject &message)
+    {
+        const int version = message.value(QStringLiteral("v")).toInt(-1);
+        if (version != 1) {
+            rejectProtocol_(QStringLiteral("bad-params"),
+                            QStringLiteral("frame is missing protocol version v; expected 1"));
+            return;
+        }
+        const QString kind = message.value(QStringLiteral("kind")).toString();
+        if (kind == QLatin1String("hello.ack")) {
+            handleHelloAck_(message);
+        } else if (kind == QLatin1String("nack")) {
+            const QString code = message.value(QStringLiteral("code")).toString();
+            const QString text = message.value(QStringLiteral("message")).toString();
+            failConnection_(QStringLiteral("protocol: host rejected the handshake")
+                            + (code.isEmpty() ? QString() : QStringLiteral(" (") + code + QLatin1Char(')'))
+                            + QStringLiteral(": ") + text);
+        } else if (kind == QLatin1String("res")) {
+            handleReply_(message);
+        } else if (kind == QLatin1String("req")) {
+            handleHostRequest_(message);
+        } else if (kind == QLatin1String("evt")) {
+            handleEvent_(message);
+        }
+        // Unknown kinds are forward-compatible by contract: ignore, do not answer.
+    }
+
+    void handleEvent_(const QJsonObject &frame)
+    {
+        // Events are host→Qt; Qt never replies to one. Unknown names are
+        // ignored so a newer host can add events without breaking this build.
+        const QString name = frame.value(QStringLiteral("name")).toString();
+        if (name == QLatin1String("theme.reload"))
             theme_->reload();
+    }
+
+    void rejectProtocol_(const QString &code, const QString &message)
+    {
+        if (transport_->isActive()) {
+            sendFrame_(QJsonObject{{QStringLiteral("kind"), QStringLiteral("nack")},
+                                   {QStringLiteral("code"), code},
+                                   {QStringLiteral("message"), message}});
+        }
+        failConnection_(QStringLiteral("protocol: ") + message);
+    }
+
+    void failConnection_(const QString &reason)
+    {
+        lastError_ = reason;
+        const bool wasConnected = connected_ || hadConnected_;
+        connecting_ = false;
+        connected_ = false;
+        if (handshakeTimer_ != nullptr)
+            handshakeTimer_->stop();
+        if (transport_->isActive())
+            transport_->stop();
+        rejectAllPending_(QStringLiteral("unavailable: ") + reason);
+        emit transportStateChanged();
+        if (wasConnected)
+            scheduleQuitAfterDisconnect_();
+    }
+
+    void rejectAllPending_(const QString &reason)
+    {
+        const QList<QString> ids = pending_.keys();
+        for (const QString &id : ids) {
+            auto it = pending_.find(id);
+            if (it == pending_.end())
+                continue;
+            const Pending pending = *it;
+            complete_(id, false, QVariant(), reason, pending.method, pending.params);
+        }
+    }
+
+    /** EOF after a live session means the host died: do not linger as a ghost window. */
+    void scheduleQuitAfterDisconnect_()
+    {
+        if (quitScheduled_)
+            return;
+        quitScheduled_ = true;
+        QTimer::singleShot(500, qApp, &QCoreApplication::quit);
     }
 
     void handleTransportFailure_(const QString &reason)
     {
-        lastError_ = reason;
-        // Fail everything in flight: the peer cannot answer any more, and a QML
-        // control stuck on "loading" is worse than an honest error.
-        const QList<QString> ids = pending_.keys();
-        for (const QString &id : ids) {
-            if (!pending_.contains(id))
-                continue;
-            const Pending pending = pending_.take(id);
-            complete_(id, false, QVariant(), QStringLiteral("unavailable: ") + reason, pending.method, pending.params);
-        }
-        ++failed_;
-        emit pendingRequestsChanged();
+        failConnection_(reason);
     }
 
     void expirePending_()
@@ -868,14 +1080,16 @@ private:
         const qint64 now = elapsed_.elapsed();
         const QList<QString> ids = pending_.keys();
         for (const QString &id : ids) {
-            if (!pending_.contains(id))
+            auto it = pending_.find(id);
+            if (it == pending_.end() || !it->sent)
+                continue; // unsent requests are bounded by the handshake timer
+            if (now - it->startedMs < kRequestTimeoutMs)
                 continue;
-            const Pending pending = pending_.value(id);
-            if (now - pending.startedMs < kRequestTimeoutMs)
-                continue;
+            const Pending pending = *it;
             pending_.remove(id);
             ++timedOut_;
-            complete_(id, false, QVariant(), QStringLiteral("timeout: no reply within 5 s"), pending.method, pending.params);
+            complete_(id, false, QVariant(), QStringLiteral("timeout: no reply within 5 s"),
+                      pending.method, pending.params);
         }
         emit pendingRequestsChanged();
     }
@@ -903,9 +1117,17 @@ private:
         } else if (method == QLatin1String("code.highlight")) {
             emit codeHighlighted(id, ok ? result.toString() : QString(), error);
         } else if (method == QLatin1String("theme.apply")) {
-            emit themeApplied(id, map.value(QStringLiteral("mode")).toString(), ok, error);
+            QString applied = map.value(QStringLiteral("applied")).toString();
+            if (applied.isEmpty())
+                applied = map.value(QStringLiteral("mode")).toString();
+            if (applied.isEmpty())
+                applied = params.value(QStringLiteral("mode")).toString();
+            emit themeApplied(id, applied, ok, error);
         } else if (method == QLatin1String("theme.scale")) {
-            emit fontScaleApplied(id, map.value(QStringLiteral("scale")).toDouble(), error);
+            qreal scale = map.value(QStringLiteral("scale")).toDouble();
+            if (map.isEmpty())
+                scale = params.value(QStringLiteral("scale")).toDouble();
+            emit fontScaleApplied(id, scale, error);
         } else if (method == QLatin1String("settings.get")) {
             emit settingRead(id, map.value(QStringLiteral("name")).toString(),
                              map.value(QStringLiteral("value")), error);
@@ -937,9 +1159,16 @@ private:
     ThemeBridge *theme_ = nullptr;
     StdioTransport *transport_ = nullptr;
     QTimer *sweepTimer_ = nullptr;
+    QTimer *handshakeTimer_ = nullptr;
     QHash<QString, Pending> pending_;
     QElapsedTimer elapsed_{};
+    QString epoch_;
     qint64 sequence_ = 0;
+    qint64 eventSeq_ = 0;
+    bool connecting_ = false;
+    bool connected_ = false;
+    bool hadConnected_ = false;
+    bool quitScheduled_ = false;
     int handled_ = 0;
     int failed_ = 0;
     int timedOut_ = 0;
@@ -960,7 +1189,41 @@ int main(int argc, char *argv[])
     // exposes through context properties.
     ThemeBridge themeBridge;
     DshQtBridge bridge(&themeBridge);
+
+    // Headless protocol self-test (tests/host-e2e.e2e.ts).
+    //
+    // The real transport, the real handshake and the real binary are exercised;
+    // only the QML engine is skipped, so a failure here is a protocol failure,
+    // not a rendering one. stdout carries frames, so diagnostics go to stderr.
+    const bool selfTest = qEnvironmentVariableIsSet("DSH_QT_HOST_SELFTEST");
+    if (selfTest) {
+        bool pingSent = false;
+        QObject::connect(&bridge, &DshQtBridge::transportStateChanged, &app, [&bridge, &pingSent]() {
+            const QString state = bridge.transportState();
+            std::fprintf(stderr, "[selftest] state=%s\n", qUtf8Printable(state));
+            if (state == QLatin1String("connected") && !pingSent) {
+                pingSent = true;
+                bridge.request(QStringLiteral("ping"));
+            }
+        });
+        QObject::connect(
+            &bridge, &DshQtBridge::requestReplied, &app,
+            [](const QString &, const QString &method, bool ok, const QVariant &result, const QString &error) {
+                if (method != QLatin1String("ping"))
+                    return;
+                const QVariantMap map = result.toMap();
+                std::fprintf(stderr, "[selftest] ping=%s pong=%d error=%s\n", ok ? "ok" : "failed",
+                             map.value(QStringLiteral("pong")).toBool() ? 1 : 0, qUtf8Printable(error));
+                QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+            });
+        // Hard stop: a handshake that never completes must not hang the suite.
+        QTimer::singleShot(10000, qApp, []() { QCoreApplication::exit(3); });
+    }
+
     bridge.connectToNode();
+
+    if (selfTest)
+        return app.exec();
 
     QQmlApplicationEngine engine;
 
