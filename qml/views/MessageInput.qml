@@ -30,7 +30,7 @@ Rectangle {
     // qmllint disable unqualified
     readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
     // qmllint enable unqualified
-    property Theme theme: Theme { bridge: themeBridge }
+    property Theme theme: Theme { bridge: messageInput.themeBridge }
     /** Two-way access to the editor contents (handy for tests and shortcuts). */
     property alias text: editor.text
     /** While busy the send action is disabled but typing stays possible. */
@@ -46,7 +46,7 @@ Rectangle {
      * Injected by main.qml; it stays null under qmltestrunner, which is exactly
      * why `submit()` still works without it.
      */
-    property QtObject qtBridge: null
+    property var qtBridge: null
 
     /** Id of the most recent delivery request, or "". */
     readonly property string lastRequestId: internal.lastRequestId

@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 // SettingsForm.qml — the generator: schema in, controls out.
 //
 // This is the whole point of the settings work: a plugin that declares its

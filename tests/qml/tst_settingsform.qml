@@ -20,6 +20,7 @@ TestCase {
 
     name: "SettingsForm"
     when: windowShown
+    visible: true
 
     /** Descriptor shaped exactly like src/settings/forms.ts output. */
     function descriptor(name, uiType, value, extra) {

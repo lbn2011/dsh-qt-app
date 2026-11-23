@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 // ColorPicker.qml — a swatch grid plus a hex field.
 //
 // Colour is the one setting whose raw value is unpleasant to type, so it gets a

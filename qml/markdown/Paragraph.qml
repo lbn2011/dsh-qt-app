@@ -14,7 +14,7 @@ Item {
     property string content: root.node !== null && root.node !== undefined && root.node.value !== undefined
                              ? String(root.node.value)
                              : ""
-    property var children: root.node !== null && root.node !== undefined
+    property var nodes: root.node !== null && root.node !== undefined
                            && root.node.children !== undefined && root.node.children !== null
                            ? root.node.children
                            : []
@@ -28,7 +28,7 @@ Item {
         id: body
         objectName: "markdownParagraphText"
         width: root.width > 0 ? root.width : implicitWidth
-        nodes: root.children
+        nodes: root.nodes
         plainText: root.content
         theme: root.theme
     }

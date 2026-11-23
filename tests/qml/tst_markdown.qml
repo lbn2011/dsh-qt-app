@@ -109,6 +109,31 @@ TestCase {
         compare(text.text, "**not** parsed", "fallback text is shown verbatim, not parsed")
     }
 
+    function test_nestedListAndQuoteUpdateTheirRenderedBody() {
+        const view = createMarkdown(documentWith({
+            "type": "blockquote", "children": [{
+                "type": "list", "ordered": false, "items": [[paragraph("nested")]]
+            }]
+        }))
+        tryCompare(view, "blockCount", 1)
+        const quote = findChild(view, "markdownBlock0").item
+        verify(quote !== null)
+        compare(findChild(quote, "markdownListItemMarker").text, "•")
+        compare(findChild(quote, "markdownParagraphText").text, "nested")
+
+        const listBody = findChild(quote, "markdownListItemBody")
+        verify(listBody !== null && listBody.item !== null)
+        listBody.parent.parent.blocks = [paragraph("updated list")]
+        tryCompare(findChild(listBody.item, "markdownParagraphText"), "text", "updated list")
+
+        quote.node = { "type": "blockquote", "children": [paragraph("updated quote")] }
+        tryVerify(function () {
+            const text = findChild(quote, "markdownParagraphText")
+            return text !== null && text.text === "updated quote"
+        })
+        compare(findChild(quote, "markdownListItemMarker"), null)
+    }
+
     function test_emptyDocumentRendersNothing() {
         const view = createMarkdown(documentWith())
         compare(view.blockCount, 0, "an empty document has no blocks")

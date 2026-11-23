@@ -19,7 +19,7 @@ Item {
     property string type: "table"
     property string role: "block"
     property string content: ""
-    property var children: []
+    property var nodes: []
 
     property var theme: null
 
@@ -84,6 +84,7 @@ Item {
                 model: root.cells
 
                 delegate: Rectangle {
+                    id: cell
                     required property var modelData
 
                     readonly property bool headerCell: modelData.isHeader === true
@@ -109,10 +110,10 @@ Item {
                     MarkdownInline {
                         id: cellText
                         anchors.centerIn: parent
-                        nodes: modelData.nodes
+                        nodes: cell.modelData.nodes
                         theme: root.theme
                         bold: parent.headerCell
-                        horizontalAlignment: root.alignmentFor(modelData.column)
+                        horizontalAlignment: root.alignmentFor(cell.modelData.column)
                     }
                 }
             }

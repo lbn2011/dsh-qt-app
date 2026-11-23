@@ -21,6 +21,7 @@ TestCase {
 
     name: "SettingsPluginSlot"
     when: windowShown
+    visible: true
 
     /** One toggle, declared the way a plugin would. */
     function toggleSchema(name) {
@@ -177,6 +178,8 @@ TestCase {
         var first = findChild(forms, "settingsSlotForm0")
         verify(first !== null)
         compare(findChild(first, "settingsSlotHeading").text, "A")
+        verify(first.theme !== null, "an unthemed SlotForms preserves the host's default Theme")
+        compare(findChild(first, "settingsSlotHeading").color, first.theme.text)
 
         forms.destroy()
     }

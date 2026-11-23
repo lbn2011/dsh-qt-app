@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 // SlotForms.qml — renders the `conversation.settings.form` contributions that
 // belong to one settings tab.
 //
@@ -71,7 +73,12 @@ ColumnLayout {
 
             objectName: "settingsSlotForm" + formHost.index
             Layout.fillWidth: true
-            theme: root.theme
+            Binding {
+                target: formHost
+                property: "theme"
+                value: root.theme
+                when: root.theme !== null
+            }
             contribution: formHost.modelData
             slotContext: root.slotContext
         }

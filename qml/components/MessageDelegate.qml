@@ -48,7 +48,7 @@ Item {
     // qmllint disable unqualified
     readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
     // qmllint enable unqualified
-    property Theme theme: Theme { bridge: themeBridge }
+    property Theme theme: Theme { bridge: delegate.themeBridge }
 
     readonly property bool fromUser: delegate.role === "user"
     readonly property bool fromSystem: delegate.role === "system"

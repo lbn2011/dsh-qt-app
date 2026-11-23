@@ -63,7 +63,7 @@ ApplicationWindow {
      * echo instead of a real reply.
      */
     // qmllint disable unqualified
-    readonly property QtObject qtBridge: (typeof dshQt !== "undefined" && dshQt !== null
+    readonly property var qtBridge: (typeof dshQt !== "undefined" && dshQt !== null
                                           && typeof dshQt.request === "function") ? dshQt : null
     // qmllint enable unqualified
 

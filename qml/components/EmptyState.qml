@@ -20,7 +20,7 @@ Item {
     // qmllint disable unqualified
     readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
     // qmllint enable unqualified
-    property Theme theme: Theme { bridge: themeBridge }
+    property Theme theme: Theme { bridge: emptyState.themeBridge }
     property string title: qsTr("No messages yet")
     property string hint: qsTr("Type a message below to start a session.")
 

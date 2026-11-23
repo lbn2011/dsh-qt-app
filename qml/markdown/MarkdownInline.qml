@@ -17,7 +17,6 @@ Text {
     property string type: "inline"
     property string role: "inline"
     property string content: root.plainText
-    property var children: root.nodes
 
     /** Inline nodes to render. */
     property var nodes: root.node !== null && root.node !== undefined

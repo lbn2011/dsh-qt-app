@@ -116,14 +116,14 @@ TestCase {
         const settings = makeSettings({})
         const theme = settings.theme
 
-        const before = theme.background
+        const before = String(theme.background)
         const beforeLuminance = testCase.luminance(before)
         settings.applyTheme("light")
 
         compare(settings.mode, "light")
         compare(settings.effectiveScheme, "light")
         compare(theme.themeId, "light", "the Theme follows the selection")
-        verify(theme.background !== before, "background repainted")
+        verify(String(theme.background) !== before, "background repainted")
         // A light scheme is genuinely lighter than the dark one, by number
         // rather than by an opaque string comparison.
         verify(testCase.luminance(theme.background) > beforeLuminance + 0.5,
@@ -137,13 +137,13 @@ TestCase {
         const theme = settings.theme
 
         settings.applyTheme("light")
-        const lightSurface = theme.surface
+        const lightSurface = String(theme.surface)
 
         settings.applyTheme("dark")
 
         compare(settings.effectiveScheme, "dark")
         compare(theme.themeId, "dark")
-        verify(theme.surface !== lightSurface, "surface repainted back to dark")
+        verify(String(theme.surface) !== lightSurface, "surface repainted back to dark")
 
         settings.destroy()
     }

@@ -13,7 +13,7 @@ Item {
     property string type: "blockquote"
     property string role: "block"
     property string content: ""
-    property var children: root.node !== null && root.node !== undefined
+    property var nodes: root.node !== null && root.node !== undefined
                            && root.node.children !== undefined && root.node.children !== null
                            ? root.node.children
                            : []
@@ -47,10 +47,10 @@ Item {
         anchors.topMargin: Math.round(root.base.tokens.spacing / 2)
         source: "Markdown.qml"
         onLoaded: {
-            item.document = root.children
+            item.document = { "type": "document", "children": root.nodes }
             item.theme = root.theme
         }
-        Binding { target: content.item; property: "document"; value: root.children }
+        Binding { target: content.item; property: "document"; value: ({ "type": "document", "children": root.nodes }) }
         Binding { target: content.item; property: "theme"; value: root.theme }
     }
 }

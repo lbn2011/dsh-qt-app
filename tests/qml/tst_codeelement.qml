@@ -73,7 +73,7 @@ TestCase {
 
         compare(block.renderer, null, "no renderer without a host")
         compare(block.isHighlighted, false, "nothing is highlighted")
-        compare(text.textFormat, TextEdit.TextPlain, "plain text is the fallback format")
+        compare(text.textFormat, TextEdit.PlainText, "plain text is the fallback format")
         compare(text.text, testCase.source, "the source is shown verbatim")
     }
 
@@ -89,7 +89,8 @@ TestCase {
         const text = findChild(block, "markdownCodeText")
         compare(block.isHighlighted, true, "markup from the renderer is used")
         compare(text.textFormat, TextEdit.RichText, "highlighted code is rich text")
-        compare(text.text, "<font color=\"#6ba1ff\">const</font> x = 1")
+        compare(text.getText(0, text.length), "const x = 1")
+        verify(text.text.indexOf("#6ba1ff") >= 0, "highlight colour survives rich-text normalization")
         compare(text.plainText, testCase.source, "the raw source stays available")
 
         // the request carried the code, the fence language and the scheme

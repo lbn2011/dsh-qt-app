@@ -22,7 +22,7 @@ Rectangle {
     // qmllint disable unqualified
     readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
     // qmllint enable unqualified
-    property Theme theme: Theme { bridge: themeBridge }
+    property Theme theme: Theme { bridge: header.themeBridge }
     property string title: qsTr("New session")
     property string status: "idle"
     property string model: ""

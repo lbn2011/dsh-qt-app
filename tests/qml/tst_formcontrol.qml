@@ -17,6 +17,7 @@ TestCase {
 
     name: "FormControl"
     when: windowShown
+    visible: true
 
     function descriptor(name, uiType, value, extra) {
         var base = {

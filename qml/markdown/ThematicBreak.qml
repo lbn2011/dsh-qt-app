@@ -12,7 +12,7 @@ Item {
     property string type: "thematicBreak"
     property string role: "block"
     property string content: ""
-    property var children: []
+    property var nodes: []
 
     property var theme: null
 

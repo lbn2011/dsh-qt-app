@@ -38,10 +38,10 @@ QtObject {
      * `typeof` guards an identifier that does not exist outside the native host;
      * a plain `ctx.theme` read would throw a ReferenceError there.
      */
-    // qmllint cannot resolve a context property, so it flags the two reads below
+    // The linter cannot resolve a context property, so it flags the two reads below
     // as unqualified accesses; the `typeof` guard makes them safe by construction.
     // qmllint disable unqualified
-    property QtObject bridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
+    property var bridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
     // qmllint enable unqualified
 
     /** Active scheme id; falls back to the dark palette without a host. */

@@ -58,7 +58,7 @@ Item {
     property QtObject bridgeOverride: null
 
     /** The bridge actually in use, or null when running without a host. */
-    readonly property QtObject bridge: root.bridgeOverride !== null ? root.bridgeOverride : root.themeBridge
+    readonly property var bridge: root.bridgeOverride !== null ? root.bridgeOverride : root.themeBridge
 
     /** Token source. Follows the live palette through the bridge. */
     property Theme theme: Theme { bridge: root.bridge }
@@ -121,9 +121,9 @@ Item {
      */
     function systemScheme() {
         // qmllint disable unqualified
-        if (typeof Qt !== "undefined" && Qt.styleHints !== undefined
-                && Qt.styleHints.colorScheme !== undefined) {
-            const reported = Qt.styleHints.colorScheme
+        const hints = Qt.styleHints
+        if (hints !== undefined && hints.colorScheme !== undefined) {
+            const reported = hints.colorScheme
             if (reported === 1) // Qt.ColorScheme.Light
                 return "light"
             if (reported === 2) // Qt.ColorScheme.Dark

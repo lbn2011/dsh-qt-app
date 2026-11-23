@@ -63,6 +63,67 @@ Run 45049991925 (build) / 45049992016 (test), 2026-11-22T17:32Z:
 - D2 (settings pane): RESOLVED — tabbed SettingsPanel with schema-driven forms and plugin SlotHost.
 - D3 (API key storage): DEFERRED per plan — no apiKeyRef field shipped in Phase 2; keyring stays Phase 4; schema contains no secret material.
 
-## 8. Gate verdict
+## 8. Recovery verification (t26 attempt 8, 2026-11-23)
+
+Current published app revision: `07cf477007051ce6f6f45bb684c4405e7687ee01`.
+The following are observed job results, not a new review approval:
+
+| Evidence | Result |
+|---|---|
+| [Build run 45193645540](https://github.com/lbn2011/dsh-qt-app/actions/runs/45193645540) | Ubuntu and Windows Qt build, Package, and bundled-addon assertion all passed; macOS cancelled |
+| [Test run 45193645295](https://github.com/lbn2011/dsh-qt-app/actions/runs/45193645295) | Ubuntu and Windows TypeScript and packaging passed; QML tests, QML lint, and Windows addon tests failed |
+| Local `pnpm -C dsh-qt-app test` | 319 passed, 0 failed; exit 0 |
+| Local `pnpm -C dsh-qt-app typecheck` | exit 0 |
+| Local CMake configure with contract Qt prefix | exit 1: Qt6Config.cmake / qt6-config.cmake unavailable |
+
+Local checks ran serially in `t26-recovery-verify.service`; inspected properties were
+`CPUQuotaPerSecUSec=2s` and `MemoryMax=4294967296` (CPUQuota=200%, MemoryMax=4G).
+Peak memory was 343.4 MiB. The test reporter emitted `ℹ tests 319` rather than TAP
+`# tests 319`; the contract's literal grep is therefore not a valid gate under this
+local runner. The CMake grep also does not prove absence of absolute destinations:
+`grep -v` succeeds when any unrelated line exists. CMake currently uses relative
+`DESTINATION "dsh-qt-napi/prebuild/${DSH_QT_NAPI_TRIPLE}"` with a build-tree default
+install prefix; the two-platform Package jobs provide the execution evidence.
+
+Original job logs were fetched using the GitHub jobs logs API (the `gh run view
+--log` invocation returned empty files). Confirmed remaining failures:
+
+- QML job 137758221452: CodeBlock rich-text output is normalized to a complete HTML
+  document while the test compares the original fragment; plain-text assertion
+  expects `undefined` versus actual `0`. List body and Markdown descendant checks
+  fail; FormControl, SettingsForm, SettingsPluginSlot and ThemeSettings also fail.
+  SlotHost reports null theme reads. Root-cause hypotheses about component children
+  still require reproduction and must not be treated as established fixes.
+- Windows addon job 137758221239: three discovery assertions compare POSIX paths
+  with resolved Windows paths; nine loader/parity cases report
+  `ERR_UNSUPPORTED_ESM_URL_SCHEME` / `Received protocol 'd:'`, with locations in
+  `dsh-qt-napi/test/loader-integration.test.mjs`. These are separate from the now
+  passing app theme-path test.
+- QML lint job 137758221247: warnings include invalid qmllint directive text in
+  Theme.qml, missing QObject properties, and unqualified accesses across several
+  components. The repair scope now includes these diagnostics and addon tests.
+
+N2 and the original N3 have green CI evidence. N1 and the all-green criterion
+remain unmet. Subsequent repairs and real Qt validation are in progress; no
+all-green run is claimed. The current verification commands are direct `pnpm -C
+dsh-qt-app test`, `typecheck`, and `build`; the obsolete grep pipelines above are
+retained only to explain the earlier local evidence.
+
+### Follow-up local checks (2026-11-24)
+
+Direct contract commands `pnpm -C dsh-qt-app test`, `typecheck`, and `build`
+all exited 0 in `t26-contract-checks.service`; CPUQuotaPerSecUSec=2s and
+MemoryMax=4294967296 were inspected before execution. Runtime was 5.891s,
+peak memory 325.8 MiB. Native addon `npm test` also passed 70/70 with zero
+skips in separately limited `t26-napi-check.service` (same limits).
+
+Local Qt validation remains unavailable. The logged SDK installation failed
+with exit 1 after installing aqtinstall 3.3.0 on Python 3.14.8:
+`The packages ['qt_base'] were not found while parsing XML of package information!`
+No real Qt executable was generated. The earlier installation exited 120 with
+no retained exception detail. Neither attempt is Qt validation. The repaired
+revision still requires real Qt QML/lint and Windows CI execution.
+
+## 9. Gate verdict
 
 Verdict: **needs_revision** — all t10–t22 code deliverables are present, coherent and locally green (319/319 tests, typecheck, build clean), but the Phase 2 acceptance criterion "CI passed on Linux/Windows" is not met at head 46a9406 due to F1 (C++ compile error), F2 (test.yml ordering) and F3 (Windows node-gyp spawn). After those fixes and a green CI run, the gate can pass on re-review; D1–D3 and risk dispositions are recorded above.

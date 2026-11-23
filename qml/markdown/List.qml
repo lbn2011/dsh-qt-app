@@ -17,7 +17,7 @@ Item {
     property string type: "list"
     property string role: "block"
     property string content: ""
-    property var children: root.items
+    property var nodes: root.items
 
     property var theme: null
 

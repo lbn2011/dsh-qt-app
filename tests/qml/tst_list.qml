@@ -86,7 +86,9 @@ TestCase {
 
         const body = findChild(view, "markdownListItemBody")
         verify(body !== null, "list item must expose its body")
-        compare(body.blockCount, 1, "the item body is a markdown document")
+        verify(body.item !== null)
+        compare(body.item.blockCount, 1, "the item body is a markdown document")
+        compare(findChild(body.item, "markdownParagraphText").text, "body text")
     }
 
     function test_itemWithSeveralBlocks() {
@@ -99,7 +101,8 @@ TestCase {
 
         const body = findChild(view, "markdownListItemBody")
         verify(body !== null)
-        compare(body.blockCount, 2, "a loose list item keeps every block")
+        verify(body.item !== null)
+        compare(body.item.blockCount, 2, "a loose list item keeps every block")
     }
 
     function test_emptyListRendersNothing() {

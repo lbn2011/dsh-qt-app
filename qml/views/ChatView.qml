@@ -25,7 +25,7 @@ Rectangle {
     // qmllint disable unqualified
     readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
     // qmllint enable unqualified
-    property Theme theme: Theme { bridge: themeBridge }
+    property Theme theme: Theme { bridge: chatView.themeBridge }
     /** Message model to render; null renders the empty state only. */
     /**
      * The Node bridge (`dshQt`), or null when no host is attached.

@@ -75,7 +75,7 @@ SettingsForm {
         }
     ]
 
-    theme: parent !== null ? parent.theme : null
+    // The owner injects theme explicitly; SettingsForm supports a null theme.
     settings: root.settingsBridge
     fields: (root.settingsBridge !== null && root.settingsBridge !== undefined
         && typeof root.settingsBridge.fields === "function")

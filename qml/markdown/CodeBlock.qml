@@ -30,7 +30,7 @@ Item {
     property string content: root.node !== null && root.node !== undefined && root.node.value !== undefined
                              ? String(root.node.value)
                              : ""
-    property var children: []
+    property var nodes: []
 
     /** Info string of the fence ("ts", "qml", …); empty for indented blocks. */
     property string language: root.node !== null && root.node !== undefined && root.node.language !== undefined
@@ -57,10 +57,12 @@ Item {
     /** Test/host seam: a stand-in for ctx.qtRenderer. */
     property var rendererOverride: null
 
-    /** The Cordis renderer service, when the host published one. */
+    /** The Cordis renderer service is a host-injected context property. */
+    // qmllint disable unqualified
     readonly property var renderer: root.rendererOverride !== null && root.rendererOverride !== undefined
                                     ? root.rendererOverride
                                     : ((typeof ctx !== "undefined" && ctx.qtRenderer) ? ctx.qtRenderer : null)
+    // qmllint enable unqualified
 
     /** Colour scheme to ask for; follows the active theme. */
     readonly property string scheme: {

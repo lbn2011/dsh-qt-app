@@ -13,7 +13,7 @@ Item {
     property string type: "listItem"
     property string role: "block"
     property string content: ""
-    property var children: root.blocks
+    property var nodes: root.blocks
 
     /** Block nodes of this item (the AST's list item body). */
     property var blocks: root.node !== null && root.node !== undefined
@@ -61,10 +61,10 @@ Item {
             width: row.width - markerText.width - row.spacing
             source: "Markdown.qml"
             onLoaded: {
-                item.document = root.blocks
+                item.document = { "type": "document", "children": root.blocks }
                 item.theme = root.theme
             }
-            Binding { target: body.item; property: "document"; value: root.blocks }
+            Binding { target: body.item; property: "document"; value: ({ "type": "document", "children": root.blocks }) }
             Binding { target: body.item; property: "theme"; value: root.theme }
         }
     }
