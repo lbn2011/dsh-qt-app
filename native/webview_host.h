@@ -68,11 +68,8 @@ public:
 signals:
     void visibleChanged();
     void maskedUrlChanged();
-    // `webengine-unavailable`, `invalid-url`, `navigation-blocked`, `load-failed`.
+    // `webengine-unavailable`, `invalid-url`, `load-failed`.
     void loadFailed(const QString &reason);
-    // The page asked for something only the shell can do (open a link in the
-    // system browser, for instance). The token is never part of this signal.
-    void externalNavigationRequested(const QString &url);
 
 private:
     class Private;

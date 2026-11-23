@@ -28,12 +28,36 @@ set(CMAKE_AUTOMOC ON)
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Quick Qml QuickControls2)
 
+# --- phase 3: optional Qt WebEngine embedding -------------------------------
+# The on-demand WebUI fallback normally hands the authenticated URL to the
+# user's browser. When WebEngine is available the shell can also embed it in a
+# native view, which is a packaging decision (Chromium adds ~150 MB):
+# ON keeps the view, OFF ships a smaller binary that only opens the browser.
+# CI builds with OFF so the mandatory path never depends on a Qt module the
+# runner does not install.
+option(DSH_QT_WEBENGINE "Embed the on-demand WebUI with Qt WebEngine (ships Chromium)" ON)
+
+set(DSH_QT_HAS_WEBENGINE 0)
+if(DSH_QT_WEBENGINE)
+  find_package(Qt6 QUIET OPTIONAL_COMPONENTS WebEngineQuick)
+  if(TARGET Qt6::WebEngineQuick)
+    set(DSH_QT_HAS_WEBENGINE 1)
+    message(STATUS "dsh-qt-app: Qt WebEngine embedding enabled")
+  else()
+    message(STATUS "dsh-qt-app: DSH_QT_WEBENGINE=ON but Qt6::WebEngineQuick is not installed — embedding disabled")
+  endif()
+else()
+  message(STATUS "dsh-qt-app: Qt WebEngine embedding disabled (DSH_QT_WEBENGINE=OFF)")
+endif()
+
 qt_standard_project_setup()
 
 # Host executable: loads qml/main.qml and exposes the build-time macros from
 # qml/config.h to QML as the `dshQt` context property.
 qt_add_executable(dsh-qt-app
   native/main.cpp
+  native/webview_host.h
+  native/webview_host.cc
   qml/config.h)
 
 target_include_directories(dsh-qt-app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/qml)
@@ -44,6 +68,16 @@ target_link_libraries(dsh-qt-app PRIVATE
   Qt6::Quick
   Qt6::Qml
   Qt6::QuickControls2)
+
+# 1 when WebEngineQuick is linked, 0 otherwise. native/main.cpp uses this to
+# guard QtWebEngineQuick::initialize() (before QGuiApplication) and
+# native/webview_host.cc to compile either the real view or the unavailable
+# stub, so the QML contract (`available`, `maskedUrl`, `loadAuthenticated`) is
+# identical in both builds.
+target_compile_definitions(dsh-qt-app PRIVATE DSH_QT_HAS_WEBENGINE=${DSH_QT_HAS_WEBENGINE})
+if(DSH_QT_HAS_WEBENGINE)
+  target_link_libraries(dsh-qt-app PRIVATE Qt6::WebEngineQuick)
+endif()
 
 # QML sources are embedded as qrc:/qml/... so the executable is self-contained.
 # Every .qml file under qml/ is picked up (components/, models/, views/ included),
@@ -283,6 +317,14 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "DSH Qt6/QML native UI profile")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "dsh-qt-app")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+
+# Redistributable notices: MIT (this project), the pinned addon, and the
+# BSD-2-Clause cmark-gfm vendored inside it. install() puts them next to the
+# executable so an unpacked package cannot lose its provenance.
+install(FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+  "${CMAKE_CURRENT_SOURCE_DIR}/THIRD-PARTY-NOTICES.md"
+  DESTINATION .)
 set(CPACK_PACKAGE_CHECKSUM "SHA256")
 
 if(WIN32)

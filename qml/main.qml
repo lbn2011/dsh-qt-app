@@ -52,6 +52,15 @@ ApplicationWindow {
     SessionModel { id: session }
     ListModel { id: sessionIndexModel }
 
+    /** Live tool-call projection (I2); rows arrive as `tool.row` events. */
+    ToolCallModel { id: toolModel }
+
+    /** Official settings / LLM / credential surface (I3). */
+    SettingsBridge { id: hostSettings; host: window.qtBridge }
+
+    /** Plugin catalogue, settings slots and `ui.action` dispatch (I4). */
+    PluginsBridge { id: hostPlugins; qtBridge: window.qtBridge }
+
     /** Active scheme id, mirrored for bindings that only need the name. */
     readonly property string themeId: theme.themeId
 
@@ -199,7 +208,7 @@ ApplicationWindow {
      * ship with (`ThemeForm.fallbackFields`, …). Edits still reach the store
      * through `saveSetting()`, so this is a display-only gap, not a write-path one.
      */
-    readonly property var settingsBridge: null
+    readonly property var settingsBridge: hostSettings
 
     /** Persist one setting; the schema is validated on the Node side. */
     function saveSetting(name, value) {
@@ -236,6 +245,7 @@ ApplicationWindow {
         objectName: "chatView"
         theme: theme
         messageModel: chatModel
+        toolModel: toolModel
         qtBridge: window.qtBridge
         title: session.title
         status: session.status
@@ -286,6 +296,56 @@ ApplicationWindow {
         }
     }
 
+    /**
+     * Host events (v1 `evt` frames) forwarded by native/main.cpp.
+     *
+     * The three consumers are deliberately disjoint: tool rows keep the model
+     * current, `webui.state` mirrors the fallback state machine, and slot
+     * changes only invalidate the plugin form cache.
+     */
+    Connections {
+        target: window.qtBridge
+        ignoreUnknownSignals: true
+
+        function onEventReceived(name, topic, payload) {
+            if (name === "tool.row")
+                window.applyToolRows(payload)
+            else if (name === "tool.snapshot" && payload && payload.rows)
+                toolModel.applySnapshot(payload)
+            else if (name === "webui.state")
+                webFallback.applyStatus(payload)
+            else if (name === "slot.changed")
+                hostPlugins.refreshSlots("conversation.settings.form")
+        }
+
+        function onWebuiStateChanged(status) {
+            webFallback.applyStatus(status)
+        }
+    }
+
+    /**
+     * Apply one `tool.row` event.
+     *
+     * A new epoch means the host restarted (seq restarts at 1), and a new
+     * session key means the user switched conversations: both clear the model
+     * before applying, so rows from the previous stream can never leak in.
+     */
+    function applyToolRows(payload) {
+        if (!payload || payload.rows === undefined || payload.rows === null)
+            return
+        var epoch = String(payload.epoch === undefined ? "" : payload.epoch)
+        var key = String(payload.sessionKey === undefined ? "" : payload.sessionKey)
+        if (epoch !== toolModel.epoch || key !== toolModel.sessionKey) {
+            toolModel.clearRows()
+            toolModel.epoch = epoch
+            toolModel.sessionKey = key
+            toolModel.watermark = 0
+        }
+        toolModel.applyRows(payload.rows)
+        if (payload.seq !== undefined)
+            toolModel.watermark = Number(payload.seq)
+    }
+
     MessageInput {
         id: messageInput
         objectName: "messageInputBar"
@@ -301,6 +361,51 @@ ApplicationWindow {
         onDeliveryReported: function (id, text, accepted, error) {
             window.finishSend(id, text, accepted, error)
         }
+    }
+
+    /**
+     * On-demand WebUI fallback (I5).
+     *
+     * Inert until the user asks for it: `webui.open` is the only thing that can
+     * start a listener or a child process, and the panel stays hidden while the
+     * state is Idle. The one-shot authenticated URL never reaches this file —
+     * the shell asks C++ to embed or open it (`openWebuiEmbedded` /
+     * `openWebuiExternally`), and QML only ever sees `maskedUrl`.
+     */
+    WebFallbackPanel {
+        id: webFallback
+
+        objectName: "webFallbackPanel"
+        webviewHost: (typeof webviewHost !== "undefined" ? webviewHost : null)
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: messageInput.top
+        width: Math.min(560, Math.round(window.width * 0.45))
+        visible: !webFallback.idle
+        z: 20
+
+        onOpenRequested: window.requestWebui("open")
+        onRetryRequested: window.requestWebui("open")
+        onCloseRequested: window.requestWebui("close")
+        onEmbedRequested: {
+            if (window.qtBridge !== null)
+                window.qtBridge.openWebuiEmbedded()
+        }
+        onExternalOpenRequested: {
+            if (window.qtBridge !== null)
+                window.qtBridge.openWebuiExternally()
+        }
+    }
+
+    /** Send one `webui.*` request; replies arrive as `webui.state` events. */
+    function requestWebui(action) {
+        if (window.qtBridge === null)
+            return ""
+        if (action === "close") {
+            window.qtBridge.closeWebui()
+            return ""
+        }
+        return window.qtBridge.request("webui.open", ({}))
     }
 
     /**
@@ -329,6 +434,7 @@ ApplicationWindow {
             anchors.fill: parent
             theme: theme
             settingsBridge: window.settingsBridge
+            pluginsBridge: hostPlugins
             onSettingEdited: function (name, value) {
                 window.saveSetting(name, value)
             }

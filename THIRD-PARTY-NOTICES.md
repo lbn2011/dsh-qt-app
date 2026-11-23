@@ -1,0 +1,70 @@
+# Third-party notices
+
+`dsh-qt-app` itself is MIT-licensed (see `LICENSE`). This file lists the
+components whose source or binaries travel with a packaged build, the exact
+upstream identity that produced them, and where their licence text lives. It is
+installed next to the executable so a redistributed package keeps its notices.
+
+## dsh-qt-napi (N-API addon, `qt-bridge.node`)
+
+- Repository: <https://github.com/lbn2011/dsh-qt-napi>
+- Pinned commit: `87084a6901297a4fe9af997d4b8cdf9d829b0f67` (also recorded in
+  `package.json` under `dshQtNapi.commit`; CI checks the checkout against it)
+- Licence: MIT (the repository's `LICENSE`)
+- Why it is bundled: the Qt host does not link a Markdown parser. It asks Node
+  for an AST over the v1 stdio protocol, so the addon is the only cmark-gfm
+  build in the product and must ship beside the executable.
+
+## cmark-gfm (vendored inside dsh-qt-napi)
+
+- Upstream: <https://github.com/github/cmark-gfm>
+- Version: `0.29.0.gfm.14`, partially vendored (parser sources; the upstream
+  test suite is not vendored)
+- Licence: BSD-2-Clause
+
+```
+Copyright (c) 2014, John MacFarlane
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+A byte-for-byte copy of the upstream `COPYING` is retained in the addon
+repository at `vendor/cmark-gfm/COPYING`; its `PROVENANCE.md` records the
+0.29.0.gfm.14 import. Nothing here re-licenses that code.
+
+## Qt 6 (linked at build time, not redistributed by this repository)
+
+The executable links Qt 6 (Core, Gui, Quick, Qml, QuickControls2; optionally
+WebEngineQuick). Qt is distributed under LGPL-3.0 / GPL-3.0 / commercial terms;
+this repository does not vendor or redistribute Qt binaries. Installers built
+from a Qt installation inherit whatever terms that installation carries. The
+WebEngine option is OFF in CI, so the mandatory build does not pull Chromium
+into the package.
+
+## JavaScript runtime dependencies
+
+`@deepseek-ai/cordis` and the Cordis include/loader plugins are installed by
+`pnpm` at build/test time and are not copied into the CMake package. Their
+licences are recorded in `pnpm-lock.yaml` and in each package's `LICENSE`.

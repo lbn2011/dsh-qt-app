@@ -46,6 +46,12 @@ Rectangle {
     readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
     // qmllint enable unqualified
 
+    /** Plugin catalogue bridge (I4); null when the host is absent. */
+    property var pluginsBridge: null
+
+    /** Official settings/LLM/credential bridge (I3); null when the host is absent. */
+    // (declared above as settingsBridge)
+
     /** Test/preview seam: forwarded to ThemeSettings.qml. */
     property QtObject bridgeOverride: null
 
@@ -105,6 +111,11 @@ Rectangle {
         {
             "id": "language",
             "title": qsTr("Language"),
+            "kind": "builtin"
+        },
+        {
+            "id": "models",
+            "title": qsTr("Models"),
             "kind": "builtin"
         },
         {
@@ -512,12 +523,51 @@ Rectangle {
                         Layout.fillWidth: true
                         theme: root.theme
                         contributions: root.contributionsFor("plugins")
+                        pluginsBridge: root.pluginsBridge
                     }
 
                     SlotForms {
                         Layout.fillWidth: true
                         theme: root.theme
                         forms: root.contributionsFor("plugins")
+                        slotContext: root.slotContext
+                    }
+                }
+            }
+
+            // -- Models ------------------------------------------------------
+            Flickable {
+                id: modelsPage
+
+                objectName: "settingsPageModels"
+
+                contentWidth: width
+                contentHeight: modelsColumn.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+
+                ScrollBar.vertical: ScrollBar {
+                    policy: ScrollBar.AsNeeded
+                    palette.mid: root.theme.textMuted
+                    palette.dark: root.theme.border
+                }
+
+                ColumnLayout {
+                    id: modelsColumn
+
+                    width: modelsPage.width
+                    spacing: root.theme.spacingLarge
+
+                    ModelsForm {
+                        objectName: "settingsSectionModels"
+                        Layout.fillWidth: true
+                        settingsBridge: root.settingsBridge
+                    }
+
+                    SlotForms {
+                        Layout.fillWidth: true
+                        theme: root.theme
+                        forms: root.contributionsFor("models")
                         slotContext: root.slotContext
                     }
                 }

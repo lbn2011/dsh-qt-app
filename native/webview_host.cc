@@ -35,7 +35,6 @@ namespace {
 
 constexpr auto kUnavailable = "webengine-unavailable";
 constexpr auto kInvalidUrl = "invalid-url";
-constexpr auto kNavigationBlocked = "navigation-blocked";
 constexpr auto kLoadFailed = "load-failed";
 
 // `http://127.0.0.1:PORT/?token=***` — never the raw URL.

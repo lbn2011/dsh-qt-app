@@ -1,6 +1,6 @@
 # Phase 3 分层测试矩阵与 CI 证据门禁（t10，设计文档）
 
-状态：**设计稿，未实现任何测试代码、未运行任何构建**。本文只定义「验收标准 + 证据格式 + 门禁规则」；每一项缺失测试入口都标注为实施任务（I-xx），**不伪造可执行命令**。
+状态：**设计矩阵（实施现状见独立文件）**。已跑的入口与真实退出码记录在 `docs/PHASE-3-STATUS.md` §3（t26 实测：TS 473/473、QML 215/215、真实 Qt 子进程 e2e 通过）。下表标记 I-xx 的入口只有在代码里存在并可执行时才算「已实现」；未实现的仍是缺口，不伪造命令。
 
 版本锚（引用 t1 报告 §0）：已安装宿主 @deepseek-ai/dsh **0.2.2-rc.1**；官方源码参考 0.2.3-alpha.2 仅作能力面；dsh-qt-app 0.1.0 / dsh-qt-napi 0.1.0；本机 Qt 6.8.2（qmltestrunner/qmllint 在 /usr/lib/qt6/bin，不在 PATH）；Node v26.13.1。CI 矩阵 pin Qt 6.7.3 / Node 22.19.0。
 
@@ -37,13 +37,29 @@
 
 ---
 
+### 1.3 实施状态（t26 实测，随代码更新）
+
+| 缺口 ID | 现状 | 入口（存在才列） |
+|---|---|---|
+| I-G0 | **部分实现**：真实 Qt 子进程握手 + `host.ping` 往返 + 干净退出；尚未在隔离 profile 中跑完整会话/工具流 | `tests/host-e2e.e2e.ts` |
+| I-TOOL1 | **已实现** | `tests/qml/tst_toolcallmodel.qml`、`tests/tools-projection.test.ts` |
+| I-PLUGIN1 | **已实现**（官方 manager fake） | `tests/plugins-service.test.ts`、`tests/integration-wiring.test.ts` |
+| I-PLUGIN2 | **已实现**（受限 React 子集/拒绝） | `tests/ui-converter.test.ts` |
+| I-WEBUI1 | **已实现**（状态机，不 spawn） | `tests/webui-service.test.ts`、`tests/webui-default-off.test.ts` |
+| I-WEBUI2 | **未实现**：未在 CI 内真实 spawn `dsh web --port 0 --no-open` | — |
+| I-SET1 | **已实现** | `tests/settings-rpc.test.ts`、`tests/settings-forms.test.ts`、`tests/qml/tst_settingsbridge.qml` |
+| I-SET2 | **部分实现**：帧/回复 JSON 断言无 sentinel secret；日志 spy 级断言未单列 | `tests/integration-wiring.test.ts` |
+| I-GATE1 | **未实现**：门禁包装器脚本不存在；当前直接记录命令退出码与日志路径 | — |
+| I-DOC1 | **部分实现**：`docs/ci.md` Known gaps + `docs/PHASE-3-STATUS.md` §4 | — |
+
+
 ## 2. 需求 → 分层测试 → 证据 映射（验收矩阵）
 
 层代码：**U**=单元(TS)、**C**=契约(桥/DTO 形状)、**Q**=QML fixture、**E**=真实宿主端到端(隔离 profile)、**P**=Windows/Linux 打包、**M**=macOS（缺口，如实标注）。证据锚：CI job/step 名 + 日志文件路径（§5 格式）。
 
 | ReqID | 需求（来自任务书/依赖报告） | U | C | Q | E | P | 正例 | 负例 | 证据锚 | 实施 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| R-BRIDGE-H1 | 真实双进程握手：Qt 启动→stdio 连接→Node 侧 connected；每帧换行分隔 JSON-RPC envelope（TS qml.request/qml.reply 形状为准，C++ 扁平请求/响应需适配，差异以任务追加证据为准） | U | C(envelope 形状冻结) | — | E(I-G0：真实 spawn，抓帧存盘) | — | 握手后 request/reply 往返 | 断连、半行帧、非 JSON 帧→显式错误非挂死 | e2e（帧日志 artifacts） | I-G0 |
+| R-BRIDGE-H1 | 真实双进程握手：Qt 启动→stdio 连接→Node 侧 connected；每帧换行分隔 JSON-RPC envelope（协议 v1 信封：`kind=hello|hello.ack|req|res|evt`，帧定义见 `src/bridge/protocol.ts`；**不存在** Phase 2 的 `qml.request/qml.reply` 双形状兼容层） | U | C(envelope 形状冻结) | — | E(I-G0：真实 spawn，抓帧存盘) | — | 握手后 request/reply 往返 | 断连、半行帧、非 JSON 帧→显式错误非挂死 | e2e（帧日志 artifacts） | I-G0 |
 | R-BRIDGE-T1 | 请求/回复与超时：request 有 replyId；无 reply 超时→rejected+超时码；进程退出→pending 全部 rejected | U | C | — | E（kill 一端观察） | — | 正常往返 | replyId 重复/超时/exit 三负例 | e2e | I-G0 |
 | R-BRIDGE-E1 | 事件流：qml.event 推通道不占 request 槽位；乱序/重复事件幂等到达（与 R-TOOL-O1 共用 fixture） | U | C | Q | E | — | 推送顺序保序 | 同帧多事件、事件先于握手 | qml-tests / e2e | I-TOOL1,I-G0 |
 | R-TOOL-O1 | 工具事件乱序到达仍收敛到正确五态（queued/running/succeeded/failed/cancelled） | U(模型状态机) | C(ToolEventDTO/ToolRowDTO 形状、tool.snapshot 拉通道) | Q(I-TOOL1) | E(I-G0：jsonl 注入 4 行) | — | ok/error 序列正常收敛 | delta 先于 start、error 后又 ok、重复 callId | test.yml `typescript`；qml-tests；e2e job | I-TOOL1,I-G0 |

@@ -38,6 +38,9 @@ env:
   QT_VERSION: 6.7.3
   NODE_VERSION: "22.19.0"
   NAPI_REPO: lbn2011/dsh-qt-napi
+  # Full commit, not a branch: the addon is a separate repository and an
+  # unpinned checkout would let a rebuilt cmark-gfm change this app silently.
+  NAPI_SHA: 87084a6901297a4fe9af997d4b8cdf9d829b0f67
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -58,7 +61,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.NAPI_REPO }}
+          ref: ${{ env.NAPI_SHA }}
           path: dsh-qt-napi
+
+
+      - name: Assert addon checkout matches the pinned SHA
+        shell: bash
+        working-directory: dsh-qt-napi
+        run: |
+          got="$(git rev-parse HEAD)"
+          if [ "$got" != "$NAPI_SHA" ]; then
+            echo "::error::dsh-qt-napi checkout is $got, expected pinned $NAPI_SHA"
+            exit 1
+          fi
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -136,6 +151,11 @@ jobs:
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
+
+      - name: Assert pinned addon SHA (package.json)
+        shell: bash
+        run: |
+          node -e "const p=require('./package.json'); const want=process.env.NAPI_SHA; const got=p.dshQtNapi&&p.dshQtNapi.commit; if(got!==want){console.error('addon SHA lock mismatch: package.json='+got+' env='+want);process.exit(1)} console.log('addon SHA lock ok: '+got)"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

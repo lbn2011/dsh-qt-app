@@ -1,10 +1,11 @@
 // PluginsSettings.qml — the Plugins tab landing.
 //
-// The native shell cannot install plugins yet (the Cordis host lands in a later
-// phase), so this tab does the honest thing: it states which plugin surfaces the
-// settings panel accepts, and how many contributions actually arrived. When a
-// plugin does ship a settings view, that view is rendered by the panel through
-// SlotHost.qml, immediately below this summary.
+// Phase 3 wires this tab to the live Cordis plugin manager (PluginsBridge.qml).
+// The summary below still states which plugin surfaces the settings panel
+// accepts; the catalogue and the enable switches come from the host, so the
+// tab shows real data when a manager is attached and says so when it is not.
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -19,6 +20,9 @@ ColumnLayout {
     readonly property QtObject themeBridge: (typeof ctx !== "undefined" && ctx.theme) ? ctx.theme : null
     // qmllint enable unqualified
 
+    /** Live bridge to the Node plugin manager; injected by the settings panel. */
+    property var pluginsBridge: null
+
     /** Token source; a parent injects its own Theme instance. */
     property Theme theme: Theme { bridge: root.themeBridge }
 
@@ -30,6 +34,8 @@ ColumnLayout {
         "conversation.settings.section",
         "conversation.settings.form"
     ]
+
+    readonly property bool bridgeBusy: root.pluginsBridge !== null && root.pluginsBridge.busy
 
     readonly property int contributionCount: (root.contributions === null
         || root.contributions === undefined
@@ -77,13 +83,65 @@ ColumnLayout {
 
     Button {
         objectName: "settingsPluginsManageButton"
-        text: qsTr("Manage plugins")
-        // Disabled on purpose: there is no plugin manager to open yet, and a
-        // button that silently does nothing is worse than a visible "not yet".
-        enabled: false
+        text: root.bridgeBusy ? qsTr("Refreshing…") : qsTr("Refresh plugins")
+        enabled: root.pluginsBridge !== null && !root.bridgeBusy
         implicitHeight: root.theme.controlHeight
         palette.button: root.theme.surfaceAlt
         palette.buttonText: root.theme.text
+        Layout.fillWidth: true
+        onClicked: root.pluginsBridge.refresh()
+    }
+
+    Label {
+        objectName: "settingsPluginsStatus"
+        visible: root.pluginsBridge !== null && root.pluginsBridge.lastError.length > 0
+        text: root.pluginsBridge === null ? "" : root.pluginsBridge.lastError
+        color: root.theme.danger
+        font.pixelSize: root.theme.fontSmall
+        wrapMode: Text.Wrap
+        Layout.fillWidth: true
+    }
+
+    Repeater {
+        objectName: "settingsPluginsRows"
+        model: root.pluginsBridge === null ? [] : root.pluginsBridge.rows
+
+        delegate: RowLayout {
+            id: pluginRow
+
+            required property var modelData
+            Layout.fillWidth: true
+            spacing: root.theme.spacing
+
+            Label {
+                Layout.fillWidth: true
+                text: (pluginRow.modelData.name || pluginRow.modelData.id || "") + (pluginRow.modelData.version ? "  " + pluginRow.modelData.version : "")
+                color: root.theme.text
+                font.pixelSize: root.theme.fontSmall
+                elide: Text.ElideRight
+            }
+
+            Label {
+                text: pluginRow.modelData.enabled ? qsTr("enabled") : qsTr("disabled")
+                color: root.theme.textMuted
+                font.pixelSize: root.theme.fontSmall
+            }
+
+            Switch {
+                objectName: "settingsPluginSwitch_" + (pluginRow.modelData.id || pluginRow.modelData.name || "")
+                checked: !!pluginRow.modelData.enabled
+                onClicked: root.pluginsBridge.setEnabled(pluginRow.modelData.id || pluginRow.modelData.name, checked)
+            }
+        }
+    }
+
+    Label {
+        objectName: "settingsPluginsEmpty"
+        visible: root.pluginsBridge !== null && root.pluginsBridge.rows.length === 0 && !root.bridgeBusy
+        text: qsTr("No plugins installed in this profile.")
+        color: root.theme.textMuted
+        font.pixelSize: root.theme.fontSmall
+        wrapMode: Text.Wrap
         Layout.fillWidth: true
     }
 }

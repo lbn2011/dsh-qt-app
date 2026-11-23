@@ -67,6 +67,18 @@ test(
       pings += 1
       return { pong: true, host: 'node-e2e' }
     })
+    // The Qt selftest walks three real routes of the shipped bridge in order:
+    // handshake, renderer and theme service.
+    let markdownParses = 0
+    host.register('markdown.parse', () => {
+      markdownParses += 1
+      return { document: { type: 'document', children: [] } }
+    })
+    let scales = 0
+    host.register('theme.scale', () => {
+      scales += 1
+      return { scale: 1.25 }
+    })
 
     host.attach({ transport, child })
 
@@ -92,17 +104,56 @@ test(
       [
         '[selftest] state=connecting',
         '[selftest] state=connected',
-        '[selftest] ping=ok pong=1 error=',
+        '[selftest] ping=ok error=',
+        '[selftest] pong=1',
+        '[selftest] markdown.parse=ok error=',
+        '[selftest] theme.scale=ok error=',
       ],
       `selftest stderr was:\n${stderr.join('\n')}`,
     )
     assert.deepEqual(states.slice(0, 2), ['connecting', 'connected'])
     assert.equal(pings, 1, 'the Qt side performs exactly one host.ping')
+    assert.equal(markdownParses, 1, 'the renderer route is reachable from the real binary')
+    assert.equal(scales, 1, 'the theme route is reachable from the real binary')
     assert.equal(exit.code, 0)
     assert.equal(exit.signal, null)
     assert.equal(host.state, 'disconnected')
     assert.ok(host.stats.handled >= 1)
     assert.equal(host.stats.protocolErrors, 0)
     host.dispose()
+  },
+)
+test(
+  'real Qt host: the shipped QML entry loads with every wired surface',
+  { skip: existsSync(binary) ? false : `no Qt binary at ${binary}; run cmake --build build first`, timeout: 20_000 },
+  async () => {
+    // No Node host on purpose: this proves the window itself compiles —
+    // ToolCallModel, SettingsBridge, PluginsBridge, WebFallbackPanel and the
+    // eventReceived Connections — while the transport stays in `connecting`.
+    const child = spawn(binary, [], {
+      cwd: root,
+      env: {
+        ...process.env,
+        QT_QPA_PLATFORM: process.platform === 'win32' ? 'windows' : 'offscreen',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    assert.ok(child.stderr !== null && child.stdout !== null)
+    const stderr: string[] = []
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk: string) => {
+      for (const line of chunk.split(/\r?\n/)) if (line.trim() !== '') stderr.push(line)
+    })
+    const exited = new Promise<number | null>((resolve) => child.once('exit', (code) => resolve(code)))
+    await new Promise((resolve) => setTimeout(resolve, 3000))
+    assert.equal(child.exitCode, null, `the window must stay up; stderr:\n${stderr.join('\n')}`)
+    child.kill()
+    await exited
+    const failures = stderr.filter(
+      (line) => /is not a type|Cannot assign|unavailable|TypeError|ReferenceError/.test(line),
+    )
+    assert.deepEqual(failures, [], `QML load errors:\n${stderr.join('\n')}`)
+    assert.equal(/state=connecting/.test(stderr.join('\n')), false, 'no selftest output without the flag')
   },
 )

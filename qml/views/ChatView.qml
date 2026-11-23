@@ -42,6 +42,14 @@ Rectangle {
 
     property ListModel messageModel: null
 
+    /**
+     * Tool-call rows for this conversation (I2).
+     *
+     * `null` is a supported state: a QML preview or qmltestrunner has no host,
+     * so the section stays hidden rather than showing an empty frame.
+     */
+    property ListModel toolModel: null
+
     // Re-exported header state so main.qml wires a single source of truth.
     property alias title: sessionHeader.title
     property alias status: sessionHeader.status
@@ -266,7 +274,7 @@ Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: sessionHeader.bottom
-        anchors.bottom: parent.bottom
+        anchors.bottom: toolSection.top
         anchors.margins: chatView.theme.spacingLarge
         clip: true
         spacing: chatView.theme.spacingLarge
@@ -283,6 +291,47 @@ Rectangle {
 
         // Keep the newest message in view, including while a reply streams in.
         onCountChanged: messageList.positionViewAtEnd()
+    }
+
+    /**
+     * Tool activity, above the composer.
+     *
+     * Height follows the row count up to a cap so a long tool stream cannot
+     * push the conversation off screen; once capped the list scrolls.
+     */
+    Item {
+        id: toolSection
+
+        objectName: "toolCallSection"
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.margins: chatView.theme.spacingLarge
+        height: (chatView.toolModel !== null && chatView.toolModel.count > 0)
+                ? Math.min(220, chatView.toolModel.count * (chatView.theme.controlHeight + 8)) : 0
+        visible: height > 0
+
+        ListView {
+            id: toolList
+
+            objectName: "toolCallList"
+            anchors.fill: parent
+            clip: true
+            spacing: chatView.theme.spacingSmall
+            boundsBehavior: Flickable.StopAtBounds
+            model: chatView.toolModel
+            ScrollBar.vertical: ScrollBar {
+                palette.mid: chatView.theme.border
+                palette.dark: chatView.theme.textMuted
+            }
+
+            delegate: ToolCallRow {
+                width: toolList.width
+                rowModel: chatView.toolModel
+                rowIndex: index
+                revision: chatView.toolModel.watermark
+            }
+        }
     }
 
     // Re-emit the model's streaming signals so a host can listen on the view.

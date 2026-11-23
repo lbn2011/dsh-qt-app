@@ -35,6 +35,19 @@ import {
 import type { QmlBridge, QmlBridgeRequest } from './bridge/index.js'
 import { HostBridgeError, HostBridgeService } from './host/bridge-service.js'
 import type { HostBridgeConfig, HostBridgeLogger } from './host/bridge-service.js'
+import { randomUUID } from 'node:crypto'
+import { createPluginService } from './plugins/service.js'
+import type { PluginManagerPort } from './plugins/service.js'
+import { registerSettingsMethods } from './bridge/settings-rpc.js'
+import type { SettingsRpcDeps } from './bridge/settings-rpc.js'
+import { registerLlmMethods } from './llm/operations.js'
+import type { LlmOperationsDeps } from './llm/operations.js'
+import { registerCredentialMethods } from './credentials/rpc.js'
+import type { CredentialsRpcDeps } from './credentials/rpc.js'
+import { ToolProjection } from './tools/index.js'
+import type { SessionEventLike } from './tools/index.js'
+import { WebuiService, attachWebuiToHost } from './webui/service.js'
+import type { WebuiServiceConfig } from './webui/service.js'
 import { EventLoopBridge, createEventLoopBridge } from './event-loop/timer.js'
 import { highlight as highlightSource } from './highlight/index.js'
 import type { EventLoopBridgeOptions, EventLoopStats } from './event-loop/timer.js'
@@ -124,6 +137,8 @@ export interface QtPluginConfig {
   hostHandshakeTimeoutMs?: number
   /** Logger handed to the bridge services (Cordis's logger is compatible). */
   logger?: HostBridgeLogger
+  /** On-demand WebUI fallback (I5); nothing listens until `webui.open`. */
+  readonly webui?: WebuiServiceConfig
 }
 
 /** Snapshot returned by `ctx.qtRenderer.stats`. */
@@ -334,6 +349,22 @@ export class QtRendererService extends Service {
  * @param ctx — the Cordis context the plugin is mounted on.
  * @param config — optional plugin configuration.
  */
+/**
+ * Resolve an official host service without declaring it in `inject`.
+ *
+ * The Qt plugin is usable on a bare context (tests, a profile that ships only
+ * part of the harness): a missing service must degrade to `unavailable`, not
+ * fail the fiber. Cordis throws on undeclared property access, so the
+ * reflection layer is asked directly and a miss becomes `undefined`.
+ */
+function optionalService<T>(ctx: Context, name: string): T | undefined {
+  try {
+    return ctx.reflect.get(name, false) as T | undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function apply(ctx: Context, config: QtPluginConfig = {}): void {
   const renderer = new QtRendererService(ctx, config)
 
@@ -371,13 +402,137 @@ export function apply(ctx: Context, config: QtPluginConfig = {}): void {
   )
   registerLegacyMethods(host, qmlBridge)
 
+  // The host profile supplies these services; when one is absent the matching
+  // RPC group degrades to `unavailable` instead of failing the whole plugin.
+  const settingsService = optionalService<NonNullable<OfficialServices['settings']>>(ctx, 'settings')
+  const llmService = optionalService<NonNullable<OfficialServices['llm']>>(ctx, 'llm')
+  const credentialsService = optionalService<NonNullable<OfficialServices['credentials']>>(ctx, 'credentials')
+  const pluginManager = optionalService<NonNullable<OfficialServices['pluginManager']>>(ctx, 'pluginManager')
+  const defaultModel = optionalService<NonNullable<OfficialServices['agentDefaultModel']>>(ctx, 'agentDefaultModel')
+  const logger = config.logger
+  const disposers: Array<() => void> = []
+
+  const settingsDeps: SettingsRpcDeps = {
+    ...(settingsService === undefined ? {} : { settings: settingsService }),
+    ...(logger === undefined ? {} : { logger: logger as unknown as NonNullable<SettingsRpcDeps['logger']> }),
+  }
+  disposers.push(...registerSettingsMethods(host, settingsDeps))
+
+  const llmDeps: LlmOperationsDeps = {
+    ...(llmService === undefined ? {} : { llm: llmService }),
+    ...(defaultModel === undefined ? {} : { defaultModel }),
+    ...(logger === undefined ? {} : { logger: logger as unknown as NonNullable<LlmOperationsDeps['logger']> }),
+  }
+  disposers.push(...registerLlmMethods(host, llmDeps))
+
+  const credentialDeps: CredentialsRpcDeps = {
+    ...(credentialsService === undefined ? {} : { credentials: credentialsService }),
+    ...(logger === undefined ? {} : { logger: logger as unknown as NonNullable<CredentialsRpcDeps['logger']> }),
+  }
+  disposers.push(...registerCredentialMethods(host, credentialDeps))
+
+  const plugins = createPluginService({
+    manager: (pluginManager ?? {}) as PluginManagerPort,
+    host,
+  })
+  plugins.attach()
+  disposers.push(() => plugins.dispose())
+
+  disposers.push(attachToolProjection(ctx, host))
+
+  const webui = new WebuiService(ctx, config.webui ?? {})
+  ctx.effect(() => {
+    const detachWebui = attachWebuiToHost(host, webui)
+    return () => {
+      detachWebui()
+      void webui.dispose()
+    }
+  }, 'dsh-qt-app: webui fallback')
+
   ctx.effect(() => {
     host.start()
     return () => {
+      for (const dispose of disposers.splice(0)) dispose()
       host.dispose()
       qmlBridge.dispose()
     }
   }, 'dsh-qt-app: host bridge')
+}
+
+/** Services the DSH profile may inject; every one is optional at runtime. */
+interface OfficialServices {
+  readonly settings?: SettingsRpcDeps['settings']
+  readonly llm?: LlmOperationsDeps['llm']
+  readonly credentials?: CredentialsRpcDeps['credentials']
+  readonly pluginManager?: PluginManagerPort
+  readonly agentDefaultModel?: LlmOperationsDeps['defaultModel']
+}
+
+interface SessionIdentity {
+  readonly id: unknown
+}
+
+/**
+ * Project the active session's `tool/call` and `tool/result` events into tool
+ * rows and push changed rows to the Qt host.
+ *
+ * The first event of a session (or a resync request) starts a fresh epoch, so
+ * the QML table can tell a session switch from an in-place row update. The
+ * projection itself is pure; this function only owns the subscription and the
+ * `tool.snapshot` method used for the initial load and reconnect reconciliation.
+ */
+function attachToolProjection(ctx: Context, host: HostBridgeService): () => void {
+  const projection = new ToolProjection()
+  let sessionKey: string | null = null
+  let epoch = randomUUID()
+  let disposed = false
+
+  const ensureSession = (key: string): void => {
+    if (key === sessionKey && !projection.needsResync()) return
+    sessionKey = key
+    epoch = randomUUID()
+    projection.beginSession(key, epoch)
+  }
+
+  const unregister = host.register('tool.snapshot', (params) => {
+    const requested =
+      params !== null && typeof params === 'object' && !Array.isArray(params)
+        ? (params as { sessionKey?: unknown }).sessionKey
+        : undefined
+    const key = typeof requested === 'string' && requested.length > 0 ? requested : sessionKey
+    if (key === null) {
+      return { sessionKey: '', epoch, seq: 0, rows: [], truncated: false }
+    }
+    if (projection.sessionKey !== key) ensureSession(key)
+    return projection.snapshot(key)
+  })
+
+  const observable = ctx as unknown as {
+    on(
+      name: string,
+      listener: (session: SessionIdentity, event: SessionEventLike) => void,
+    ): () => void
+  }
+  const off = observable.on('session/event', (session, event) => {
+    if (disposed) return
+    const key = String(session.id)
+    ensureSession(key)
+    const rows = projection.applyEvent(event, { sessionKey: key })
+    if (rows.length === 0) return
+    void host.emitEvent('tool.row', {
+      sessionKey: key,
+      epoch,
+      seq: event.seq,
+      rows,
+      stats: projection.stats,
+    })
+  })
+
+  return () => {
+    disposed = true
+    unregister()
+    off()
+  }
 }
 
 function isParamsRecord(value: unknown): value is Record<string, unknown> {

@@ -16,6 +16,7 @@
 // (src/theme/persist.ts — `theme.json`, schemaVersion 1), and a QML-only store
 // could not be watched for changes made while the app is running.
 #include <QByteArray>
+#include <QDesktopServices>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -56,8 +57,14 @@
 #endif
 
 #include <cstdio>
+#include <memory>
 
 #include "config.h"
+#include "webview_host.h"
+
+#if defined(DSH_QT_HAS_WEBENGINE) && DSH_QT_HAS_WEBENGINE
+#include <QtWebEngineQuick/QtWebEngineQuick>
+#endif
 
 namespace {
 
@@ -722,6 +729,42 @@ public:
         return true;
     }
 
+    /**
+     * Ask the host for the one-shot authenticated WebUI URL.
+     *
+     * QML never receives that URL: the reply is consumed here (or in
+     * WebviewHost) and only `maskedUrl` leaves this object. Both calls are
+     * no-ops when the host is not connected — `request()` already reports
+     * `unavailable` through `requestReplied`.
+     */
+    Q_INVOKABLE void openWebuiEmbedded()
+    {
+        webuiIntent_ = QStringLiteral("embed");
+        request(QStringLiteral("webui.token"));
+    }
+
+    Q_INVOKABLE void openWebuiExternally()
+    {
+        webuiIntent_ = QStringLiteral("browser");
+        request(QStringLiteral("webui.token"));
+    }
+
+    Q_INVOKABLE void closeWebui()
+    {
+        webuiIntent_.clear();
+        if (webview_ != nullptr)
+            webview_->close();
+        request(QStringLiteral("webui.close"));
+    }
+
+    /** True when this build can embed a WebEngine view (own Chromium). */
+    Q_INVOKABLE bool canEmbedWebui() const
+    {
+        return webview_ != nullptr && webview_->available();
+    }
+
+    void setWebviewHost(WebviewHost *view) { webview_ = view; }
+
     Q_INVOKABLE QVariantMap stats() const
     {
         return QVariantMap{{QStringLiteral("transport"), transportState()},
@@ -748,6 +791,18 @@ signals:
     void requestReplied(const QString &id, const QString &method, bool ok, const QVariant &result, const QString &error);
     void transportStateChanged();
     void pendingRequestsChanged();
+
+    /**
+     * Every v1 `evt` frame, already validated by the host, forwarded to QML.
+     *
+     * `payload` is the event payload object; `topic` carries the optional
+     * `{session, turn}` scope. Known names additionally drive native state
+     * (`theme.reload`, `webui.state`); everything else is consumed by QML.
+     */
+    void eventReceived(const QString &name, const QVariant &topic, const QVariant &payload);
+
+    /** WebUI fallback state machine, mirrored for the QML panel. */
+    void webuiStateChanged(const QVariantMap &status);
 
 private:
     struct Pending
@@ -1017,8 +1072,22 @@ private:
         // Events are host→Qt; Qt never replies to one. Unknown names are
         // ignored so a newer host can add events without breaking this build.
         const QString name = frame.value(QStringLiteral("name")).toString();
+        const QJsonValue payloadValue = frame.value(QStringLiteral("payload"));
+        const QVariant payload = payloadValue.toVariant();
+        const QVariant topic = frame.value(QStringLiteral("topic")).toVariant();
+
         if (name == QLatin1String("theme.reload"))
             theme_->reload();
+        else if (name == QLatin1String("webui.state")) {
+            const QVariantMap status = payloadValue.toObject().toVariantMap();
+            if (webview_ != nullptr)
+                webview_->applyStatus(status);
+            emit webuiStateChanged(status);
+        }
+
+        // Everything (including the two handled above) is forwarded once, so
+        // QML consumers do not need a second subscription path.
+        emit eventReceived(name, topic, payload);
     }
 
     void rejectProtocol_(const QString &code, const QString &message)
@@ -1174,10 +1243,20 @@ private:
     int timedOut_ = 0;
     int cancelled_ = 0;
     QString lastError_;
+
+    /** Optional embedded WebUI view; owned by main(), may stay null. */
+    WebviewHost *webview_ = nullptr;
+
+    /** Which consumer asked for `webui.token` ("embed" or "browser"). */
+    QString webuiIntent_;
 };
 
 int main(int argc, char *argv[])
 {
+#if defined(DSH_QT_HAS_WEBENGINE) && DSH_QT_HAS_WEBENGINE
+    // Must run before QGuiApplication is constructed (Qt WebEngine contract).
+    QtWebEngineQuick::initialize();
+#endif
     QGuiApplication app(argc, argv);
     QGuiApplication::setApplicationName(QStringLiteral(DSH_QT_APP_NAME));
     QGuiApplication::setApplicationVersion(QStringLiteral(DSH_QT_APP_VERSION));
@@ -1197,24 +1276,46 @@ int main(int argc, char *argv[])
     // not a rendering one. stdout carries frames, so diagnostics go to stderr.
     const bool selfTest = qEnvironmentVariableIsSet("DSH_QT_HOST_SELFTEST");
     if (selfTest) {
-        bool pingSent = false;
-        QObject::connect(&bridge, &DshQtBridge::transportStateChanged, &app, [&bridge, &pingSent]() {
+        // Each request proves one real route of the shipped bridge: the
+        // handshake (`ping`), the renderer (`markdown.parse`) and the theme
+        // service (`theme.scale`). The sequence is fixed so the e2e test can
+        // assert exact stderr lines instead of scraping timings.
+        const QStringList methods = {QStringLiteral("ping"), QStringLiteral("markdown.parse"),
+                                     QStringLiteral("theme.scale")};
+        const auto paramsFor = [](const QString &method) {
+            if (method == QLatin1String("markdown.parse"))
+                return QVariantMap{{QStringLiteral("text"), QStringLiteral("# hi")}};
+            if (method == QLatin1String("theme.scale"))
+                return QVariantMap{{QStringLiteral("scale"), 1.25}};
+            return QVariantMap{};
+        };
+        auto next = std::make_shared<int>(0);
+        bool started = false;
+        QObject::connect(&bridge, &DshQtBridge::transportStateChanged, &app, [&bridge, &started, methods, next, paramsFor]() {
             const QString state = bridge.transportState();
             std::fprintf(stderr, "[selftest] state=%s\n", qUtf8Printable(state));
-            if (state == QLatin1String("connected") && !pingSent) {
-                pingSent = true;
-                bridge.request(QStringLiteral("ping"));
+            if (state == QLatin1String("connected") && !started) {
+                started = true;
+                bridge.request(methods.at(*next), paramsFor(methods.at(*next)));
             }
         });
         QObject::connect(
             &bridge, &DshQtBridge::requestReplied, &app,
-            [](const QString &, const QString &method, bool ok, const QVariant &result, const QString &error) {
-                if (method != QLatin1String("ping"))
+            [&bridge, methods, next, paramsFor](const QString &, const QString &method, bool ok, const QVariant &result,
+                                     const QString &error) {
+                std::fprintf(stderr, "[selftest] %s=%s error=%s\n", qUtf8Printable(method),
+                             ok ? "ok" : "failed", qUtf8Printable(error));
+                if (method == QLatin1String("ping")) {
+                    const QVariantMap map = result.toMap();
+                    std::fprintf(stderr, "[selftest] pong=%d\n",
+                                 map.value(QStringLiteral("pong")).toBool() ? 1 : 0);
+                }
+                ++*next;
+                if (*next >= methods.size()) {
+                    QTimer::singleShot(0, qApp, &QCoreApplication::quit);
                     return;
-                const QVariantMap map = result.toMap();
-                std::fprintf(stderr, "[selftest] ping=%s pong=%d error=%s\n", ok ? "ok" : "failed",
-                             map.value(QStringLiteral("pong")).toBool() ? 1 : 0, qUtf8Printable(error));
-                QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+                }
+                bridge.request(methods.at(*next), paramsFor(methods.at(*next)));
             });
         // Hard stop: a handshake that never completes must not hang the suite.
         QTimer::singleShot(10000, qApp, []() { QCoreApplication::exit(3); });
@@ -1225,12 +1326,16 @@ int main(int argc, char *argv[])
     if (selfTest)
         return app.exec();
 
+    WebviewHost webview;
+    bridge.setWebviewHost(&webview);
+
     QQmlApplicationEngine engine;
 
     // One namespace, two roles: the constant build metadata that AboutSettings
     // already reads (`dshQt.appName`), and the request API the chat views use.
     engine.rootContext()->setContextProperty(QStringLiteral("dshQt"), &bridge);
     engine.rootContext()->setContextProperty(QStringLiteral("ctx"), &bridge);
+    engine.rootContext()->setContextProperty(QStringLiteral("webviewHost"), &webview);
 
     QObject::connect(
         &engine, &QQmlApplicationEngine::objectCreationFailed, &app,

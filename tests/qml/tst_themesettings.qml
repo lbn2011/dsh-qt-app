@@ -289,12 +289,13 @@ TestCase {
         const panel = settingsPanelComponent.createObject(testCase, {})
         verify(panel !== null, "SettingsPanel could not be created")
 
-        // Phase 2j turned the stacked sections into tabs and added About.
-        compare(panel.sections.length, 4)
+        // Phase 2j turned the stacked sections into tabs; Phase 3 added Models.
+        compare(panel.sections.length, 5)
         compare(panel.sections[0], "theme")
         compare(panel.sections[1], "language")
-        compare(panel.sections[2], "plugins")
-        compare(panel.sections[3], "about")
+        compare(panel.sections[2], "models")
+        compare(panel.sections[3], "plugins")
+        compare(panel.sections[4], "about")
 
         verify(findChild(panel, "settingsSectionTheme") !== null, "Theme section is present")
         verify(findChild(panel, "settingsSectionLanguage") !== null, "Language section is present")

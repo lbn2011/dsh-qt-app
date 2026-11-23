@@ -99,13 +99,13 @@ TestCase {
     function test_builtinTabsAreListedInOrder() {
         createPanel()
 
-        compare(panel.sections.join(","), "theme,language,plugins,about")
-        compare(panel.tabs.length, 4)
+        compare(panel.sections.join(","), "theme,language,models,plugins,about")
+        compare(panel.tabs.length, 5)
         compare(panel.tabs[0].kind, "builtin")
 
         // One button per tab, and the model and the bar cannot drift apart
         // because both are driven by `tabs`.
-        for (var index = 0; index < 4; ++index)
+        for (var index = 0; index < 5; ++index)
             verify(findChild(panel, "settingsTab" + index) !== null, "tab button " + index + " exists")
     }
 
@@ -125,11 +125,11 @@ TestCase {
 
         verify(panel.selectTab("about"), "about is a known tab")
         compare(panel.currentTab, "about")
-        compare(panel.currentTabIndex, 3)
+        compare(panel.currentTabIndex, 4)
 
         verify(panel.selectTab("plugins"))
         compare(panel.currentTab, "plugins")
-        compare(panel.currentTabIndex, 2)
+        compare(panel.currentTabIndex, 3)
 
         const pluginsPage = findChild(panel, "settingsPagePlugins")
         verify(pluginsPage !== null, "plugins page exists")
@@ -203,16 +203,16 @@ TestCase {
                 }]
         })
 
-        compare(panel.tabs.length, 5)
-        compare(panel.sections.join(","), "theme,language,plugins,about,plugin-acme-settings")
+        compare(panel.tabs.length, 6)
+        compare(panel.sections.join(","), "theme,language,models,plugins,about,plugin-acme-settings")
 
-        const slotTab = panel.tabs[4]
+        const slotTab = panel.tabs[5]
         compare(slotTab.kind, "slot")
         compare(slotTab.title, "Acme")
 
         // A plugin tab is reachable like any other.
         verify(panel.selectTab(slotTab.id))
-        compare(panel.currentTabIndex, 4)
+        compare(panel.currentTabIndex, 5)
 
         // And it really rendered: SlotHost instantiated the contributed item and
         // handed it the theme from the slot context.
@@ -238,7 +238,7 @@ TestCase {
                 }]
         })
 
-        compare(panel.sections.join(","), "theme,language,plugins,about,acme")
+        compare(panel.sections.join(","), "theme,language,models,plugins,about,acme")
         // No component and no url: the host must say so instead of rendering
         // nothing at all.
         panel.selectTab("acme")
@@ -259,7 +259,7 @@ TestCase {
         })
 
         // Forms never create tabs of their own.
-        compare(panel.tabs.length, 4)
+        compare(panel.tabs.length, 5)
         compare(panel.formCountFor("plugins"), 1)
         compare(panel.formCountFor("theme"), 0)
 
