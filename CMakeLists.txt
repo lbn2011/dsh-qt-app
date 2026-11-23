@@ -112,7 +112,19 @@ endif()
 # from a local CMake build with `cmake --build build --target qml-tests`.
 # QT_QPA_PLATFORM=offscreen is forced because CI has no display server.
 # ---------------------------------------------------------------------------
-find_program(QMLTESTRUNNER_EXECUTABLE NAMES qmltestrunner HINTS "${QT6_INSTALL_PREFIX}/bin")
+# Debian/Ubuntu install the Qt host tools under QT_HOST_BINS
+# (/usr/lib/qt6/bin), which is not on PATH and differs from QT6_INSTALL_PREFIX
+# (/usr). Ask qmake when it is available so a plain configure finds the runner.
+find_program(QT_QMAKE6_EXECUTABLE NAMES qmake6 qmake HINTS "${QT6_INSTALL_PREFIX}/bin")
+if(QT_QMAKE6_EXECUTABLE)
+  execute_process(
+    COMMAND "${QT_QMAKE6_EXECUTABLE}" -query QT_HOST_BINS
+    OUTPUT_VARIABLE DSH_QT_HOST_BINS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+endif()
+find_program(QMLTESTRUNNER_EXECUTABLE NAMES qmltestrunner
+  HINTS "${DSH_QT_HOST_BINS}" "${QT6_INSTALL_PREFIX}/bin" "${QT6_INSTALL_PREFIX}/lib/qt6/bin")
 if(QMLTESTRUNNER_EXECUTABLE)
   add_custom_target(qml-tests
     COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen

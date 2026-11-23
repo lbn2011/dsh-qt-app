@@ -24,7 +24,7 @@ const fakeBridge: NapiBridge = {
 
 function mount(options: QtPluginConfig = {}): Context {
   const ctx = new Context()
-  apply(ctx, { autoStartEventLoop: false, bridge: fakeBridge, ...options })
+  apply(ctx, { autoStartEventLoop: false, autoLaunch: false, bridge: fakeBridge, ...options })
   return ctx
 }
 
@@ -55,7 +55,7 @@ test('apply() registers ctx.qtRenderer and declares the native surfaces', () => 
 
 test('apply() starts the event loop through ctx.effect when enabled', async () => {
   const ctx = new Context()
-  await ctx.plugin(plugin, { bridge: fakeBridge })
+  await ctx.plugin(plugin, { bridge: fakeBridge, autoLaunch: false })
   assert.equal(ctx.qtRenderer.eventLoop.running, true)
 
   const stats = ctx.qtRenderer.stats
