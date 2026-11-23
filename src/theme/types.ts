@@ -255,11 +255,17 @@ export type ThemeTokenKind = 'color' | 'int' | 'string' | 'shadow'
  * QML token name -> schema path.
  *
  * This is the parity contract with `qml/components/Theme.qml`: the file must
- * declare exactly these 27 properties (13 colour, 13 int, 1 string) and nothing
- * else. `tests/theme.test.ts` parses the QML file and compares both directions,
- * so adding a token on either side without the other fails the build.
+ * declare exactly these properties and nothing else. `tests/theme.test.ts`
+ * parses the QML file and compares both directions, so adding a token on
+ * either side without the other fails the build.
+ *
+ * Phase 1 shipped 27 properties (13 colour, 13 int, 1 string).
+ * Phase 2g added `appearance` (28 total): a derived string property that
+ * resolves `themeId` to the actual scheme in use ("dark" | "light").
  */
 export const QML_TOKEN_MAP = {
+  // ---- Derived (1 string) -------------------------------------------------
+  appearance: '__derived:appearance',
   // ---- Surfaces (5 colours) ----------------------------------------------
   background: 'palette.background',
   surface: 'palette.surface',
@@ -303,6 +309,7 @@ export const QML_TOKEN_NAMES = Object.keys(QML_TOKEN_MAP) as QmlTokenName[]
 
 /** QML property type of each token, used by the parity test. */
 export const QML_TOKEN_KINDS: Readonly<Record<QmlTokenName, 'color' | 'int' | 'string'>> = {
+  appearance: 'string',
   background: 'color',
   surface: 'color',
   surfaceAlt: 'color',

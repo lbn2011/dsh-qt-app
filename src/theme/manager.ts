@@ -170,7 +170,14 @@ export function scaleTheme(base: ThemeDefinition, fontScale: number): ThemeDefin
 export function themeToQmlTokens(theme: ThemeDefinition): Record<QmlTokenName, string | number> {
   const tokens = {} as Record<QmlTokenName, string | number>
   for (const name of QML_TOKEN_NAMES) {
-    const value = readThemePath(theme, QML_TOKEN_MAP[name])
+    const path = QML_TOKEN_MAP[name]
+    // Derived properties like appearance are computed from the theme id,
+    // not read from the schema.
+    if (path === '__derived:appearance') {
+      tokens[name] = theme.id === 'light' ? 'light' : 'dark'
+      continue
+    }
+    const value = readThemePath(theme, path)
     if (typeof value !== 'string' && typeof value !== 'number') {
       throw new TypeError(`theme token ${name} resolves to ${typeof value}, expected string or number`)
     }

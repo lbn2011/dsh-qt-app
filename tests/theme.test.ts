@@ -20,7 +20,7 @@
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { after } from 'node:test'
 import { test } from 'node:test'
 
@@ -154,7 +154,9 @@ test('dark keeps every Phase 1 token value (screenshots stay valid)', () => {
   }
 
   const tokens = themeToQmlTokens(DARK_THEME)
-  assert.deepEqual(tokens, expected)
+  // Phase 2g added appearance (derived from themeId); exclude it from the Phase 1 snapshot.
+  const { appearance, ...phase1Tokens } = tokens
+  assert.deepEqual(phase1Tokens, expected)
 })
 
 test('light differs from dark on every surface and text colour', () => {
@@ -195,7 +197,7 @@ test('Theme.qml declares exactly the tokens the schema maps', () => {
     (match) => ({ kind: match[1] as 'color' | 'int' | 'string', name: match[2] as string }),
   )
 
-  assert.equal(declared.length, 27, 'Phase 1 shipped 27 tokens; the parity map must not shrink or grow')
+  assert.equal(declared.length, 28, 'Phase 1 shipped 27 tokens; Phase 2g added appearance (28 total)')
   assert.equal(new Set(declared.map((token) => token.name)).size, declared.length, 'duplicate token name in Theme.qml')
 
   // QML -> schema
@@ -219,14 +221,18 @@ test('Theme.qml declares exactly the tokens the schema maps', () => {
     )
   }
 
-  assert.equal(QML_TOKEN_NAMES.length, 27)
+  assert.equal(QML_TOKEN_NAMES.length, 28, 'Phase 1 shipped 27, Phase 2g added appearance (28 total)')
   assert.equal(PALETTE_TOKENS.length, 16, '13 Phase 1 colours + codeBackground, codeBorder, linkColor')
 })
 
 test('every mapped token resolves in both built-ins with the declared kind', () => {
   for (const theme of BUILTIN_THEMES) {
     for (const name of QML_TOKEN_NAMES) {
-      const value = readThemePath(theme, QML_TOKEN_MAP[name])
+      const path = QML_TOKEN_MAP[name]
+      // Derived properties like appearance are computed from the theme id,
+      // not read from the schema.
+      if (path.startsWith('__derived:')) continue
+      const value = readThemePath(theme, path)
       const kind = QML_TOKEN_KINDS[name]
       if (kind === 'color') {
         assert.equal(typeof value, 'string', `${theme.id}.${name} must be a colour`)
@@ -733,9 +739,21 @@ test('migratePersistedTheme is pure and reports what it did', () => {
 
 test('resolveConfigDir honours DSH_QT_CONFIG_DIR and falls back to the platform default', () => {
   assert.equal(resolveConfigDir({ DSH_QT_CONFIG_DIR: '/tmp/custom' }), '/tmp/custom')
-  const fallback = resolveConfigDir({})
-  assert.ok(fallback.endsWith('dsh-qt'))
-  assert.equal(resolveConfigDir({ XDG_CONFIG_HOME: '/tmp/xdg' }).startsWith('/tmp/xdg'), true)
+
+  // The tail is compared as a path segment rather than with `endsWith`: a Windows
+  // path is all backslashes, so a substring test would only pass by accident.
+  assert.equal(basename(resolveConfigDir({})), 'dsh-qt')
+
+  // XDG is a freedesktop convention; Windows deliberately ignores it and uses
+  // %APPDATA% instead (see resolveConfigDir), so each platform pins its own branch
+  // instead of asserting the POSIX layout everywhere.
+  if (process.platform === 'win32') {
+    const appData = 'C:\\Users\\example\\AppData\\Roaming'
+    assert.equal(resolveConfigDir({ APPDATA: appData }), join(appData, 'dsh-qt'))
+    assert.equal(basename(resolveConfigDir({ APPDATA: appData })), 'dsh-qt')
+  } else {
+    assert.equal(resolveConfigDir({ XDG_CONFIG_HOME: '/tmp/xdg' }), join('/tmp/xdg', 'dsh-qt'))
+  }
 })
 
 test('backupCorruptThemeFile returns null when there is nothing to move', () => {
