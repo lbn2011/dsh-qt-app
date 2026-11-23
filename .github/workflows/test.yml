@@ -321,10 +321,19 @@ jobs:
       # (via pipefail above) and the executed-suite count are checked here.
       - name: Assert every suite ran
         run: |
-          # qmltestrunner prints QtTest's banner, which is NINE asterisks:
-          #   ********* Start testing of ChatView *********
-          # so the pattern must be '^\*+ Start testing of ', not '^\*\*\* '.
-          executed=$(grep -cE '^\*+ Start testing of ' qmltest.log || true)
+          # One runner banner covers all suites. Count completed named suites,
+          # not banners; require both lifecycle markers for every source suite.
+          python3 - <<'PY'
+          import pathlib, re
+          log = pathlib.Path('qmltest.log').read_text()
+          for suite in pathlib.Path('tests/qml').glob('tst_*.qml'):
+              name = re.search(r'\bname:\s*"([^"]+)"', suite.read_text())
+              assert name, f'{suite}: missing TestCase name'
+              for phase in ('initTestCase', 'cleanupTestCase'):
+                  marker = f'qmltestrunner::{name[1]}::{phase}()'
+                  assert any(line.startswith('PASS ') and marker in line for line in log.splitlines()), marker
+          PY
+          executed=$(grep -cE '^PASS .*::cleanupTestCase\(\)' qmltest.log || true)
           expected="${{ steps.expected.outputs.count }}"
           echo "executed=$executed expected=$expected"
           if [ "$executed" -lt "$expected" ]; then

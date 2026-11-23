@@ -120,7 +120,9 @@ Item {
      * Unknown, and a bare `qml` invocation may not have the singleton at all.
      */
     function systemScheme() {
-        // qmllint disable unqualified
+        // Qt exposes styleHints as QObject in its tooling metadata; the
+        // runtime colorScheme property is guarded below (available since 6.5).
+        // qmllint disable unqualified missing-property
         const hints = Qt.styleHints
         if (hints !== undefined && hints.colorScheme !== undefined) {
             const reported = hints.colorScheme
@@ -129,7 +131,7 @@ Item {
             if (reported === 2) // Qt.ColorScheme.Dark
                 return "dark"
         }
-        // qmllint enable unqualified
+        // qmllint enable unqualified missing-property
         return "dark"
     }
 
