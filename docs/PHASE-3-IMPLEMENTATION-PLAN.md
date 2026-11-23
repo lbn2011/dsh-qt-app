@@ -159,12 +159,12 @@ Phase 2 已验证可用的部分：`apply` → `QtRendererService` 注册（`src
 | repo | 路径 | 角色 | SHA |
 |---|---|---|---|
 | app | `/data/qt-phase3/app/base` | 独立基仓（`dev/phase-1`） | 33e516c32856878c37f92ddbbada81f9e437f3ba（tree `ce2c7db…` 复核一致） |
-| app | `/data/qt-phase3/app/wt/integration` | 集成分支 worktree（`phase3/integration`） | 33e516c（本文件首个提交后前进） |
+| app | `/data/qt-phase3/app/wt/integration` | 集成分支 worktree（`phase3/integration`） | c2907d3（本文件与 5 份 Phase-3 文档的落盘提交；基线 33e516c） |
 | addon | `/data/qt-phase3/addon/base` | 独立 addon 基仓（`main`） | 87084a6901297a4fe9af997d4b8cdf9d829b0f67 |
 
-待创建（I0 执行，逐条核验“路径不存在或为空、分支名不冲突、脏树检查、磁盘 ≥5G”）：
+**I0 已完成（2026-11-23T18:46Z，台账 `/data/qt-phase3/logs/I0-baseline.txt`）**：创建前逐条核验目标路径不存在、分支名不冲突、base clone 干净、磁盘可用 5.9G；创建后 6 棵 worktree 的 HEAD 均等于基线 SHA，`git status --porcelain` 全为空。使用 `git -C <base> worktree add` 而非 `create_worktree` 工具，理由：该工具一次只操作当前仓并把会话 cwd 切到新树，无法在同一轮内为两个仓建 6 棵并保持固定路径；效果等价（同一 `git worktree add`），路径与 SHA 已逐条记录。
 
-| 成员 | repo | worktree（拟） | 分支（拟） | base SHA | 交付 SHA |
+| 成员 | repo | worktree（实际） | 分支 | HEAD / base SHA | 交付 SHA |
 |---|---|---|---|---|---|
 | host-architect-qiu | app | `/data/qt-phase3/app/wt/qiu-host` | `phase3/host-qiu` | 33e516c | 待填 |
 | host-architect-qiu | addon | `/data/qt-phase3/addon/wt/qiu-host` | `phase3/host-qiu` | 87084a6 | 待填 |
@@ -178,6 +178,7 @@ Phase 2 已验证可用的部分：`apply` → `QtRendererService` 注册（`src
 ## 5. 任务分解
 
 > 任务编号 I0–I9；每项交付物必须独立可测。`RQ-*` 映射到 §9 验收矩阵。
+> **版本继承：** 除任务内另行注明外，每项任务一律继承 §0 版本锁（宿主 0.2.2-rc.1、protocol v1、app 基线 33e516c、addon 87084a6、cordis 4.1.0）。I1a 之后所有任务只能 `import type` `src/bridge/protocol.ts`，不得各自定义信封。
 
 ### I0：工作树与基线落地（owner：host-architect-qiu）
 
