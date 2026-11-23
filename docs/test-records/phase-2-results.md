@@ -124,6 +124,36 @@ No real Qt executable was generated. The earlier installation exited 120 with
 no retained exception detail. Neither attempt is Qt validation. The repaired
 revision still requires real Qt QML/lint and Windows CI execution.
 
-## 9. Gate verdict
+## Final repair verification (2026-11-24)
+
+The earlier unmet items above are historical. Final tested app code revision:
+`928a69d90338ab7ba63e4f0c467dcddab5fe96e6`. Actual addon checkout in the
+Windows job: `87084a6901297a4fe9af997d4b8cdf9d829b0f67`.
+
+- [Test run 45217678952](https://github.com/lbn2011/dsh-qt-app/actions/runs/45217678952): Ubuntu/Windows TypeScript, packaging and addon jobs all succeeded; addon integration succeeded.
+- [Build run 45217678796](https://github.com/lbn2011/dsh-qt-app/actions/runs/45217678796): Ubuntu/Windows addon and Qt build jobs all succeeded, including Package and bundled-addon checks.
+- [QML job 137843136170](https://github.com/lbn2011/dsh-qt-app/actions/runs/45217678952/job/137843136170): QtTest 6.7.3 / Qt 6.7.3 on Ubuntu 22.04; raw result `Totals: 168 passed, 0 failed, 0 skipped, 0 blacklisted, 540ms`; `executed=14 expected=14`.
+- [Lint job 137843137506](https://github.com/lbn2011/dsh-qt-app/actions/runs/45217678952/job/137843137506): succeeded with lint gate enabled.
+- [Windows addon job 137843135583](https://github.com/lbn2011/dsh-qt-app/actions/runs/45217678952/job/137843135583): actual checkout SHA above; `# tests 70`, `# pass 70`, `# fail 0`, `# skipped 0`.
+- [Ubuntu Qt build 137844200265](https://github.com/lbn2011/dsh-qt-app/actions/runs/45217678796/job/137844200265) and [Windows Qt build 137844199794](https://github.com/lbn2011/dsh-qt-app/actions/runs/45217678796/job/137844199794): succeeded.
+
+Both workflow conclusions remain `cancelled` solely because the macOS jobs were
+cancelled. macOS is an accepted outstanding gap, not a passed platform.
+Local Qt was not run; the real Qt evidence above comes from CI.
+
+The QML suite gate now checks each source TestCase's named init/cleanup PASS
+markers instead of counting the single runner banner. The runner exit status
+is retained via pipefail, failed Totals fail the job, and missing Totals fail.
+Offline negative checks against the actual previous log rejected an empty log
+and a log missing one complete suite; the full log passed all 14 suites.
+Every source file must yield a TestCase name, so failed name extraction fails.
+The sole remaining Qt.styleHints metadata warning is suppressed locally around
+its guarded dynamic access; other lint checks remain enabled.
+
+This final evidence update changes documentation only after the tested code
+revision above. Implementation repair is ready for independent review; the
+historical review verdict below is not self-overridden by the implementer.
+
+## 9. Historical gate verdict
 
 Verdict: **needs_revision** — all t10–t22 code deliverables are present, coherent and locally green (319/319 tests, typecheck, build clean), but the Phase 2 acceptance criterion "CI passed on Linux/Windows" is not met at head 46a9406 due to F1 (C++ compile error), F2 (test.yml ordering) and F3 (Windows node-gyp spawn). After those fixes and a green CI run, the gate can pass on re-review; D1–D3 and risk dispositions are recorded above.
