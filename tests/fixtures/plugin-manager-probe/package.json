@@ -1,0 +1,8 @@
+{
+  "name": "@dsh-fixture/plugin-manager-probe",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Isolated-profile probe: lists and toggles a local fixture plugin through the real ctx.pluginManager."
+}

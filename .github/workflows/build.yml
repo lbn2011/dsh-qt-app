@@ -161,7 +161,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build TypeScript
-        run: pnpm build
+        run: node scripts/gate.mjs -- pnpm build
 
       - name: Install Linux Qt dependencies
         if: runner.os == 'Linux'
@@ -196,13 +196,13 @@ jobs:
         run: echo "DSH_QT_NAPI_DIR=${GITHUB_WORKSPACE}/dsh-qt-napi" >> "$GITHUB_ENV"
 
       - name: Configure (CMake)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: node scripts/gate.mjs -- cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: node scripts/gate.mjs -- cmake --build build --config Release --parallel
 
       - name: Package
-        run: pnpm package
+        run: node scripts/gate.mjs -- pnpm package
 
       - name: Assert packaging bundled the addon
         shell: bash

@@ -68,6 +68,15 @@ export interface QtSlotContribution {
   icon?: string
   /** Render callback; opaque to the Cordis layer. */
   render?: (props: Record<string, unknown>) => unknown
+  /**
+   * Action handler for gestures raised by the rendered tree (`click`, `change`,
+   * `submit`). Mirrored into the slot registry so `ui.action` can reach it.
+   */
+  action?: (
+    event: string,
+    payload: unknown,
+    props: Record<string, unknown>,
+  ) => Record<string, unknown> | void
 }
 
 /** A QML view registered with the Qt host. */

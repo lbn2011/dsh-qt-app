@@ -136,6 +136,41 @@ ColumnLayout {
     }
 
     Label {
+        objectName: "settingsPluginsSlotsHint"
+        visible: root.pluginsBridge !== null
+        text: qsTr("Slots with a render function are drawn as native Qt controls; the rest keep their component, URL or text fallback.")
+        color: root.theme.textMuted
+        font.pixelSize: root.theme.fontSmall
+        wrapMode: Text.Wrap
+        Layout.fillWidth: true
+    }
+
+    Repeater {
+        objectName: "settingsPluginsSlotRows"
+        model: root.pluginsBridge === null ? [] : root.pluginsBridge.slots
+
+        delegate: ColumnLayout {
+            id: slotRow
+
+            required property var modelData
+            Layout.fillWidth: true
+            spacing: root.theme.spacing
+
+            GeneratedSlot {
+                objectName: "settingsGeneratedSlot_" + (slotRow.modelData.id || "")
+                // Component- and URL-only slots are handled by their own views.
+                visible: slotRow.modelData.hasRender === true
+                Layout.fillWidth: true
+                pluginsBridge: root.pluginsBridge
+                slotId: slotRow.modelData.id || ""
+                slotTitle: slotRow.modelData.title || slotRow.modelData.label || ""
+                surface: slotRow.modelData.surface || ""
+                theme: root.theme
+            }
+        }
+    }
+
+    Label {
         objectName: "settingsPluginsEmpty"
         visible: root.pluginsBridge !== null && root.pluginsBridge.rows.length === 0 && !root.bridgeBusy
         text: qsTr("No plugins installed in this profile.")

@@ -1,15 +1,17 @@
-# Phase 3 实施现状（t26 集成候选）
+# Phase 3 实施现状（t32 修复轮候选，待 t33 独立复验）
 
 本文描述**当前代码实际接通的链路**与已跑过的验证。设计意图见
 `docs/PHASE-3-IMPLEMENTATION-PLAN.md` 与 `docs/PHASE-3-*.md`；两者冲突时以
-本文与源码为准，未实现的能力在这里明确标为缺口。
+本文与源码为准，未实现的能力在这里明确标为缺口。t26 的候选声明（上一版）
+在 t27 审查中被指出**过早**（token 泄漏、WebUI/槽位/真实 profile 未验收），
+本文只保留被实测覆盖的结论，失败史见 `docs/test-records/t32-repair-round-2.md`。
 
 ## 1. 运行时拓扑（无失实版本）
 
 ```
 DSH profile (Node)
 └── dsh-qt-app 插件 (Cordis)
-    ├── QtRendererService      渲染服务 / 旧 11 个 QML 方法
+    ├── QtRendererService      渲染服务 / 旧 11 个 QML 方法 / 槽位渲染函数镜像
     ├── HostBridgeService      协议 v1 宿主端（spawn + stdio NDJSON）
     │   └── child: dsh-qt-app (Qt 6 GUI, 唯一 UI 进程)
     ├── Settings/Llm/Credentials RPC   → 官方 ctx.settings/ctx.llm/ctx.credentials
@@ -21,61 +23,77 @@ DSH profile (Node)
 - **只有一个 UI 进程**：Node 宿主持有并 spawn Qt 子进程（`src/host/launcher.ts`），
   子进程只读写自己的 stdin/stdout；Qt 侧不 spawn 任何进程、不监听端口（`native/main.cpp`）。
 - **握手前不显示已连接**：`HostBridgeService` 在收到 Qt `hello` 并回 `hello.ack`
-  之前保持 `connecting`，`host.state` 只有握手完成后才是 `connected`
-  （`src/host/bridge-service.ts`；e2e 断言 `[selftest] state=connecting` 先于 `connected`）。
+  之前保持 `connecting`（`src/host/bridge-service.ts`；`tests/host-e2e.e2e.ts` 断言
+  `state=connecting` 先于 `connected`）。
 - **默认无 Web 监听**：`WebuiService` 构造只注册状态机，不启动 backend；
-  `tests/webui-default-off.test.ts` 断言 Idle、无端口、无子进程、无状态事件。
-  只有显式 `webui.open` 才走同进程 `WebServer{127.0.0.1, port:0}` 或
-  `dsh web --port 0 --no-open` 第二进程退路（`docs/PHASE-3-WEB-FALLBACK.md`）。
-- WebUI token 只进入 C++ 专有消费者（`DshQtBridge` 的 `webui.token` 回复；
-  embed=WebEngine `loadAuthenticated`，否则 `QDesktopServices::openUrl`），
-  QML 只见 `maskedUrl`；日志与帧中不出现 token。
+  `tests/webui-default-off.test.ts` 断言 Idle、无端口、无子进程、无状态事件；真实
+  profile 探针（`tests/official-profile.e2e.ts`）在运行期间采样 `/proc`，未出现监听端口。
+- **WebUI token 只经一次原生消费**：`webui.token` 回复在 `DshQtBridge::complete_`
+  内转交 `resolveWebuiToken_`（`native/main.cpp`），按**请求 id** 绑定 embed/browser
+  意图；embed 且 WebEngine 可用时 `loadAuthenticated`，否则（非自测）用
+  `QDesktopServices::openUrl`；随后 URL 内存清零，QML 只收到
+  `webuiTokenResolved(id,intent,outcome,maskedUrl,error)`，`maskedUrl` 中 token 为 `***`。
+  该回复**绝不**再走通用 `requestReplied`。关闭或超时后迟到的回复按 `cancelled` 丢弃。
 
 ## 2. 已从实际应用访问的面
 
 | 面 | QML 入口 | Node 侧 | 证据 |
 | --- | --- | --- | --- |
-| 工具可视化 | `ChatView` → `ToolCallModel`/`ToolCallRow`（五态、折叠、复制） | `src/tools/projection.ts` + `attachToolProjection`（`src/index.ts`） | `tests/qml/tst_toolcallmodel.qml`；QML 全套 215 通过 |
+| 工具可视化 | `ChatView` → `ToolCallModel`/`ToolCallRow`（五态、折叠、复制） | `src/tools/projection.ts` + `attachToolProjection`（`src/index.ts`） | `tests/qml/tst_toolcallmodel.qml`；真实 profile 的 `tool.row` running→ok（`tests/official-profile.e2e.ts`） |
 | 设置/模型 | `SettingsPanel` → `ModelsForm`、`SettingsBridge` | `registerSettingsMethods` / `registerLlmMethods` | `tests/qml/tst_settingsbridge.qml`；`tests/integration-wiring.test.ts` |
 | 凭据 | `ApiKeyField`（新增/替换/删除，永不回显） | `registerCredentialMethods` → 官方 `ctx.credentials` | 同上（帧 JSON 断言不含 sentinel secret） |
-| 插件管理 | `SettingsPanel` → `PluginsSettings`（列/启停/刷新） | `createPluginService(...).attach()` → 官方 `ctx.pluginManager` | `tests/qml/tst_i4plugins.qml`；wiring 的 `plugin.list` |
-| WebUI 回退 | `WebFallbackPanel`（状态/重试/嵌入/外部打开） | `WebuiService` + `attachWebuiToHost` | `tests/webui-service.test.ts`、`tests/webui-default-off.test.ts`；`requestWebui` 走 `qtBridge.request('webui.open')` |
-| 旧 Phase 2 方法 | `MarkdownText`/`CodeBlock`/`MessageInput`/`Theme` | `registerLegacyMethods`（11 个 v1 方法） | `tests/qml-bridge.test.ts`、`tests/host-e2e.e2e.ts` |
+| 插件管理 | `SettingsPanel` → `PluginsSettings`（列/启停/刷新） | `createPluginService(...).attach()` → 官方 `ctx.pluginManager` | `tests/plugin-manager-live.e2e.ts`（真实 profile 列表/停用/启用 + ChangeResult） |
+| 槽位渲染 | `PluginsSettings` → `GeneratedSlot` → `GeneratedView`/`GeneratedNode` | `ui.render` / `ui.action`；`mirrorRendererSlots` 把 `QtRendererService` 的 render 函数镜像进 SlotRegistry | `tests/qml/tst_generatedview.qml` 14 例；`tests/slot-bridge.test.ts`；`tests/generated-slot-live.e2e.ts`（真实 Qt：渲染→点击→Node 重渲染 Count 1） |
+| WebUI 回退 | `WebFallbackPanel`（状态/重试/嵌入/外部打开） | `WebuiService` + `attachWebuiToHost` | `tests/webui-live.e2e.ts`（真实 `WebuiService` in-process + 真实 Qt，open→Ready→token→close，端口消失）；`tests/webui-external.e2e.ts`（官方 `dsh web` 303+cookie 栅栏、无/伪造凭据 401） |
+| 旧 Phase 2 方法 | `MarkdownText`/`CodeBlock`/`MessageInput`/`Theme` | `registerLegacyMethods`（11 个 v1 方法） | `tests/host-e2e.e2e.ts`（ping/markdown.parse/theme.scale 真实往返） |
 
 `qml/main.qml` 的 `Connections` 只监听 `eventReceived`：
 `tool.row`/`tool.snapshot`/`webui.state`/`slot.changed`；未知信号
 （`ignoreUnknownSignals: true`）不会让 QML 崩。
 
-## 3. 验证证据（本机 t26 实测，Linux）
+## 3. 验证证据（t32 本机实测，Linux，串行预算）
 
-所有命令在共享预算下串行执行（`flock` + `systemd-run CPUQuota=200% MemoryMax=4G`），
-退出码原样记录：
+所有命令经 `flock /data/qt-phase3/logs/verify.lock` + `systemd-run CPUQuota=200% MemoryMax=4G`
+串行执行，退出码原样记录：
 
 | 命令 | 退出码 | 摘要 | 日志 |
 | --- | --- | --- | --- |
-| `pnpm typecheck` | 0 | src + tests 无错 | `logs/t26-typecheck-final.log` |
-| `pnpm test` | 0 | **473/473 pass**（含新增 `tests/integration-wiring.test.ts` 5 例） | `logs/t26-test-final.log` |
-| `pnpm build` | 0 | `tsc -p tsconfig.json` → lib/ | `logs/t26-build-final.log` |
-| `cmake -S . -B build -DDSH_QT_WEBENGINE=OFF` | 0 | WebEngine 关闭仍可配置 | `logs/t26-cmake-configure.log` |
-| `cmake --build build` | 0 | 含 `native/webview_host.cc` | `logs/t26-cmake-build.log` |
-| `cmake --build build --target qml-tests` | 0 | **215 passed / 0 failed** | `logs/t26-qml-final.log` |
-| `pnpm exec tsx --test tests/host-e2e.e2e.ts` | 0 | **2/2**：真实 `build/dsh-qt-app` 子进程走 ping→`markdown.parse`→`theme.scale` 三条真实路由并干净退出；无宿主时 QML 入口（工具/设置/插件/WebUI 面板）在 offscreen 下加载无错、传输保持 connecting | `logs/t26-e2e3.log` |
+| `pnpm typecheck` | 0 | src + tests 无错 | `logs/t32-typecheck.log` |
+| `pnpm test` | 0 | **482/482 pass**（含 gate 3、packaging 3、integration-wiring 5） | `logs/t32-test.log` |
+| `pnpm build` | 0 | `tsc -p tsconfig.json` | `logs/t32-build.log` |
+| `cmake -S . -B build -DDSH_QT_WEBENGINE=OFF` | 0 | WebEngine 关闭 | `logs/t32-cmake-configure.log` |
+| `cmake --build build` | 0 | 含 `webview_host.cc`、C++ token 分派 | `logs/t32-build2.log`、`t32-build3.log` |
+| `cmake --build build --target qml-tests` | 0 | QML 套件（含 `tst_generatedview.qml`） | `logs/t32-qml-final.log` |
+| `tsx --test tests/host-e2e.e2e.ts` | 0 | 7/7：握手、三方法、shipped QML、token 生命周期（成功/错误/超时/重复/关闭后迟到） | `logs/t32-e2e2.log` |
+| `tsx --test tests/webui-live.e2e.ts` | 0 | 1/1：真实 WebuiService open→Ready→token→close | `logs/t32-webui-live2.log` |
+| `tsx --test tests/official-profile.e2e.ts` | 0 | 1/1：真实 headless profile + 假模型 + 真实 Qt，会话/tool.row/无监听 | `logs/t32-official-profile.log` |
+| `tsx --test tests/generated-slot-live.e2e.ts` | 0 | 1/1：渲染→点击→Node 重渲染 | `/tmp/e2e7.log` |
+| `tsx --test tests/plugin-manager-live.e2e.ts` | 0 | 1/1：真实 ctx.pluginManager 列表/停用/启用 | `logs/t32-plugin-manager.log` |
+| `tsx --test tests/webui-external.e2e.ts` | 0 | 1/1：官方 `dsh web` 栅栏负例与端口释放 | `logs/t32-webui-external2.log` |
 
-CI 侧的确定性锁：`.github/workflows/{build,test}.yml` 用 `NAPI_SHA` checkout
-addon，并各有一条断言步（`git rev-parse HEAD` 与 `package.json` 的
-`dshQtNapi.commit` 都必须等于该 SHA）。`THIRD-PARTY-NOTICES.md` 随
-`cmake --install`/CPack 安装到包根，覆盖本项目 MIT、addon（pinned SHA）、
-其 vendored cmark-gfm 0.29.0.gfm.14（BSD-2 全文）。
+CI 锁：`.github/workflows/{build,test}.yml` 用 `NAPI_SHA` checkout addon，并断言
+`git rev-parse HEAD` 与 `package.json` 的 `dshQtNapi.commit` 等于该 SHA；
+typecheck/test/build/package/CMake configure/build 步骤经 `scripts/gate.mjs`
+运行（退出码保真，stderr 记录 `[gate] exit=…`）；`tests/gate.test.ts` 覆盖保真与缺命令负例。
+`THIRD-PARTY-NOTICES.md` 随 `cmake --install`/CPack 安装到包根（`tests/packaging.test.ts`
+在临时 prefix 实测），覆盖本项目 MIT、addon（pinned SHA）、vendored cmark-gfm
+0.29.0.gfm.14（BSD-2 全文）。
 
-## 4. 缺口（如实报告，不在本次声称完成）
+## 4. 缺口（如实报告，不在本轮声称完成）
 
-- **macOS**：CI 有 `macos-14` 构建矩阵，但无本机/CI 运行证据；WebEngine 回退与
-  原生窗口行为未在 macOS 验证。
-- **Windows**：代码与 CI job 存在，但本机未运行 Windows GUI/e2e；Windows 证据
-  依赖 CI（本轮未触发远端 CI）。
-- **Qt WebEngine**：本机构建用 `-DDSH_QT_WEBENGINE=OFF`（未安装 WebEngine），
-  因此嵌入式 WebUI 的“加载成功”路径未本机实测；无 WebEngine 时按设计降级为
-  外部浏览器打开（`QDesktopServices`），该分支已编译并在 QML 层覆盖。
-- **真实 DSH profile 会话流**：未在 CI 启动完整 profile 的真实会话；当前以
-  官方服务 fake + v1 帧（`tests/integration-wiring.test.ts`）与真实 Qt 子进程
-  （`tests/host-e2e.e2e.ts`）分层覆盖，二者不能替代真实 profile 的端到端证据。
+- **Qt WebEngine 嵌入加载未本机验证**：本机构建 `-DDSH_QT_WEBENGINE=OFF`，嵌入分支
+  只编译不运行；`tests/webui-live.e2e.ts` 在 OFF 构建下要求 `external` 降级，并**拒绝**
+  把 external 记成 embedded。真实嵌入加载需 WebEngine=1 的 Windows/Linux 机器或 CI。
+- **`external` 只证明分派到浏览器分支**：自测模式下不实际启动桌面浏览器
+  （避免副作用），因此「浏览器真的加载了页面」未在本轮证明；官方 `dsh web` 端的
+  303+cookie 与 401 栅栏由 `tests/webui-external.e2e.ts` 单独证明。
+- **真实模型/真实用户 profile 未跑**：`tests/official-profile.e2e.ts` 使用隔离
+  `DSH_HOME` + 本地确定性假模型（一次 `bash` tool_use + 一次文本），不接触真实凭据、
+  不调用付费模型；标题请求判据为 `thinking.type==='disabled' && messages.length===1`。
+- **macOS/Windows**：代码与 CI 矩阵存在，本机无运行证据；跨平台 GUI 行为需 CI 触发后补。
+- **插件槽位注册通道的边界**：render/action 函数经 `mirrorRendererSlots` 从
+  `QtRendererService.registerSlot` 镜像到 `PluginService` 的 SlotRegistry；`ui.register`
+  RPC 仍只承载可序列化元数据（函数无法过线），这一语义写入契约文档。
+- **QML 渲染子集**：`GeneratedNode` 只覆盖 converter 产出的有限 `NativeNode` 子集
+  （文本/布局/按钮/输入/选择/复选/单选/滑块/分隔/预格式），超界显示 unsupported 文案并由
+  `ConverterResult.status==='web'|'text'` 走回退；不执行任意 React hooks/DOM。

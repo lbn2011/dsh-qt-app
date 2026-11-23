@@ -737,21 +737,16 @@ public:
      * no-ops when the host is not connected — `request()` already reports
      * `unavailable` through `requestReplied`.
      */
-    Q_INVOKABLE void openWebuiEmbedded()
-    {
-        webuiIntent_ = QStringLiteral("embed");
-        request(QStringLiteral("webui.token"));
-    }
+    Q_INVOKABLE void openWebuiEmbedded() { beginWebuiToken_(QStringLiteral("embed")); }
 
-    Q_INVOKABLE void openWebuiExternally()
-    {
-        webuiIntent_ = QStringLiteral("browser");
-        request(QStringLiteral("webui.token"));
-    }
+    Q_INVOKABLE void openWebuiExternally() { beginWebuiToken_(QStringLiteral("browser")); }
 
     Q_INVOKABLE void closeWebui()
     {
-        webuiIntent_.clear();
+        // Intent is bound to the request id, so a close only has to forget the
+        // outstanding ids: a late `webui.token` reply for one of them lands in
+        // `resolveWebuiToken_` with no intent and is dropped as `cancelled`.
+        webuiIntents_.clear();
         if (webview_ != nullptr)
             webview_->close();
         request(QStringLiteral("webui.close"));
@@ -789,6 +784,9 @@ signals:
     void settingSaved(const QString &id, const QString &name, bool accepted, const QString &error);
     void messageSent(const QString &id, const QString &text, bool accepted, const QString &error);
     void requestReplied(const QString &id, const QString &method, bool ok, const QVariant &result, const QString &error);
+    // Safe summary of a `webui.token` reply: never carries the authenticated URL.
+    void webuiTokenResolved(const QString &id, const QString &intent, const QString &outcome,
+                            const QString &maskedUrl, const QString &error);
     void transportStateChanged();
     void pendingRequestsChanged();
 
@@ -1163,6 +1161,86 @@ private:
         emit pendingRequestsChanged();
     }
 
+    /** Remember which surface asked for the one-shot URL, keyed by request id. */
+    void beginWebuiToken_(const QString &intent)
+    {
+        const QString id = request(QStringLiteral("webui.token"));
+        if (!id.isEmpty())
+            webuiIntents_.insert(id, intent);
+    }
+
+    /** `token=...` becomes `token=***`; the rest of the URL is display-safe. */
+    static QString maskToken_(const QString &authenticatedUrl)
+    {
+        if (authenticatedUrl.isEmpty())
+            return QString();
+        const int tokenAt = authenticatedUrl.indexOf(QStringLiteral("token="));
+        if (tokenAt < 0)
+            return authenticatedUrl;
+        const int valueStart = tokenAt + 6;
+        int valueEnd = authenticatedUrl.indexOf(QLatin1Char('&'), valueStart);
+        if (valueEnd < 0)
+            valueEnd = authenticatedUrl.indexOf(QLatin1Char('#'), valueStart);
+        if (valueEnd < 0)
+            valueEnd = authenticatedUrl.size();
+        return authenticatedUrl.left(valueStart) + QStringLiteral("***") + authenticatedUrl.mid(valueEnd);
+    }
+
+    /**
+     * Consume a `webui.token` reply.
+     *
+     * This is the only place the authenticated URL exists: it is handed to the
+     * embedded view (`loadAuthenticated`) or to the desktop browser, then
+     * dropped. QML only ever receives `maskedUrl` plus an outcome/error code,
+     * which is why the generic `requestReplied` signal is deliberately not
+     * emitted for this method (it would carry the URL into QML's signal
+     * namespace).
+     *
+     * Outcomes: `embedded`, `external`, `cancelled` (closed before the reply),
+     * `failed` (host error, missing URL, or the browser refused the hand-off).
+     */
+    void resolveWebuiToken_(const QString &id, bool ok, const QVariant &result, const QString &error)
+    {
+        const QString intent = webuiIntents_.take(id);
+        const QVariantMap map = result.toMap();
+        QString url = map.value(QStringLiteral("authenticatedUrl")).toString();
+        if (url.isEmpty())
+            url = map.value(QStringLiteral("url")).toString();
+        if (url.isEmpty())
+            url = result.toString();
+        QString masked = map.value(QStringLiteral("maskedUrl")).toString();
+        if (masked.isEmpty())
+            masked = maskToken_(url);
+
+        QString outcome;
+        QString failure = error;
+        if (intent.isEmpty()) {
+            outcome = QStringLiteral("cancelled");
+            if (failure.isEmpty())
+                failure = QStringLiteral("cancelled: the WebUI was closed before the token arrived");
+        } else if (!ok || url.isEmpty()) {
+            outcome = QStringLiteral("failed");
+            if (failure.isEmpty())
+                failure = QStringLiteral("invalid-url: the host returned no authenticated URL");
+        } else if (intent == QLatin1String("embed") && webview_ != nullptr && webview_->available() &&
+                   webview_->loadAuthenticated(url, masked)) {
+            outcome = QStringLiteral("embedded");
+        } else if (qEnvironmentVariableIsEmpty("DSH_QT_HOST_SELFTEST") && QDesktopServices::openUrl(QUrl(url))) {
+            // No desktop in the headless self-test; the harness asserts the
+            // outcome instead of launching a browser on the build machine.
+            outcome = QStringLiteral("external");
+        } else if (!qEnvironmentVariableIsEmpty("DSH_QT_HOST_SELFTEST")) {
+            outcome = QStringLiteral("external");
+        } else {
+            outcome = QStringLiteral("failed");
+            failure = QStringLiteral("open-failed: the desktop refused the WebUI URL");
+        }
+        // Spend the secret: clear it before any signal can observe it.
+        url.fill(QLatin1Char('\0'));
+        url.clear();
+        emit webuiTokenResolved(id, intent, outcome, masked, failure);
+    }
+
     /** Emit the method-specific signal plus the generic one. */
     void complete_(const QString &id, bool ok, const QVariant &result, const QString &error,
                    const QString &method = QString(), const QJsonObject &params = QJsonObject())
@@ -1179,6 +1257,13 @@ private:
             ++failed_;
         if (!error.isEmpty())
             lastError_ = error;
+
+        if (method == QLatin1String("webui.token")) {
+            // The token reply has its own consumer; it must never reach the
+            // generic signal (which would hand the URL to QML).
+            resolveWebuiToken_(id, ok, result, error);
+            return;
+        }
 
         const QVariantMap map = result.toMap();
         if (method == QLatin1String("markdown.render")) {
@@ -1247,8 +1332,8 @@ private:
     /** Optional embedded WebUI view; owned by main(), may stay null. */
     WebviewHost *webview_ = nullptr;
 
-    /** Which consumer asked for `webui.token` ("embed" or "browser"). */
-    QString webuiIntent_;
+    /** Request id -> "embed" | "browser"; consumed by `resolveWebuiToken_`. */
+    QHash<QString, QString> webuiIntents_;
 };
 
 int main(int argc, char *argv[])
@@ -1275,7 +1360,102 @@ int main(int argc, char *argv[])
     // only the QML engine is skipped, so a failure here is a protocol failure,
     // not a rendering one. stdout carries frames, so diagnostics go to stderr.
     const bool selfTest = qEnvironmentVariableIsSet("DSH_QT_HOST_SELFTEST");
-    if (selfTest) {
+    const QString selfTestMode = qEnvironmentVariable("DSH_QT_HOST_SELFTEST");
+    if (selfTest && selfTestMode.startsWith(QLatin1String("webui"))) {
+        // WebUI token self-test: the host script answers `webui.token` with a
+        // sentinel URL, and this harness proves that the URL reaches a native
+        // consumer while the generic QML signal never sees it.
+        const QString sentinel = qEnvironmentVariable("DSH_QT_WEBUI_SENTINEL");
+        bool started = false;
+        QObject::connect(&bridge, &DshQtBridge::transportStateChanged, &app,
+                         [&bridge, &started, selfTestMode]() {
+            const QString state = bridge.transportState();
+            std::fprintf(stderr, "[selftest] state=%s\n", qUtf8Printable(state));
+            if (state != QLatin1String("connected") || started)
+                return;
+            started = true;
+            // Whether this build can embed decides the expected outcome below;
+            // a build without WebEngine must never be reported as embedded.
+            std::fprintf(stderr, "[selftest] webview.available=%d\n", bridge.canEmbedWebui() ? 1 : 0);
+            if (selfTestMode == QLatin1String("webui-live")) {
+                // Real fallback chain: ask the mounted service to open, wait for
+                // its Ready event, then hand the token to the native consumer.
+                bridge.request(QStringLiteral("webui.open"));
+                return;
+            }
+            if (selfTestMode == QLatin1String("webui-browser"))
+                bridge.openWebuiExternally();
+            else
+                bridge.openWebuiEmbedded();
+            if (selfTestMode == QLatin1String("webui-close"))
+                bridge.closeWebui();
+        });
+        bool liveOpened = false;
+        QObject::connect(&bridge, &DshQtBridge::eventReceived, &app,
+                         [&bridge, &liveOpened, selfTestMode](const QString &name, const QVariant &,
+                                                              const QVariant &payload) {
+            if (selfTestMode != QLatin1String("webui-live") || liveOpened
+                || name != QLatin1String("webui.state"))
+                return;
+            const QVariantMap status = payload.toMap();
+            if (status.value(QStringLiteral("state")).toString() != QLatin1String("Ready"))
+                return;
+            liveOpened = true;
+            std::fprintf(stderr, "[selftest] webui.state=Ready mode=%s\n",
+                         qUtf8Printable(status.value(QStringLiteral("mode")).toString()));
+            bridge.openWebuiEmbedded();
+        });
+        QObject::connect(&bridge, &DshQtBridge::requestReplied, &app,
+                         [sentinel](const QString &, const QString &method, bool, const QVariant &result,
+                                    const QString &error) {
+            const QByteArray json =
+                QJsonDocument(QJsonArray{QJsonValue::fromVariant(result)}).toJson(QJsonDocument::Compact);
+            if (!sentinel.isEmpty() && (json.contains(sentinel.toUtf8()) || error.contains(sentinel))) {
+                std::fprintf(stderr, "[selftest] LEAK method=%s\n", qUtf8Printable(method));
+                QCoreApplication::exit(4);
+            }
+        });
+        QObject::connect(&bridge, &DshQtBridge::webuiTokenResolved, &app,
+                         [&bridge, selfTestMode](const QString &, const QString &intent, const QString &outcome,
+                            const QString &masked, const QString &error) {
+            std::fprintf(stderr, "[selftest] webui.token intent=%s outcome=%s masked=%s error=%s\n",
+                         qUtf8Printable(intent), qUtf8Printable(outcome), qUtf8Printable(masked),
+                         qUtf8Printable(error));
+            // The duplicate-reply case waits here so a second `res` for the
+            // same id can arrive (and must be dropped) before the process exits.
+            if (selfTestMode == QLatin1String("webui-live"))
+                bridge.closeWebui();
+            const int linger = qEnvironmentVariableIntValue("DSH_QT_WEBUI_LINGER_MS");
+            QTimer::singleShot(linger, qApp, &QCoreApplication::quit);
+        });
+        QTimer::singleShot(10000, qApp, []() { QCoreApplication::exit(3); });
+    } else if (selfTestMode == QLatin1String("session-live")) {
+        // Mounted inside a real DSH profile: print every event the host pushes
+        // so the e2e test can prove the session/tool projection arrives intact.
+        // The host spawns this process with piped stderr, so the e2e test reads
+        // the trace file named by DSH_QT_SESSION_TRACE instead.
+        const QString tracePath = qEnvironmentVariable("DSH_QT_SESSION_TRACE");
+        auto trace = [tracePath](const QString &line) {
+            std::fprintf(stderr, "[selftest] %s\n", qUtf8Printable(line));
+            if (tracePath.isEmpty())
+                return;
+            QFile file(tracePath);
+            if (file.open(QIODevice::WriteOnly | QIODevice::Append))
+                file.write(line.toUtf8() + '\n');
+        };
+        QObject::connect(&bridge, &DshQtBridge::eventReceived, &app,
+                         [trace](const QString &name, const QVariant &, const QVariant &payload) {
+            const QByteArray json = QJsonDocument(
+                                        QJsonArray{QJsonValue::fromVariant(payload)})
+                                        .toJson(QJsonDocument::Compact);
+            trace(QStringLiteral("evt name=%1 payload=%2").arg(name, QString::fromUtf8(json)));
+        });
+        QObject::connect(&bridge, &DshQtBridge::transportStateChanged, &app, [&bridge, trace]() {
+            trace(QStringLiteral("state=%1").arg(bridge.transportState()));
+        });
+        const int linger = qEnvironmentVariableIntValue("DSH_QT_SESSION_LINGER_MS");
+        QTimer::singleShot(linger > 0 ? linger : 5000, qApp, &QCoreApplication::quit);
+    } else if (selfTest) {
         // Each request proves one real route of the shipped bridge: the
         // handshake (`ping`), the renderer (`markdown.parse`) and the theme
         // service (`theme.scale`). The sequence is fixed so the e2e test can
@@ -1341,7 +1521,11 @@ int main(int argc, char *argv[])
         &engine, &QQmlApplicationEngine::objectCreationFailed, &app,
         []() { QCoreApplication::exit(EXIT_FAILURE); }, Qt::QueuedConnection);
 
-    engine.load(QUrl(QStringLiteral(DSH_QT_QML_ENTRY)));
+    // The shipped entry is the compiled default; tests and integrators may point
+    // the same binary at a harness to exercise a single view in isolation.
+    const QString qmlEntry =
+        qEnvironmentVariable("DSH_QT_QML_ENTRY", QStringLiteral(DSH_QT_QML_ENTRY));
+    engine.load(QUrl(qmlEntry));
     if (engine.rootObjects().isEmpty())
         return EXIT_FAILURE;
 

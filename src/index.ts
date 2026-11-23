@@ -38,6 +38,8 @@ import type { HostBridgeConfig, HostBridgeLogger } from './host/bridge-service.j
 import { randomUUID } from 'node:crypto'
 import { createPluginService } from './plugins/service.js'
 import type { PluginManagerPort } from './plugins/service.js'
+import { createSlotRegistry } from './plugins/slot-contract.js'
+import { mirrorRendererSlots } from './plugins/slot-bridge.js'
 import { registerSettingsMethods } from './bridge/settings-rpc.js'
 import type { SettingsRpcDeps } from './bridge/settings-rpc.js'
 import { registerLlmMethods } from './llm/operations.js'
@@ -178,6 +180,7 @@ export class QtRendererService extends Service {
   // a traceable Proxy and invokes members with a "shadow" receiver, so ECMAScript
   // private fields would throw "Cannot read private member" at runtime.
   private logger_: Logger | undefined
+  private slotListeners = new Set<() => void>()
   private dialogSeq_ = 0
   private pendingDialogs_ = new Map<string, (result: DialogResult) => void>()
 
@@ -296,18 +299,39 @@ export class QtRendererService extends Service {
     return [...this.views.values()]
   }
 
+  /** Observe slot mutations; the plugin-slot bridge mirrors them into the registry. */
+  subscribeSlots(listener: () => void): () => void {
+    this.slotListeners.add(listener)
+    return () => {
+      this.slotListeners.delete(listener)
+    }
+  }
+
+  private notifySlots(): void {
+    for (const listener of [...this.slotListeners]) {
+      try {
+        listener()
+      } catch {
+        // A broken mirror must not stop the renderer from mutating its slots.
+      }
+    }
+  }
+
   /** Register a plugin slot contribution; returns a disposer. */
   registerSlot(contribution: QtSlotContribution): () => void {
     const key = `${contribution.surface}:${contribution.id}`
     this.slots.set(key, contribution)
+    this.notifySlots()
     return () => {
-      this.slots.delete(key)
+      if (this.slots.delete(key)) this.notifySlots()
     }
   }
 
   /** Remove a slot contribution. */
   unregisterSlot(surface: string, id: string): boolean {
-    return this.slots.delete(`${surface}:${id}`)
+    const removed = this.slots.delete(`${surface}:${id}`)
+    if (removed) this.notifySlots()
+    return removed
   }
 
   /** Slot contributions, optionally filtered by surface. */
@@ -431,13 +455,16 @@ export function apply(ctx: Context, config: QtPluginConfig = {}): void {
   }
   disposers.push(...registerCredentialMethods(host, credentialDeps))
 
+  const slotRegistry = createSlotRegistry()
   const plugins = createPluginService({
     manager: (pluginManager ?? {}) as PluginManagerPort,
     host,
+    slots: slotRegistry,
   })
   plugins.attach()
   disposers.push(() => plugins.dispose())
 
+  disposers.push(mirrorRendererSlots(renderer, slotRegistry))
   disposers.push(attachToolProjection(ctx, host))
 
   const webui = new WebuiService(ctx, config.webui ?? {})

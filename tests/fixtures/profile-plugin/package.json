@@ -1,0 +1,8 @@
+{
+  "name": "@dsh-fixture/profile-plugin",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Offline fixture plugin used by tests/official-profile.e2e.ts to prove real ctx.pluginManager listing."
+}

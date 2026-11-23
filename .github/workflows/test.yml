@@ -182,10 +182,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck (src + tests)
-        run: pnpm typecheck
+        run: node scripts/gate.mjs -- pnpm typecheck
 
       - name: Unit tests
-        run: pnpm test
+        run: node scripts/gate.mjs -- pnpm test
 
   # ---------------------------------------------------------------------------
   # napi integration: run the TypeScript suite with a real addon on disk.
@@ -263,7 +263,7 @@ jobs:
       - name: Full suite with the real addon present
         env:
           DSH_QT_NAPI_PATH: ${{ github.workspace }}/dsh-qt-napi/prebuild/linux-x64/qt-bridge.node
-        run: pnpm test
+        run: node scripts/gate.mjs -- pnpm test
 
   qml-lint:
     name: qml lint

@@ -41,15 +41,15 @@
 
 | 缺口 ID | 现状 | 入口（存在才列） |
 |---|---|---|
-| I-G0 | **部分实现**：真实 Qt 子进程握手 + `host.ping` 往返 + 干净退出；尚未在隔离 profile 中跑完整会话/工具流 | `tests/host-e2e.e2e.ts` |
+| I-G0 | **已实现**：真实 Qt 子进程 7 例（握手/三方法/shipped QML 加载/token 生命周期）；隔离 profile 真实会话+工具流见 `tests/official-profile.e2e.ts` | `tests/host-e2e.e2e.ts`、`tests/official-profile.e2e.ts` |
 | I-TOOL1 | **已实现** | `tests/qml/tst_toolcallmodel.qml`、`tests/tools-projection.test.ts` |
 | I-PLUGIN1 | **已实现**（官方 manager fake） | `tests/plugins-service.test.ts`、`tests/integration-wiring.test.ts` |
 | I-PLUGIN2 | **已实现**（受限 React 子集/拒绝） | `tests/ui-converter.test.ts` |
 | I-WEBUI1 | **已实现**（状态机，不 spawn） | `tests/webui-service.test.ts`、`tests/webui-default-off.test.ts` |
-| I-WEBUI2 | **未实现**：未在 CI 内真实 spawn `dsh web --port 0 --no-open` | — |
+| I-WEBUI2 | **已实现**：真实 spawn `dsh web --port 0 --no-open`（隔离 DSH_HOME），断言 303+cookie 握手、无 token/伪造 token/伪造 cookie 均 401、退出后端口释放 | `tests/webui-external.e2e.ts` |
 | I-SET1 | **已实现** | `tests/settings-rpc.test.ts`、`tests/settings-forms.test.ts`、`tests/qml/tst_settingsbridge.qml` |
 | I-SET2 | **部分实现**：帧/回复 JSON 断言无 sentinel secret；日志 spy 级断言未单列 | `tests/integration-wiring.test.ts` |
-| I-GATE1 | **未实现**：门禁包装器脚本不存在；当前直接记录命令退出码与日志路径 | — |
+| I-GATE1 | **已实现**：`scripts/gate.mjs` 逐字返回子进程退出码并在 stderr 打 `[gate] exit=…`；CI 的 typecheck/test/build/package/CMake configure/build 步骤经它运行；自测含保真与缺命令负例 | `scripts/gate.mjs`、`tests/gate.test.ts` |
 | I-DOC1 | **部分实现**：`docs/ci.md` Known gaps + `docs/PHASE-3-STATUS.md` §4 | — |
 
 
