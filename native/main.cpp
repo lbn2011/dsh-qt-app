@@ -33,7 +33,11 @@
 #include <QMetaObject>
 #include <QObject>
 #include <QQmlApplicationEngine>
+#include <QQmlComponent>
 #include <QQmlContext>
+#include <QQmlEngine>
+#include <QQuickItem>
+#include <QQuickWindow>
 #include <QQuickStyle>
 #include <QSaveFile>
 #include <QSocketNotifier>
@@ -120,6 +124,33 @@ QString configDirectory()
     if (!generic.isEmpty())
         return generic + QStringLiteral("/dsh-qt");
     return QDir::homePath() + QStringLiteral("/.config/dsh-qt");
+}
+
+/**
+ * Test-only record of the URL handed to the desktop browser.
+ *
+ * `tests/webengine-chromium.e2e.ts` sets `DSH_QT_OPEN_URL_LOG` and then fetches
+ * the recorded URL from its own HTTP server, which proves the one-shot token
+ * really authenticates the browser hand-off path. This is a record, not a
+ * substitute: the external branch below still runs unchanged, and in a
+ * production launch (no self-test) neither this function nor the file it
+ * mentions is ever touched. The file is created owner-only because the value
+ * written is a credential for the duration of the hand-off.
+ */
+void recordOpenUrlForTest(const QUrl &url)
+{
+    if (qEnvironmentVariableIsEmpty("DSH_QT_HOST_SELFTEST"))
+        return;
+    const QString path = qEnvironmentVariable("DSH_QT_OPEN_URL_LOG");
+    if (path.isEmpty())
+        return;
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        return;
+    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    file.write(url.toEncoded());
+    file.write("\n");
+    file.close();
 }
 
 } // namespace
@@ -1230,6 +1261,9 @@ private:
             // outcome instead of launching a browser on the build machine.
             outcome = QStringLiteral("external");
         } else if (!qEnvironmentVariableIsEmpty("DSH_QT_HOST_SELFTEST")) {
+            // Headless: no desktop to open a browser on. The harness records the
+            // exact URL it would have handed over and validates that URL itself.
+            recordOpenUrlForTest(QUrl(url));
             outcome = QStringLiteral("external");
         } else {
             outcome = QStringLiteral("failed");
@@ -1354,6 +1388,14 @@ int main(int argc, char *argv[])
     ThemeBridge themeBridge;
     DshQtBridge bridge(&themeBridge);
 
+    // Created before the self-test branches on purpose: the WebEngine
+    // acceptance test (`webui-chromium`) drives this same object through the
+    // real `webui.open` → `webui.token` → `loadAuthenticated` chain, so it has
+    // to exist in the self-test path too. In a build without WebEngine it is
+    // cheap and reports itself unavailable.
+    WebviewHost webview;
+    bridge.setWebviewHost(&webview);
+
     // Headless protocol self-test (tests/host-e2e.e2e.ts).
     //
     // The real transport, the real handshake and the real binary are exercised;
@@ -1366,9 +1408,40 @@ int main(int argc, char *argv[])
         // sentinel URL, and this harness proves that the URL reaches a native
         // consumer while the generic QML signal never sees it.
         const QString sentinel = qEnvironmentVariable("DSH_QT_WEBUI_SENTINEL");
+        const bool chromium = selfTestMode == QLatin1String("webui-chromium");
         bool started = false;
+        // Headless container for the WebEngine acceptance test. The product
+        // path injects WebFallbackPanel.qml's `embedSlot`; the self-test has no
+        // QML window, so it supplies an equivalent off-screen Item here. This
+        // is the only test-specific object: the engine, the token and the
+        // close path are the production ones.
+        // Heap-allocated on purpose: the self-test block ends before
+        // `app.exec()`, so a stack engine/window would be destroyed exactly
+        // when the embedded page starts loading. Ownership goes to `app`.
+        QQmlEngine *selftestEngine = nullptr;
+        QQuickWindow *selftestWindow = nullptr;
+        if (chromium) {
+            selftestEngine = new QQmlEngine(&app);
+            selftestWindow = new QQuickWindow;
+            QQmlComponent containerComponent(selftestEngine);
+            containerComponent.setData(
+                QByteArrayLiteral("import QtQuick\nItem { anchors.fill: parent }"),
+                QUrl(QStringLiteral("qrc:/dsh/selftest_container.qml")));
+            QQuickItem *container = qobject_cast<QQuickItem *>(containerComponent.create());
+            if (container == nullptr) {
+                std::fprintf(stderr, "[selftest] webview.container=0 %s\n",
+                             qUtf8Printable(containerComponent.errorString()));
+                QCoreApplication::exit(7);
+            } else {
+                container->setParentItem(selftestWindow->contentItem());
+                webview.setContainer(container);
+                selftestWindow->resize(1024, 768);
+                selftestWindow->show();
+                std::fprintf(stderr, "[selftest] webview.container=1\n");
+            }
+        }
         QObject::connect(&bridge, &DshQtBridge::transportStateChanged, &app,
-                         [&bridge, &started, selfTestMode]() {
+                         [&bridge, &started, selfTestMode, chromium]() {
             const QString state = bridge.transportState();
             std::fprintf(stderr, "[selftest] state=%s\n", qUtf8Printable(state));
             if (state != QLatin1String("connected") || started)
@@ -1377,7 +1450,7 @@ int main(int argc, char *argv[])
             // Whether this build can embed decides the expected outcome below;
             // a build without WebEngine must never be reported as embedded.
             std::fprintf(stderr, "[selftest] webview.available=%d\n", bridge.canEmbedWebui() ? 1 : 0);
-            if (selfTestMode == QLatin1String("webui-live")) {
+            if (selfTestMode == QLatin1String("webui-live") || chromium) {
                 // Real fallback chain: ask the mounted service to open, wait for
                 // its Ready event, then hand the token to the native consumer.
                 bridge.request(QStringLiteral("webui.open"));
@@ -1392,10 +1465,11 @@ int main(int argc, char *argv[])
         });
         bool liveOpened = false;
         QObject::connect(&bridge, &DshQtBridge::eventReceived, &app,
-                         [&bridge, &liveOpened, selfTestMode](const QString &name, const QVariant &,
+                         [&bridge, &liveOpened, chromium, selfTestMode](const QString &name, const QVariant &,
                                                               const QVariant &payload) {
-            if (selfTestMode != QLatin1String("webui-live") || liveOpened
-                || name != QLatin1String("webui.state"))
+            if (selfTestMode != QLatin1String("webui-live") && !chromium)
+                return;
+            if (liveOpened || name != QLatin1String("webui.state"))
                 return;
             const QVariantMap status = payload.toMap();
             if (status.value(QStringLiteral("state")).toString() != QLatin1String("Ready"))
@@ -1416,11 +1490,20 @@ int main(int argc, char *argv[])
             }
         });
         QObject::connect(&bridge, &DshQtBridge::webuiTokenResolved, &app,
-                         [&bridge, selfTestMode](const QString &, const QString &intent, const QString &outcome,
-                            const QString &masked, const QString &error) {
+                         [&bridge, chromium, selfTestMode](const QString &, const QString &intent,
+                            const QString &outcome, const QString &masked, const QString &error) {
             std::fprintf(stderr, "[selftest] webui.token intent=%s outcome=%s masked=%s error=%s\n",
                          qUtf8Printable(intent), qUtf8Printable(outcome), qUtf8Printable(masked),
                          qUtf8Printable(error));
+            if (chromium) {
+                // The embedded view is the consumer here: a load result (or the
+                // hard timeout) decides the exit code, not this reply.
+                if (outcome != QLatin1String("embedded")) {
+                    std::fprintf(stderr, "[selftest] webview.load state=not-started\n");
+                    QCoreApplication::exit(5);
+                }
+                return;
+            }
             // The duplicate-reply case waits here so a second `res` for the
             // same id can arrive (and must be dropped) before the process exits.
             if (selfTestMode == QLatin1String("webui-live"))
@@ -1428,7 +1511,42 @@ int main(int argc, char *argv[])
             const int linger = qEnvironmentVariableIntValue("DSH_QT_WEBUI_LINGER_MS");
             QTimer::singleShot(linger, qApp, &QCoreApplication::quit);
         });
-        QTimer::singleShot(10000, qApp, []() { QCoreApplication::exit(3); });
+        if (chromium || selfTestMode == QLatin1String("webui-browser")) {
+            QObject::connect(&webview, &WebviewHost::loadFailed, &app,
+                             [](const QString &reason) {
+                std::fprintf(stderr, "[selftest] webview.failed reason=%s\n",
+                             qUtf8Printable(reason));
+            });
+        }
+        if (chromium) {
+            // The WebEngine acceptance test (T28-2): report every engine load
+            // transition, close only after Chromium committed the marker page,
+            // then require the close itself to commit `about:blank` before the
+            // process exits 0.
+            bool loadSettled = false;
+            bool loadFailed = false;
+            QObject::connect(&webview, &WebviewHost::loadStateChanged, &app,
+                             [&bridge, &webview, &loadSettled, &loadFailed]() {
+                const QString state = webview.loadState();
+                std::fprintf(stderr, "[selftest] webview.load state=%s title=%s url=%s\n",
+                             qUtf8Printable(state), qUtf8Printable(webview.pageTitle()),
+                             qUtf8Printable(webview.currentUrlMasked()));
+                if ((state == QLatin1String("loaded") || state == QLatin1String("failed"))
+                    && !loadSettled) {
+                    loadSettled = true;
+                    loadFailed = state == QLatin1String("failed");
+                    bridge.closeWebui();
+                } else if (state == QLatin1String("closed")) {
+                    std::fprintf(stderr, "[selftest] webview.close visible=%d url=%s\n",
+                                 webview.visible() ? 1 : 0,
+                                 qUtf8Printable(webview.currentUrlMasked()));
+                    QCoreApplication::exit(loadFailed ? 6 : 0);
+                }
+            });
+            QTimer::singleShot(60000, qApp, []() { QCoreApplication::exit(3); });
+        } else {
+            QTimer::singleShot(10000, qApp, []() { QCoreApplication::exit(3); });
+        }
     } else if (selfTestMode == QLatin1String("session-live")) {
         // Mounted inside a real DSH profile: print every event the host pushes
         // so the e2e test can prove the session/tool projection arrives intact.
@@ -1505,9 +1623,6 @@ int main(int argc, char *argv[])
 
     if (selfTest)
         return app.exec();
-
-    WebviewHost webview;
-    bridge.setWebviewHost(&webview);
 
     QQmlApplicationEngine engine;
 

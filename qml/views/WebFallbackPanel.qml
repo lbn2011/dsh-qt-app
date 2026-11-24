@@ -56,6 +56,16 @@ Item {
     property var webviewHost: null
     readonly property bool canEmbed: root.webviewHost !== null && root.webviewHost.available === true
 
+    // Hand the stable slot to the native host. WebviewHost owns the
+    // WebEngineView and needs a QQuickItem to parent it to; without this the
+    // embed step can only fail. A host injected later is handled by the change
+    // handler, a host present at completion by the slot's own handler.
+    function syncEmbedContainer() {
+        if (root.webviewHost !== null && root.webviewHost.available === true)
+            root.webviewHost.setContainer(embedSlot)
+    }
+    onWebviewHostChanged: root.syncEmbedContainer()
+
     /** Mirrors the Node-side `webui.state` event payload. */
     property string state: "Idle"
     property string mode: ""
@@ -184,6 +194,7 @@ Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
             visible: root.ready && root.canEmbed
+            Component.onCompleted: root.syncEmbedContainer()
         }
 
         // Browser fallback: the token-carrying URL is handed over natively.

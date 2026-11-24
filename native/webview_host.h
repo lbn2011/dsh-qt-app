@@ -23,6 +23,8 @@
 #include <QUrl>
 #include <QVariantMap>
 
+class QQuickItem;
+
 class WebviewHost : public QObject
 {
     Q_OBJECT
@@ -34,6 +36,13 @@ class WebviewHost : public QObject
     Q_PROPERTY(bool visible READ visible NOTIFY visibleChanged)
     // Safe to display: `http://127.0.0.1:PORT/?token=***`.
     Q_PROPERTY(QString maskedUrl READ maskedUrl NOTIFY maskedUrlChanged)
+    // Last load outcome reported by the embedded engine. One of `idle`,
+    // `loading`, `loaded`, `failed`, `closed`. Added for the WebEngine
+    // acceptance test (T28-2): the headless self-test waits for `loaded`
+    // before asserting the page title and then closing the page.
+    Q_PROPERTY(QString loadState READ loadState NOTIFY loadStateChanged)
+    // Title reported by the engine for the last committed page. Never a token.
+    Q_PROPERTY(QString pageTitle READ pageTitle NOTIFY loadStateChanged)
 
 public:
     explicit WebviewHost(QObject *parent = nullptr);
@@ -46,6 +55,20 @@ public:
     QString unavailableReason() const;
     bool visible() const;
     QString maskedUrl() const;
+    // `idle`, `loading`, `loaded`, `failed` or `closed`.
+    QString loadState() const;
+    QString pageTitle() const;
+
+    // The URL the embedded page is actually showing, token-masked. This exists
+    // for the acceptance test to assert that `close()` reached `about:blank`;
+    // like `maskedUrl` it never carries the authenticated token.
+    Q_INVOKABLE QString currentUrlMasked() const;
+
+    // The QML Item that owns the embedded page (WebFallbackPanel.qml's
+    // `embedSlot`). The QML side injects it once, right after the host is
+    // assigned; without a container the WebEngineView has no scene to live in,
+    // so `loadAuthenticated` refuses instead of creating an orphan view.
+    Q_INVOKABLE void setContainer(QQuickItem *item);
 
     // Mirror of the Node-side `webui.state` event. Only `Ready` shows the view;
     // `Failed`, `Stopping` and `Idle` hide it so a stale page can never be shown
@@ -68,10 +91,19 @@ public:
 signals:
     void visibleChanged();
     void maskedUrlChanged();
+    // Emitted for every load-state transition (loading → loaded/failed →
+    // closed). Carries no data; read the properties for the safe summary.
+    void loadStateChanged();
     // `webengine-unavailable`, `invalid-url`, `load-failed`.
     void loadFailed(const QString &reason);
 
 private:
     class Private;
     Private *d = nullptr;
+
+private Q_SLOTS:
+    // Receives the QML wrapper's `loadFinished` (old-style connect: the
+    // WebEngineView is created from a QML string, so there is no C++ signal to
+    // take a pointer to). Kept as a slot rather than a lambda for that reason.
+    void handleViewLoadFinished(bool ok, const QString &title, const QString &loadedUrl);
 };

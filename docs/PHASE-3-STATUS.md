@@ -59,7 +59,7 @@ DSH profile (Node)
 | 命令 | 退出码 | 摘要 | 日志 |
 | --- | --- | --- | --- |
 | `pnpm typecheck` | 0 | src + tests 无错 | `logs/t32-typecheck.log` |
-| `pnpm test` | 0 | **482/482 pass**（含 gate 3、packaging 3、integration-wiring 5） | `logs/t32-test.log` |
+| `pnpm test` | 0 | **484/484 pass**（含 gate、packaging 5、integration-wiring 5；t34 后计数） | `logs/t34-test.log` |
 | `pnpm build` | 0 | `tsc -p tsconfig.json` | `logs/t32-build.log` |
 | `cmake -S . -B build -DDSH_QT_WEBENGINE=OFF` | 0 | WebEngine 关闭 | `logs/t32-cmake-configure.log` |
 | `cmake --build build` | 0 | 含 `webview_host.cc`、C++ token 分派 | `logs/t32-build2.log`、`t32-build3.log` |
@@ -70,27 +70,33 @@ DSH profile (Node)
 | `tsx --test tests/generated-slot-live.e2e.ts` | 0 | 1/1：渲染→点击→Node 重渲染 | `/tmp/e2e7.log` |
 | `tsx --test tests/plugin-manager-live.e2e.ts` | 0 | 1/1：真实 ctx.pluginManager 列表/停用/启用 | `logs/t32-plugin-manager.log` |
 | `tsx --test tests/webui-external.e2e.ts` | 0 | 1/1：官方 `dsh web` 栅栏负例与端口释放 | `logs/t32-webui-external2.log` |
+| `tsx --test tests/webengine-chromium.e2e.ts` | 0 | 2/2：WebEngine=ON 真实 Chromium 认证加载/标题/maskedUrl/关闭 about:blank；`DSH_QT_OPEN_URL_LOG` 真实 GET 认证 | `logs/t34-chromium-final.log` |
 
 CI 锁：`.github/workflows/{build,test}.yml` 用 `NAPI_SHA` checkout addon，并断言
 `git rev-parse HEAD` 与 `package.json` 的 `dshQtNapi.commit` 等于该 SHA；
 typecheck/test/build/package/CMake configure/build 步骤经 `scripts/gate.mjs`
 运行（退出码保真，stderr 记录 `[gate] exit=…`）；`tests/gate.test.ts` 覆盖保真与缺命令负例。
-`THIRD-PARTY-NOTICES.md` 随 `cmake --install`/CPack 安装到包根（`tests/packaging.test.ts`
-在临时 prefix 实测），覆盖本项目 MIT、addon（pinned SHA）、vendored cmark-gfm
-0.29.0.gfm.14（BSD-2 全文）。
+`THIRD-PARTY-NOTICES.md` 随 `cmake --install`/CPack 安装到包根；`tests/packaging.test.ts`
+既实测临时 install prefix，也真实执行 `cpack -G TGZ`、校验同名 `.sha256`、解归档断言根目录
+含 `LICENSE`/`THIRD-PARTY-NOTICES.md`/`bin/dsh-qt-app`，并覆盖缺 notices、坏校验和两个负例。
+CI 另有 `qt-webengine` job（`modules: qtwebengine`、offscreen、`--no-sandbox --disable-gpu`）
+编译期断言 `DSH_QT_HAS_WEBENGINE=1` 并在该构建下跑真实 Chromium 加载/关闭 e2e。
 
 ## 4. 缺口（如实报告，不在本轮声称完成）
 
-- **Qt WebEngine 嵌入加载未本机验证**：本机构建 `-DDSH_QT_WEBENGINE=OFF`，嵌入分支
-  只编译不运行；`tests/webui-live.e2e.ts` 在 OFF 构建下要求 `external` 降级，并**拒绝**
-  把 external 记成 embedded。真实嵌入加载需 WebEngine=1 的 Windows/Linux 机器或 CI。
-- **`external` 只证明分派到浏览器分支**：自测模式下不实际启动桌面浏览器
-  （避免副作用），因此「浏览器真的加载了页面」未在本轮证明；官方 `dsh web` 端的
-  303+cookie 与 401 栅栏由 `tests/webui-external.e2e.ts` 单独证明。
+- **Qt WebEngine 嵌入加载仅 Linux/offscreen 本机验证**：t34 在本机 Qt 6.8.2 +
+  `qt6-webengine-dev` 上构建 `build-webengine`（`DSH_QT_HAS_WEBENGINE=1`），真实 Chromium
+  加载标记页、标题命中、maskedUrl 只含 `token=***`、关闭后 about:blank，2/2 通过
+  （`tests/webengine-chromium.e2e.ts`）。**Windows/macOS 与真实桌面窗口仍无运行证据**；
+  CI 的 `qt-webengine` job 尚未在远程 runner 实际触发。「CI 必过」不成立，需首跑确认。
+- **`external` 只证明分派到浏览器分支**：自测下真实 GET 由测试进程经
+  `DSH_QT_OPEN_URL_LOG` 完成（认证链 200/401 已证），但没有桌面会话里“浏览器窗口真的弹出”的
+  断言；生产分支仍是 `QDesktopServices::openUrl`，hook 只在 selftest 下记录。
 - **真实模型/真实用户 profile 未跑**：`tests/official-profile.e2e.ts` 使用隔离
   `DSH_HOME` + 本地确定性假模型（一次 `bash` tool_use + 一次文本），不接触真实凭据、
   不调用付费模型；标题请求判据为 `thinking.type==='disabled' && messages.length===1`。
-- **macOS/Windows**：代码与 CI 矩阵存在，本机无运行证据；跨平台 GUI 行为需 CI 触发后补。
+- **macOS/Windows**：代码与 CI 矩阵存在，本机无运行证据；本轮 WebEngine 也只在 Linux 验证，
+  跨平台 GUI/嵌入行为需 CI 触发后补。
 - **插件槽位注册通道的边界**：render/action 函数经 `mirrorRendererSlots` 从
   `QtRendererService.registerSlot` 镜像到 `PluginService` 的 SlotRegistry；`ui.register`
   RPC 仍只承载可序列化元数据（函数无法过线），这一语义写入契约文档。

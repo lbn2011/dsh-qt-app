@@ -389,6 +389,102 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # qt-webengine: compile the WebEngine branch and prove it really loads.
+  #
+  # The mandatory Qt jobs above use the default Qt install, which does not ship
+  # QtWebEngine. That means `#if DSH_QT_HAS_WEBENGINE` was never compiled, and
+  # the embedded WebUI path (open → token → Chromium load → close) had no CI
+  # evidence. This job is that evidence: it requests the qtwebengine module,
+  # configures with -DDSH_QT_WEBENGINE=ON, asserts the compile-time flag really
+  # is 1, then runs the real Chromium e2e (tests/webengine-chromium.e2e.ts)
+  # against a local HTTP server.
+  #
+  # Chromium inside a container needs --no-sandbox and no GPU; the offscreen
+  # platform keeps the run headless. These flags are accepted upstream for CI
+  # only — the shipped app never adds them.
+  # ---------------------------------------------------------------------------
+  qt-webengine:
+    name: qt webengine (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QTWEBENGINE_CHROMIUM_FLAGS: --no-sandbox --disable-gpu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Qt with the WebEngine module
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: qtwebengine
+          cache: true
+
+      # QtWebEngine links a real Chromium: the runner needs the shared
+      # libraries Chromium itself expects, plus fonts for a page title to be
+      # laid out. install-qt-action does not install these.
+      - name: Install Chromium runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             libnss3 libnspr4 libxcomposite1 libxdamage1 libxrandr2 libxtst6             libasound2 libgbm1 libxshmfence1 libpulse0 libxkbcommon-x11-0             libxkbfile1 libxcb-cursor0 libxcb-icccm4 libxcb-image0             libxcb-keysyms1 libxcb-render-util0 libxcb-xinerama0             fonts-dejavu-core
+
+      - name: Build TypeScript
+        run: pnpm build
+
+      - name: Configure with WebEngine ON
+        run: |
+          set -o pipefail
+          cmake -S . -B build-webengine \
+            -DDSH_QT_WEBENGINE=ON \
+            -DCMAKE_BUILD_TYPE=Release 2>&1 | tee configure-webengine.log
+
+      # Two independent assertions: CMake found the module (so the flag cannot
+      # silently be 0) and the compiled target really carries the definition.
+      - name: Assert the WebEngine branch is compiled in
+        run: |
+          set -euo pipefail
+          if ! grep -q 'Qt WebEngine embedding enabled' configure-webengine.log; then
+            echo '::error::CMake did not enable Qt WebEngine — the module is missing'
+            grep -i 'webengine' configure-webengine.log || true
+            exit 1
+          fi
+          if ! grep -R -- '-DDSH_QT_HAS_WEBENGINE=1' build-webengine/CMakeFiles/dsh-qt-app.dir/flags.make; then
+            echo '::error::the dsh-qt-app target does not compile with DSH_QT_HAS_WEBENGINE=1'
+            exit 1
+          fi
+          test -x build-webengine/dsh-qt-app
+
+      - name: Build
+        run: cmake --build build-webengine --parallel 2
+
+      - name: Real Chromium auth load/close e2e
+        env:
+          DSH_QT_APP_BINARY: ${{ github.workspace }}/build-webengine/dsh-qt-app
+        run: pnpm exec tsx --test tests/webengine-chromium.e2e.ts
+
+      - name: Upload WebEngine e2e output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webengine-e2e
+          path: configure-webengine.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # packaging: prove `pnpm package` produces an installable artifact.
   #
   # This runs in the test workflow as well as the build workflow because it is a
@@ -442,6 +538,27 @@ jobs:
             exit 1
           fi
           ls -la "${artifacts[@]}"
+
+
+      # The package is only trustworthy if its license material survived
+      # archiving. This is the Linux leg; Windows NSIS/ZIP is covered by the
+      # packaging matrix (the local TGZ acceptance test is tests/packaging.test.ts).
+      - name: Assert archive ships LICENSE + notices + SHA-256
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(ls dist/package/*.tar.gz | head -1)
+          (cd dist/package && sha256sum -c "$(basename "$archive").sha256")
+          root=$(tar -tzf "$archive" | head -1 | cut -d/ -f1)
+          for required in LICENSE THIRD-PARTY-NOTICES.md; do
+            if ! tar -tzf "$archive" | grep -qx "$root/$required"; then
+              echo "::error::$archive is missing $required at its root"
+              tar -tzf "$archive" | head -20
+              exit 1
+            fi
+          done
+          echo "archive root $root carries LICENSE and THIRD-PARTY-NOTICES.md"
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4

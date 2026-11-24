@@ -59,9 +59,20 @@ repository at `vendor/cmark-gfm/COPYING`; its `PROVENANCE.md` records the
 The executable links Qt 6 (Core, Gui, Quick, Qml, QuickControls2; optionally
 WebEngineQuick). Qt is distributed under LGPL-3.0 / GPL-3.0 / commercial terms;
 this repository does not vendor or redistribute Qt binaries. Installers built
-from a Qt installation inherit whatever terms that installation carries. The
-WebEngine option is OFF in CI, so the mandatory build does not pull Chromium
-into the package.
+from a Qt installation inherit whatever terms that installation carries.
+
+Qt WebEngine is an optional, compile-time feature (`-DDSH_QT_WEBENGINE=ON`
+with the `qtwebengine` module installed; the build reports
+`DSH_QT_HAS_WEBENGINE=1`). The `qt-webengine` CI job builds and exercises that
+branch, so the notices below also cover it: when the feature is enabled the
+executable links Qt WebEngine and Chromium. Qt WebEngine itself is under the
+LGPL-3.0 (with the usual Qt commercial alternative); Chromium is under the
+BSD-3-Clause licence and carries the additional third-party notices shipped
+inside the Qt WebEngine runtime. None of those libraries, their resources, or
+the Chromium sandbox helper are copied into this repository's package: the
+archive contains only `dsh-qt-app`, `LICENSE`, and this file. A deployment that
+bundle Qt/WebEngine binaries must reproduce the notices of the Qt installation
+it copies from.
 
 ## JavaScript runtime dependencies
 
