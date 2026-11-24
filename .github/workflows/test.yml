@@ -195,7 +195,12 @@ jobs:
   # skipping. The test itself still isolates DSH_HOME.
   # ---------------------------------------------------------------------------
   webui-real-host:
-    name: webui real host (dsh ${{ env.DSH_HOST_VERSION }})
+    # A fixed display name on purpose: `jobs.<job_id>.name` can only read the
+    # github/inputs/matrix/needs/strategy/vars contexts, so an `env` expression
+    # here makes GitHub reject the whole workflow file before any job is
+    # created. The pinned host version stays in the single `env` block below,
+    # which is where the job's steps read it from.
+    name: webui real host (pinned dsh host)
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
