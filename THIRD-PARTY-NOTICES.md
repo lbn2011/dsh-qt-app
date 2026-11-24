@@ -63,16 +63,21 @@ from a Qt installation inherit whatever terms that installation carries.
 
 Qt WebEngine is an optional, compile-time feature (`-DDSH_QT_WEBENGINE=ON`
 with the `qtwebengine` module installed; the build reports
-`DSH_QT_HAS_WEBENGINE=1`). The `qt-webengine` CI job builds and exercises that
-branch, so the notices below also cover it: when the feature is enabled the
-executable links Qt WebEngine and Chromium. Qt WebEngine itself is under the
+`DSH_QT_HAS_WEBENGINE=1`). The `qt-webengine` CI job is configured to build
+and exercise that branch; that job has not yet been observed running on a
+hosted runner, so no remote CI result is claimed here. When the feature is
+enabled the executable links Qt WebEngine and Chromium, and the notices below
+cover them. Qt WebEngine itself is under the
 LGPL-3.0 (with the usual Qt commercial alternative); Chromium is under the
 BSD-3-Clause licence and carries the additional third-party notices shipped
 inside the Qt WebEngine runtime. None of those libraries, their resources, or
-the Chromium sandbox helper are copied into this repository's package: the
-archive contains only `dsh-qt-app`, `LICENSE`, and this file. A deployment that
-bundle Qt/WebEngine binaries must reproduce the notices of the Qt installation
-it copies from.
+the Chromium sandbox helper are copied into this repository's package. An
+archive built with no staged N-API addon contains only `bin/dsh-qt-app`,
+`LICENSE`, and this file. When a `qt-bridge.node` addon is staged, the archive
+additionally contains `dsh-qt-napi/prebuild/<triple>/qt-bridge.node`, whose
+pinned-commit notices are the addon section above. A deployment that bundles
+Qt/WebEngine binaries must reproduce the notices of the Qt installation it
+copies from.
 
 ## JavaScript runtime dependencies
 

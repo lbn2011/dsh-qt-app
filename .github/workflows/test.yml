@@ -394,8 +394,9 @@ jobs:
   # The mandatory Qt jobs above use the default Qt install, which does not ship
   # QtWebEngine. That means `#if DSH_QT_HAS_WEBENGINE` was never compiled, and
   # the embedded WebUI path (open → token → Chromium load → close) had no CI
-  # evidence. This job is that evidence: it requests the qtwebengine module,
-  # configures with -DDSH_QT_WEBENGINE=ON, asserts the compile-time flag really
+  # evidence. This job is intended to produce that evidence; it has not yet
+  # been executed on a hosted runner, so nothing here asserts a remote pass.
+  # It requests the qtwebengine module, configures with -DDSH_QT_WEBENGINE=ON, asserts the compile-time flag really
   # is 1, then runs the real Chromium e2e (tests/webengine-chromium.e2e.ts)
   # against a local HTTP server.
   #
