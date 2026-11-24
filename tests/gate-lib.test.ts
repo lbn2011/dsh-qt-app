@@ -50,13 +50,26 @@ test('candidateNames expands PATHEXT only for bare Windows commands', () => {
 })
 
 test('resolveExecutable searches PATH with an injectable filesystem', () => {
-  const files = new Set(['/opt/tools/pnpm', '/bin/node'])
+  // The fixture directories are real host paths and the resolver joins with the
+  // host's `path.join`, so the fixture has to be host-flavoured: the hard-coded
+  // `/opt/tools` turned into `\opt\tools\pnpm` on the Windows runner, never
+  // matched the injected set and the lookup returned null (T44-4). On Windows the
+  // command carries its own extension so PATHEXT expansion stays out of the way
+  // and only the PATH walk is under test.
+  const isWindowsHost = process.platform === 'win32'
+  const platform = isWindowsHost ? 'win32' : 'linux'
+  const separator = isWindowsHost ? ';' : ':'
+  const command = isWindowsHost ? 'pnpm.cmd' : 'pnpm'
+  const bin = join(tmpdir(), 't45-path-bin')
+  const tools = join(tmpdir(), 't45-path-tools')
+  const files = new Set([join(bin, 'node'), join(tools, command)])
   const isFile = (candidate: string) => files.has(candidate)
+
   assert.equal(
-    resolveExecutable('pnpm', { platform: 'linux', env: { PATH: '/bin:/opt/tools' }, isFile }),
-    '/opt/tools/pnpm',
+    resolveExecutable(command, { platform, env: { PATH: `${bin}${separator}${tools}` }, isFile }),
+    join(tools, command),
   )
-  assert.equal(resolveExecutable('missing', { platform: 'linux', env: { PATH: '/bin' }, isFile }), null)
+  assert.equal(resolveExecutable('missing', { platform, env: { PATH: bin }, isFile }), null)
 })
 
 test('signalExitCode follows the shell convention', () => {

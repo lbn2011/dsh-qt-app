@@ -18,7 +18,7 @@
  * the child backend never reads or writes the real installation's credentials.
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -47,6 +47,17 @@ if (requireRealHost && hostRoot === null) {
 const realHostSkip = hostRoot === null
   ? 'installed DSH host not prepared (set DSH_HOST_ROOT; the webui-real-host CI job does)'
   : false
+
+/**
+ * Listener ownership is measured through `/proc` (see the header comment), and
+ * this file has no equivalent for Windows or macOS. There, the three tests below
+ * skip with this reason instead of dying on `ENOENT: \proc`; the assertions are
+ * unchanged wherever `/proc` exists, and no platform gets a weaker assertion
+ * that pretends to have run.
+ */
+const procSkip = existsSync('/proc/net/tcp')
+  ? false
+  : 'listener ownership is read from /proc, which this platform does not provide'
 
 const isolatedHome = mkdtempSync(join(tmpdir(), 'dsh-qt-webui-'))
 process.env['DSH_HOME'] = isolatedHome
@@ -162,7 +173,7 @@ function service(config: ConstructorParameters<typeof WebuiService>[1] = {}): In
   return { service: created, statuses, logs }
 }
 
-test('default off: mounting the fallback binds nothing and spawns nothing', async () => {
+test('default off: mounting the fallback binds nothing and spawns nothing', { skip: procSkip }, async () => {
   const before = listeningPortsOf(process.pid)
   // Compare against the children that existed before the test: a CI runner may
   // have orchestration processes of its own, and an absolute [] assertion would
@@ -188,7 +199,7 @@ test('default off: mounting the fallback binds nothing and spawns nothing', asyn
   instance.dispose()
 })
 
-test('open() binds one loopback listener in this process; close() releases it', { skip: realHostSkip }, async () => {
+test('open() binds one loopback listener in this process; close() releases it', { skip: realHostSkip || procSkip }, async () => {
   const before = listeningPortsOf(process.pid)
   const { service: instance, statuses, logs } = service({ modePlan: ['in-process'] })
 
@@ -263,7 +274,7 @@ test('open() binds one loopback listener in this process; close() releases it', 
   }
 })
 
-test('the child fallback owns only its own process and leaves other listeners alone', { skip: realHostSkip }, async () => {
+test('the child fallback owns only its own process and leaves other listeners alone', { skip: realHostSkip || procSkip }, async () => {
   const external = await listenOnRandomPort()
   const before = listeningPortsOf(process.pid)
   const childrenBefore = childPidsOf(process.pid)

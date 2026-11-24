@@ -386,7 +386,13 @@ export class HostBridgeService extends Service {
         this.timedOut_ += 1
         reject(new HostBridgeError('timeout', `no reply to ${method} within ${timeoutMs} ms`))
       }, timeoutMs)
-      timer.unref()
+      // This timer is deliberately *not* unref'd: it is the only thing that
+      // settles the caller's promise. Unref'd, a caller waiting on a silent host
+      // is left with no active handle, and Node 22 drains the event loop with the
+      // request still pending (`Promise resolution is still pending but the event
+      // loop has already resolved`), which cancelled the rest of the suite. It is
+      // cleared on settle (see `settle_`) and on dispose, so a connected host does
+      // not keep the process alive after every request has been answered.
       this.pending_.set(id, { id, method, resolve, reject, timer })
       const transport = this.transport_
       const written =

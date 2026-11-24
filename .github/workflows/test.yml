@@ -221,12 +221,26 @@ jobs:
         env:
           DSH_HOST_ROOT: ${{ runner.temp }}/dsh-host/node_modules
         run: |
+          # pipefail keeps the suite's exit code: through `| tee` alone a failing
+          # test command exits 0 and the step would be a false green.
+          set -euo pipefail
           export PATH="$RUNNER_TEMP/dsh-host/node_modules/.bin:$PATH"
-          pnpm exec tsx --test --test-timeout=120000 tests/webui-default-off.test.ts | tee webui-real-host.log
+          pnpm exec tsx --test --test-timeout=120000 tests/webui-default-off.test.ts 2>&1 | tee webui-real-host.log
       - name: Fail if a host test was skipped
         run: |
-          # Node's summary line prints "ℹ skipped 0" when everything ran.
-          grep -q '^ℹ skipped 0$' webui-real-host.log
+          # Node prints its spec summary ("ℹ skipped 0") only when stdout is a TTY;
+          # through the tee pipe it prints the TAP summary ("# skipped 0"), so the
+          # old assertion could never pass. Accept either form, and require the
+          # real pass count as well so an empty or truncated log cannot read as
+          # success.
+          set -euo pipefail
+          for expected in 'pass 3' 'fail 0' 'skipped 0'; do
+            if ! grep -Eq "^(#|ℹ) ${expected}\$" webui-real-host.log; then
+              echo "::error::the real host suite did not report '${expected}'"
+              cat webui-real-host.log
+              exit 1
+            fi
+          done
       - name: Upload log
         if: always()
         uses: actions/upload-artifact@v4
@@ -482,10 +496,13 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          # QtWebEngineQuick links Qt6::WebChannelQuick, which lives in a
-          # separate module archive; installing only `qtwebengine` leaves the
-          # CMake package unresolvable (see T29-3).
-          modules: qtwebengine qtwebchannel
+          # QtWebEngineQuick's CMake package needs two sibling module archives,
+          # not one: Qt6::WebChannelQuick (qtwebchannel) and Qt6::Positioning
+          # (qtpositioning). aqt does not follow the addon's own dependencies, so
+          # `qtwebengine` alone (T29-3) and `qtwebengine qtwebchannel` (T44-3)
+          # both still left find_dependency(Positioning) failing, which made the
+          # optional component silently absent. All three modules must be named.
+          modules: qtwebengine qtwebchannel qtpositioning
           cache: true
 
       # QtWebEngine links a real Chromium: the runner needs the shared
@@ -498,6 +515,21 @@ jobs:
 
       - name: Build TypeScript
         run: pnpm build
+
+      # install-qt-action exits 0 even when a module archive is missing one of the
+      # CMake packages the configure step needs, and the product then degrades
+      # silently. Assert the three packages on disk first, so a missing module
+      # fails here with its path (T44-3).
+      - name: Assert the WebEngine CMake packages are installed
+        run: |
+          set -euo pipefail
+          for package in Qt6WebEngineQuick Qt6WebChannelQuick Qt6Positioning; do
+            if [ ! -d "$QT_ROOT_DIR/lib/cmake/$package" ]; then
+              echo "::error::$QT_ROOT_DIR/lib/cmake/$package is missing (install-qt modules: qtwebengine qtwebchannel qtpositioning)"
+              ls "$QT_ROOT_DIR/lib/cmake" | sort || true
+              exit 1
+            fi
+          done
 
       - name: Configure with WebEngine ON
         run: |

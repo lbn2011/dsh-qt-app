@@ -42,7 +42,10 @@ fi
 
 listing=$(mktemp)
 trap 'rm -f "$listing"' EXIT
-tar -tzf "$archive" >"$listing"
+# List by bare name from the archive's own directory: MSYS/GNU tar reads a
+# leading drive letter as a remote host, so an absolute `C:\...` path fails with
+# "tar (child): Cannot connect to C: resolve failed" on the Windows runner.
+(cd "$archive_dir" && tar -tzf "$archive_name" >"$listing")
 if [ ! -s "$listing" ]; then
   echo "check-archive: $archive has an empty listing" >&2
   exit 1
