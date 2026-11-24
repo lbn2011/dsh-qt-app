@@ -11,12 +11,22 @@ export function isCmdScript(file) {
   return /\.(cmd|bat)$/i.test(file);
 }
 
-/** Candidate file names for a bare command on Windows (PATHEXT expansion). */
+/**
+ * Candidate file names for a bare command on Windows (PATHEXT expansion).
+ *
+ * The bare name must not be tried first: npm's global `.bin` directories hold
+ * an extension-less POSIX shim next to the real `pnpm.cmd`. cmd.exe resolves
+ * `pnpm` through PATHEXT and runs the `.cmd`; CreateProcess cannot execute the
+ * shim at all. Trying the bare name first made the gate spawn that shim and
+ * fail with ENOENT on the Windows runner. We deliberately do not fall back to
+ * an extension-less file: failing resolution (exit 127) is more honest than a
+ * spawn that can never work.
+ */
 export function candidateNames(command, platform = process.platform, env = process.env) {
   if (platform !== WINDOWS) return [command];
   if (/[\\/]/.test(command) || path.win32.extname(command) !== '') return [command];
   const pathext = (env['PATHEXT'] || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
-  return [command, ...pathext.map((ext) => `${command}${ext.toLowerCase()}`)];
+  return pathext.map((ext) => `${command}${ext.toLowerCase()}`);
 }
 
 /**

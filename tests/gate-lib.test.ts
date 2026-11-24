@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 
 import {
   buildCmdCommandLine,
@@ -41,7 +43,7 @@ test('launcherFor sends .cmd through cmd.exe and rc.exe directly', () => {
 test('candidateNames expands PATHEXT only for bare Windows commands', () => {
   const env = { PATHEXT: '.COM;.EXE;.BAT;.CMD' }
   assert.deepEqual(candidateNames('pnpm', 'win32', env), [
-    'pnpm', 'pnpm.com', 'pnpm.exe', 'pnpm.bat', 'pnpm.cmd',
+    'pnpm.com', 'pnpm.exe', 'pnpm.bat', 'pnpm.cmd',
   ])
   assert.deepEqual(candidateNames('C:\\tools\\pnpm', 'win32', env), ['C:\\tools\\pnpm'])
   assert.deepEqual(candidateNames('pnpm', 'linux', env), ['pnpm'])
@@ -61,4 +63,36 @@ test('signalExitCode follows the shell convention', () => {
   assert.equal(signalExitCode('SIGTERM'), 143)
   assert.equal(signalExitCode('SIGINT'), 130)
   assert.equal(signalExitCode('SIGWEIRD'), 129)
+})
+
+test('Windows resolution prefers pnpm.cmd over the extensionless setup-pnpm shim', () => {
+  // Simulated on Linux with `/`; the layout and the win32 branch are the point.
+  // The real runner has the same two files under .../setup-pnpm/node_modules/.bin.
+  const dir = join(tmpdir(), 'setup-pnpm', 'node_modules', '.bin')
+  const shim = join(dir, 'pnpm')
+  const cmd = join(dir, 'pnpm.cmd')
+  const files = new Set([shim, cmd, join(dir, 'pnpm.ps1')])
+  const isFile = (candidate: string) => files.has(candidate)
+  const env = {
+    PATH: dir,
+    PATHEXT: '.COM;.EXE;.BAT;.CMD',
+    ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+  }
+
+  const resolved = resolveExecutable('pnpm', { platform: 'win32', env, isFile })
+  assert.equal(resolved, cmd, 'must not select the extensionless Unix shim')
+
+  const launch = launcherFor(resolved!, ['build', 'a b'], { platform: 'win32', env })
+  assert.equal(launch.file, env.ComSpec)
+  assert.deepEqual(launch.args.slice(0, 3), ['/d', '/s', '/c'])
+  assert.equal(launch.args[3], `""${cmd}" "build" "a b""`)
+  assert.equal(launch.options.windowsVerbatimArguments, true)
+})
+
+test('Windows resolution returns null when only an extensionless shim exists', () => {
+  const dir = join(tmpdir(), 'setup-pnpm', 'node_modules', '.bin')
+  const files = new Set([join(dir, 'pnpm')])
+  const isFile = (candidate: string) => files.has(candidate)
+  const env = { PATH: dir, PATHEXT: '.COM;.EXE;.BAT;.CMD' }
+  assert.equal(resolveExecutable('pnpm', { platform: 'win32', env, isFile }), null)
 })
