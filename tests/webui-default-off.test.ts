@@ -27,8 +27,26 @@ import { after, test } from 'node:test'
 
 import { Context } from '@deepseek-ai/cordis'
 
-import { SHARED_SESSION_NOTICE, WebuiService } from '../src/webui/index.js'
+import { defaultHostRoot, SHARED_SESSION_NOTICE, WebuiService } from '../src/webui/index.js'
 import type { WebuiStatus } from '../src/webui/index.js'
+
+/**
+ * The in-process backend needs an installed official DSH tree. A normal unit
+ * run must not require one (CI's typescript job has none), so the two host
+ * tests skip unless it is prepared explicitly. The dedicated `webui-real-host`
+ * CI job sets `DSH_HOST_ROOT` *and* `DSH_REQUIRE_REAL_HOST=1`, which turns a
+ * missing host into a failure instead of a skip.
+ */
+const hostRoot = defaultHostRoot()
+const requireRealHost = process.env['DSH_REQUIRE_REAL_HOST'] === '1'
+if (requireRealHost && hostRoot === null) {
+  throw new Error(
+    'DSH_REQUIRE_REAL_HOST=1 but no installed DSH tree was found; set DSH_HOST_ROOT to its node_modules',
+  )
+}
+const realHostSkip = hostRoot === null
+  ? 'installed DSH host not prepared (set DSH_HOST_ROOT; the webui-real-host CI job does)'
+  : false
 
 const isolatedHome = mkdtempSync(join(tmpdir(), 'dsh-qt-webui-'))
 process.env['DSH_HOME'] = isolatedHome
@@ -146,6 +164,10 @@ function service(config: ConstructorParameters<typeof WebuiService>[1] = {}): In
 
 test('default off: mounting the fallback binds nothing and spawns nothing', async () => {
   const before = listeningPortsOf(process.pid)
+  // Compare against the children that existed before the test: a CI runner may
+  // have orchestration processes of its own, and an absolute [] assertion would
+  // misreport those as something the fallback spawned.
+  const childrenBefore = childPidsOf(process.pid)
   const { service: instance, statuses } = service()
 
   assert.equal(instance.status.state, 'Idle')
@@ -157,127 +179,148 @@ test('default off: mounting the fallback binds nothing and spawns nothing', asyn
   await new Promise((resolve) => setTimeout(resolve, 300))
 
   assert.deepEqual(listeningPortsOf(process.pid), before, 'mounting must not bind a port')
-  assert.deepEqual(childPidsOf(process.pid), [], 'mounting must not spawn a host process')
+  assert.deepEqual(
+    childPidsOf(process.pid),
+    childrenBefore,
+    'mounting must not spawn a host process',
+  )
   assert.deepEqual(statuses, [], 'no state change happens before webui.open')
   instance.dispose()
 })
 
-test('open() binds one loopback listener in this process; close() releases it', async () => {
+test('open() binds one loopback listener in this process; close() releases it', { skip: realHostSkip }, async () => {
   const before = listeningPortsOf(process.pid)
   const { service: instance, statuses, logs } = service({ modePlan: ['in-process'] })
 
-  const result = await instance.open({ slotId: 'panel:webui' })
+  try {
+    const result = await instance.open({ slotId: 'panel:webui' })
 
-  assert.equal(result.mode, 'in-process')
-  assert.equal(result.sharedSession, true, 'the same process shares the session tree')
-  assert.match(result.maskedUrl, /^http:\/\/127\.0\.0\.1:\d+\/\?token=\*\*\*$/u)
-  assert.equal(result.notice, null)
-  const origin = new URL(result.maskedUrl)
-  const port = Number(origin.port)
+    assert.equal(result.mode, 'in-process')
+    assert.equal(result.sharedSession, true, 'the same process shares the session tree')
+    assert.match(result.maskedUrl, /^http:\/\/127\.0\.0\.1:\d+\/\?token=\*\*\*$/u)
+    assert.equal(result.notice, null)
+    const origin = new URL(result.maskedUrl)
+    const port = Number(origin.port)
 
-  const after = listeningPortsOf(process.pid)
-  const added = after.filter((candidate) => !before.includes(candidate))
-  assert.deepEqual(added, [port], 'exactly one new listener, owned by this process')
+    const after = listeningPortsOf(process.pid)
+    const added = after.filter((candidate) => !before.includes(candidate))
+    assert.deepEqual(added, [port], 'exactly one new listener, owned by this process')
 
-  // Unauthenticated access is refused with the official challenge.
-  const challenge = await fetch(`${origin.origin}/`, { redirect: 'manual' })
-  assert.equal(challenge.status, 401)
-  assert.match(await challenge.text(), /dsh web authentication required/u)
+    // Unauthenticated access is refused with the official challenge.
+    const challenge = await fetch(`${origin.origin}/`, { redirect: 'manual' })
+    assert.equal(challenge.status, 401)
+    assert.match(await challenge.text(), /dsh web authentication required/u)
 
-  // The /api fence rejects an untrusted request before any route runs.
-  const api = await fetch(`${origin.origin}/api/remote.mux`, { redirect: 'manual' })
-  assert.equal(api.status, 401)
-  const crossSite = await fetch(`${origin.origin}/api/remote.mux`, {
-    headers: { 'sec-fetch-site': 'cross-site' },
-    redirect: 'manual',
-  })
-  assert.equal(crossSite.status, 403)
+    // The /api fence rejects an untrusted request before any route runs.
+    const api = await fetch(`${origin.origin}/api/remote.mux`, { redirect: 'manual' })
+    assert.equal(api.status, 401)
+    const crossSite = await fetch(`${origin.origin}/api/remote.mux`, {
+      headers: { 'sec-fetch-site': 'cross-site' },
+      redirect: 'manual',
+    })
+    assert.equal(crossSite.status, 403)
 
-  // The one-shot token URL authenticates exactly like `dsh web` does.
-  const tokenUrl = instance.takeAuthenticatedUrl()
-  assert.ok(tokenUrl !== null)
-  assert.equal(instance.takeAuthenticatedUrl(), null, 'the token is handed out once')
-  const exchange = await fetch(tokenUrl, { redirect: 'manual' })
-  assert.equal(exchange.status, 303)
-  const cookie = exchange.headers.get('set-cookie')?.split(';')[0] ?? ''
-  assert.ok(cookie.startsWith('dsh-auth-'), 'the official session cookie is issued')
-  assert.equal(exchange.headers.get('referrer-policy'), 'no-referrer')
-  assert.equal(exchange.headers.get('cache-control'), 'no-store')
+    // The one-shot token URL authenticates exactly like `dsh web` does.
+    const tokenUrl = instance.takeAuthenticatedUrl()
+    assert.ok(tokenUrl !== null)
+    assert.equal(instance.takeAuthenticatedUrl(), null, 'the token is handed out once')
+    const exchange = await fetch(tokenUrl, { redirect: 'manual' })
+    assert.equal(exchange.status, 303)
+    const cookie = exchange.headers.get('set-cookie')?.split(';')[0] ?? ''
+    assert.ok(cookie.startsWith('dsh-auth-'), 'the official session cookie is issued')
+    assert.equal(exchange.headers.get('referrer-policy'), 'no-referrer')
+    assert.equal(exchange.headers.get('cache-control'), 'no-store')
 
-  const page = await fetch(`${origin.origin}/`, { headers: { cookie }, redirect: 'manual' })
-  assert.equal(page.status, 200)
-  assert.match(await page.text(), /<base href="\.\/">/u)
+    const page = await fetch(`${origin.origin}/`, { headers: { cookie }, redirect: 'manual' })
+    assert.equal(page.status, 200)
+    assert.match(await page.text(), /<base href="\.\/">/u)
 
-  // Nothing the UI can read carries the raw token.
-  const rawToken = new URL(tokenUrl).searchParams.get('token')
-  assert.ok(rawToken !== null && rawToken.length >= 32)
-  assert.equal(JSON.stringify(instance.status).includes(rawToken), false)
-  assert.equal(JSON.stringify(statuses).includes(rawToken), false)
-  assert.equal(logs.join('\n').includes(rawToken), false)
+    // Nothing the UI can read carries the raw token.
+    const rawToken = new URL(tokenUrl).searchParams.get('token')
+    assert.ok(rawToken !== null && rawToken.length >= 32)
+    assert.equal(JSON.stringify(instance.status).includes(rawToken), false)
+    assert.equal(JSON.stringify(statuses).includes(rawToken), false)
+    assert.equal(logs.join('\n').includes(rawToken), false)
 
-  await instance.close()
-  assert.equal(instance.status.state, 'Idle')
-  assert.deepEqual(listeningPortsOf(process.pid), before, 'close() releases the port')
-  await assert.rejects(fetch(`${origin.origin}/`, { signal: AbortSignal.timeout(1_000) }))
+    await instance.close()
+    assert.equal(instance.status.state, 'Idle')
+    assert.deepEqual(listeningPortsOf(process.pid), before, 'close() releases the port')
+    await assert.rejects(fetch(`${origin.origin}/`, { signal: AbortSignal.timeout(1_000) }))
 
-  // A second open is a fresh attempt, not a stale handle.
-  const reopened = await instance.open()
-  assert.equal(reopened.reused, false)
-  assert.deepEqual(
-    listeningPortsOf(process.pid).filter((candidate) => !before.includes(candidate)),
-    [Number(new URL(reopened.maskedUrl).port)],
-  )
-  await instance.close()
-  instance.dispose()
+    // A second open is a fresh attempt, not a stale handle.
+    const reopened = await instance.open()
+    assert.equal(reopened.reused, false)
+    assert.deepEqual(
+      listeningPortsOf(process.pid).filter((candidate) => !before.includes(candidate)),
+      [Number(new URL(reopened.maskedUrl).port)],
+    )
+    await instance.close()
+  } finally {
+    // A thrown assertion must not leave a listener or an open handle behind;
+    // that is what turned the first CI failure into a 20 minute job timeout.
+    await instance.close().catch(() => undefined)
+    instance.dispose()
+  }
 })
 
-test('the child fallback owns only its own process and leaves other listeners alone', async () => {
+test('the child fallback owns only its own process and leaves other listeners alone', { skip: realHostSkip }, async () => {
   const external = await listenOnRandomPort()
   const before = listeningPortsOf(process.pid)
+  const childrenBefore = childPidsOf(process.pid)
   const { service: instance } = service({ modePlan: ['child'] })
 
-  const result = await instance.open()
+  try {
+    const result = await instance.open()
 
-  assert.equal(result.mode, 'child')
-  assert.equal(result.sharedSession, false, 'a second process cannot share the session tree')
-  assert.equal(result.notice, SHARED_SESSION_NOTICE)
-  assert.equal(instance.status.notice, SHARED_SESSION_NOTICE)
-  assert.match(result.maskedUrl, /^http:\/\/127\.0\.0\.1:\d+\/\?token=\*\*\*$/u)
-  const childOrigin = new URL(result.maskedUrl)
-  const childPort = Number(childOrigin.port)
+    assert.equal(result.mode, 'child')
+    assert.equal(result.sharedSession, false, 'a second process cannot share the session tree')
+    assert.equal(result.notice, SHARED_SESSION_NOTICE)
+    assert.equal(instance.status.notice, SHARED_SESSION_NOTICE)
+    assert.match(result.maskedUrl, /^http:\/\/127\.0\.0\.1:\d+\/\?token=\*\*\*$/u)
+    const childOrigin = new URL(result.maskedUrl)
+    const childPort = Number(childOrigin.port)
 
-  // The listener belongs to the child, not to this process.
-  assert.equal(listeningPortsOf(process.pid).includes(childPort), false)
-  const children = childPidsOf(process.pid)
-  assert.equal(children.length, 1, 'exactly one host child process')
-  const childPid = children[0]
-  assert.ok(childPid !== undefined)
-  assert.deepEqual(listeningPortsOf(childPid), [childPort])
-  assert.deepEqual(listeningPortsOf(process.pid), before, 'this process still binds nothing')
+    // The listener belongs to the child, not to this process.
+    assert.equal(listeningPortsOf(process.pid).includes(childPort), false)
+    const children = childPidsOf(process.pid).filter((pid) => !childrenBefore.includes(pid))
+    assert.equal(children.length, 1, 'exactly one new host child process')
+    const childPid = children[0]
+    assert.ok(childPid !== undefined)
+    assert.deepEqual(listeningPortsOf(childPid), [childPort])
+    assert.deepEqual(listeningPortsOf(process.pid), before, 'this process still binds nothing')
 
-  // The child inherits the isolated DSH_HOME, so it cannot touch real credentials.
-  const environ = readFileSync(`/proc/${String(childPid)}/environ`, 'utf8').split('\0')
-  assert.ok(
+    // The child inherits the isolated DSH_HOME, so it cannot touch real credentials.
+    const environ = readFileSync(`/proc/${String(childPid)}/environ`, 'utf8').split('\0')
+    assert.ok(
     environ.includes(`DSH_HOME=${isolatedHome}`),
     'the fallback child must run against the isolated home',
-  )
+    )
 
-  // Kill the child behind the service's back: it must report the failure, not
-  // scan ports, and it must not touch the unrelated listener.
-  process.kill(childPid, 'SIGKILL')
-  await waitFor(() => instance.status.state === 'Failed', 15_000, 'Failed state after a dead child')
-  assert.equal(instance.status.reason, 'crashed')
-  assert.equal(instance.status.maskedUrl, null)
-  assert.equal(instance.takeAuthenticatedUrl(), null)
+    // Kill the child behind the service's back: it must report the failure, not
+    // scan ports, and it must not touch the unrelated listener.
+    process.kill(childPid, 'SIGKILL')
+    await waitFor(() => instance.status.state === 'Failed', 15_000, 'Failed state after a dead child')
+    assert.equal(instance.status.reason, 'crashed')
+    assert.equal(instance.status.maskedUrl, null)
+    assert.equal(instance.takeAuthenticatedUrl(), null)
 
-  assert.equal(listeningPortsOf(process.pid).includes(external.port), true)
-  const stillThere = await fetch(`http://127.0.0.1:${String(external.port)}/`)
-  assert.equal(await stillThere.text(), 'external')
-  await assert.rejects(fetch(`${childOrigin.origin}/`, { signal: AbortSignal.timeout(1_000) }))
-  await waitFor(() => childPidsOf(process.pid).length === 0, 5_000, 'child process to be gone')
+    assert.equal(listeningPortsOf(process.pid).includes(external.port), true)
+    const stillThere = await fetch(`http://127.0.0.1:${String(external.port)}/`)
+    assert.equal(await stillThere.text(), 'external')
+    await assert.rejects(fetch(`${childOrigin.origin}/`, { signal: AbortSignal.timeout(1_000) }))
+    await waitFor(
+    () => !childPidsOf(process.pid).includes(childPid),
+    5_000,
+    'host child process to be gone',
+    )
 
-  await instance.close()
-  assert.equal(instance.status.state, 'Idle')
-  await external.close()
-  instance.dispose()
+    await instance.close()
+    assert.equal(instance.status.state, 'Idle')
+  } finally {
+    // close() reaps the host child; dispose unbinds listeners even after a
+    // failed assertion in the middle of the flow.
+    await instance.close().catch(() => undefined)
+    instance.dispose()
+    await external.close()
+  }
 })

@@ -45,7 +45,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --test --test-timeout=120000 tests/*.test.ts",
     "clean": "node -e \"import('node:fs').then(({rmSync})=>{for(const d of ['lib','dist','build']) rmSync(d,{recursive:true,force:true})})\"",
     "cmake:configure": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release",
     "cmake:build": "cmake --build build --config Release",

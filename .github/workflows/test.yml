@@ -188,6 +188,50 @@ jobs:
         run: node scripts/gate.mjs -- pnpm test
 
   # ---------------------------------------------------------------------------
+  # webui real host: the two host-dependent WebUI tests need an installed DSH
+  # tree, which the unit job deliberately does not provide (it skips them and
+  # the skip is counted, not silently ignored). This gate prepares the pinned
+  # release and sets DSH_REQUIRE_REAL_HOST=1, so a missing host fails instead of
+  # skipping. The test itself still isolates DSH_HOME.
+  # ---------------------------------------------------------------------------
+  webui-real-host:
+    name: webui real host (dsh ${{ env.DSH_HOST_VERSION }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      DSH_HOST_VERSION: 0.2.2-rc.1
+      DSH_REQUIRE_REAL_HOST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@v4
+      - run: pnpm install --frozen-lockfile
+      - name: Install the pinned official DSH host
+        run: |
+          npm install --prefix "$RUNNER_TEMP/dsh-host" "@deepseek-ai/dsh@$DSH_HOST_VERSION"
+          "$RUNNER_TEMP/dsh-host/node_modules/.bin/dsh" --version
+      - name: Real host WebUI tests
+        env:
+          DSH_HOST_ROOT: ${{ runner.temp }}/dsh-host/node_modules
+        run: |
+          export PATH="$RUNNER_TEMP/dsh-host/node_modules/.bin:$PATH"
+          pnpm exec tsx --test --test-timeout=120000 tests/webui-default-off.test.ts | tee webui-real-host.log
+      - name: Fail if a host test was skipped
+        run: |
+          # Node's summary line prints "ℹ skipped 0" when everything ran.
+          grep -q '^ℹ skipped 0$' webui-real-host.log
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-real-host-log
+          path: webui-real-host.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # napi integration: run the TypeScript suite with a real addon on disk.
   #
   # The unit suite is hermetic (it must pass on a machine without the addon), so
@@ -433,7 +477,10 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebengine
+          # QtWebEngineQuick links Qt6::WebChannelQuick, which lives in a
+          # separate module archive; installing only `qtwebengine` leaves the
+          # CMake package unresolvable (see T29-3).
+          modules: qtwebengine qtwebchannel
           cache: true
 
       # QtWebEngine links a real Chromium: the runner needs the shared
@@ -555,18 +602,15 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          set -euo pipefail
-          archive=$(ls dist/package/*.tar.gz | head -1)
-          (cd dist/package && sha256sum -c "$(basename "$archive").sha256")
-          root=$(tar -tzf "$archive" | head -1 | cut -d/ -f1)
-          for required in LICENSE THIRD-PARTY-NOTICES.md; do
-            if ! tar -tzf "$archive" | grep -qx "$root/$required"; then
-              echo "::error::$archive is missing $required at its root"
-              tar -tzf "$archive" | head -20
-              exit 1
-            fi
-          done
-          echo "archive root $root carries LICENSE and THIRD-PARTY-NOTICES.md"
+          # The check is also exercised locally by tests/packaging.test.ts.
+          # It consumes the complete tar listing and preserves tar's exit code.
+          mapfile -t archives < <(find dist/package -maxdepth 1 -name '*.tar.gz' -print)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .tar.gz in dist/package, found ${#archives[@]}"
+            ls -l dist/package
+            exit 1
+          fi
+          bash scripts/check-archive.sh "${archives[0]}"
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4

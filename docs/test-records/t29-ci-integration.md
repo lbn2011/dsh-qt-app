@@ -124,6 +124,13 @@ missing remote jobs.
   Windows Qt job failed. The overall run status therefore cannot be used as a green signal. Cause not
   established within this task; when the repair round re-runs CI, record the run-level conclusion explicitly
   and investigate any cancellation that is not the known macOS pool gap.
+- Follow-up evidence (t36, `docs/test-records/t36-repair-round-2.md` §1/T29-6): run API reports
+  `run_attempt=1`, `created_at 13:58:12Z`, `updated_at 14:01:34Z`; `qt build (macos-14)` was cancelled
+  14:00:06–14:00:07Z after 1 s with no step, while `qt build (ubuntu)` succeeded 14:00:08–14:01:33Z and
+  `qt build (windows)` failed 14:00:08–14:00:44Z. No second run exists for the same SHA and
+  `dev/phase3-i9` still points at `2cc0807`, so concurrency `cancel-in-progress` did not overwrite this
+  run. The run-level `cancelled` actor is not exposed by the GitHub API — recorded as **unknown**, to be
+  re-checked after the repair SHA is pushed.
 
 ## 4. What passed
 

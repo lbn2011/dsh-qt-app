@@ -44,7 +44,13 @@ if(DSH_QT_WEBENGINE)
     set(DSH_QT_HAS_WEBENGINE 1)
     message(STATUS "dsh-qt-app: Qt WebEngine embedding enabled")
   else()
+    # State what is missing, where CMake looked and what to install: a bare
+    # "not installed" line hid a missing sibling module in CI for a full run.
     message(STATUS "dsh-qt-app: DSH_QT_WEBENGINE=ON but Qt6::WebEngineQuick is not installed — embedding disabled")
+    message(STATUS "dsh-qt-app:   Qt6_DIR=${Qt6_DIR}")
+    if(NOT TARGET Qt6::WebChannelQuick)
+      message(STATUS "dsh-qt-app:   Qt6::WebChannelQuick is missing; WebEngineQuick links it. Install the qtwebchannel module as well as qtwebengine.")
+    endif()
   endif()
 else()
   message(STATUS "dsh-qt-app: Qt WebEngine embedding disabled (DSH_QT_WEBENGINE=OFF)")

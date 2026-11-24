@@ -13,6 +13,10 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import "."
 
+// Nested components (the tree Loader's GeneratedNode children) reference this
+// component's ids; binding them explicitly is what qmllint requires.
+pragma ComponentBehavior: Bound
+
 Item {
     id: root
 
@@ -76,7 +80,7 @@ Item {
 
             objectName: "generatedTreeLoader"
             Layout.fillWidth: true
-            Layout.preferredHeight: item !== null ? item.implicitHeight : 0
+            Layout.preferredHeight: treeLoader.implicitHeight
             visible: root.showsNative
             source: root.showsNative ? "GeneratedNode.qml" : ""
             // The action signal is wired once per loaded item. The Loader destroys
@@ -93,9 +97,13 @@ Item {
                     return
                 if (wiredItem !== treeLoader.item) {
                     wiredItem = treeLoader.item
+                    // Loader.item is statically QObject; the dynamically loaded
+                    // GeneratedNode is the type that declares this signal.
+                    // qmllint disable missing-property
                     treeLoader.item.action.connect(function (event, payload) {
                         root.action(event, payload)
                     })
+                    // qmllint enable missing-property
                 }
                 treeLoader.item.node = root.tree
                 treeLoader.item.theme = root.theme

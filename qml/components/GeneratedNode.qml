@@ -16,6 +16,10 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import "."
 
+// Nested Repeater/RadioButton delegates reference this component's `root` id;
+// `ComponentBehavior: Bound` keeps those ids resolvable for qmllint and at runtime.
+pragma ComponentBehavior: Bound
+
 Item {
     id: root
 
@@ -221,7 +225,7 @@ Item {
 
                     objectName: "generatedChild" + index
                     Layout.fillWidth: true
-                    Layout.preferredHeight: item !== null ? item.implicitHeight : 0
+                    Layout.preferredHeight: childLoader.implicitHeight
                     source: (root.kind === "container" && root.node.direction === "row")
                         ? "" : "GeneratedNode.qml"
 
@@ -262,7 +266,7 @@ Item {
 
                     objectName: "generatedRowChild" + index
                     Layout.fillWidth: true
-                    Layout.preferredHeight: item !== null ? item.implicitHeight : 0
+                    Layout.preferredHeight: rowChild.implicitHeight
                     source: "GeneratedNode.qml"
 
                     onLoaded: rowChild.applyModel()

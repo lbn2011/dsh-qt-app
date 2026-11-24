@@ -75,15 +75,28 @@ DSH profile (Node)
 CI 锁：`.github/workflows/{build,test}.yml` 用 `NAPI_SHA` checkout addon，并断言
 `git rev-parse HEAD` 与 `package.json` 的 `dshQtNapi.commit` 等于该 SHA；
 typecheck/test/build/package/CMake configure/build 步骤经 `scripts/gate.mjs`
-运行（退出码保真，stderr 记录 `[gate] exit=…`）；`tests/gate.test.ts` 覆盖保真与缺命令负例。
+运行（退出码保真，stderr 记录 `[gate] exit=…`；Windows 的 `.cmd` 经
+`scripts/gate-lib.mjs` 用 `%ComSpec%` 启动，不做无条件 `shell:true`）；
+`tests/gate.test.ts` / `tests/gate-lib.test.ts` 覆盖透传、参数边界、ENOENT 127、
+信号 128+n、PATHEXT 解析与引用。
+`webui-real-host` job 安装固定 `@deepseek-ai/dsh@0.2.2-rc.1` 并设
+`DSH_HOST_ROOT`/`DSH_REQUIRE_REAL_HOST=1` 跑宿主相关 WebUI 测试；单元 job 无宿主时
+显式 skip，不伪装通过。归档由 `scripts/check-archive.sh` 全量消费 tar 输出并校验
+`.sha256` + 根目录 `LICENSE`/`THIRD-PARTY-NOTICES.md`（`tests/archive.test.ts` 含缺件/
+坏哈希负例）。Qt 6.7.3 的 `qmllint` 对任一 warning 返回 255，`qml/` 已修到 0 warning。
 `THIRD-PARTY-NOTICES.md` 随 `cmake --install`/CPack 安装到包根；`tests/packaging.test.ts`
 既实测临时 install prefix，也真实执行 `cpack -G TGZ`、校验同名 `.sha256`、解归档断言根目录
 含 `LICENSE`/`THIRD-PARTY-NOTICES.md`/`bin/dsh-qt-app`，并覆盖缺 notices、坏校验和两个负例。
-CI 另有 `qt-webengine` job（`modules: qtwebengine`、offscreen、`--no-sandbox --disable-gpu`）
-编译期断言 `DSH_QT_HAS_WEBENGINE=1` 并在该构建下跑真实 Chromium 加载/关闭 e2e。
+CI 另有 `qt-webengine` job（`modules: qtwebengine qtwebchannel`、offscreen、
+`--no-sandbox --disable-gpu`）编译期断言 `DSH_QT_HAS_WEBENGINE=1` 并在该构建下跑
+真实 Chromium 加载/关闭 e2e；WebEngineQuick 链接的 `Qt6::WebChannelQuick` 在独立的
+`qtwebchannel` 模块里，只装 `qtwebengine` 会让 CMake 包不可解析。
 
 ## 4. 缺口（如实报告，不在本轮声称完成）
 
+- **远程 CI 仍以 t29 的失败为基线**：t36 的修复（归档脚本、gate `.cmd`、qtwebchannel、
+  Qt 6.7.3 lint、宿主测试门）只在本机验证，尚未推送触发远程 CI；`qt-webengine` 的
+  qtwebchannel 组合、Windows gate 真实执行、macOS 取消原因都要等审查后重跑确认。
 - **Qt WebEngine 嵌入加载与外部浏览器仅 Linux 本机验证**（嵌入用 offscreen，外部浏览器用 Xvfb/xcb）：t34 在本机 Qt 6.8.2 +
   `qt6-webengine-dev` 上构建 `build-webengine`（`DSH_QT_HAS_WEBENGINE=1`），真实 Chromium
   加载标记页、标题命中、maskedUrl 只含 `token=***`、关闭后 about:blank，2/2 通过

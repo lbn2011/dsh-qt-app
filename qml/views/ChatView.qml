@@ -48,7 +48,7 @@ Rectangle {
      * `null` is a supported state: a QML preview or qmltestrunner has no host,
      * so the section stays hidden rather than showing an empty frame.
      */
-    property ListModel toolModel: null
+    property var toolModel: null
 
     // Re-exported header state so main.qml wires a single source of truth.
     property alias title: sessionHeader.title
@@ -317,7 +317,7 @@ Rectangle {
             objectName: "toolCallList"
             anchors.fill: parent
             clip: true
-            spacing: chatView.theme.spacingSmall
+            spacing: chatView.theme.spacing
             boundsBehavior: Flickable.StopAtBounds
             model: chatView.toolModel
             ScrollBar.vertical: ScrollBar {
@@ -326,6 +326,10 @@ Rectangle {
             }
 
             delegate: ToolCallRow {
+                // ListView injects `index` as a required property; declaring it here
+                // is the documented form and lets qmllint resolve the access.
+                required property int index
+
                 width: toolList.width
                 rowModel: chatView.toolModel
                 rowIndex: index

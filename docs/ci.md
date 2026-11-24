@@ -5,7 +5,7 @@ Two workflows live in `.github/workflows/`:
 | File | Trigger | Jobs |
 | --- | --- | --- |
 | `build.yml` | `push` (`main`, `dev/**`), `pull_request`, `workflow_dispatch` | `napi` (ubuntu-22.04 / windows-2022): build the cmark-gfm addon → upload `prebuild/`; `qt-build` (ubuntu-22.04 / windows-2022 / macos-14): `pnpm build` → Qt 6.7.3 → CMake configure/build → `pnpm package` → upload executable + package |
-| `test.yml` | same | `napi` (addon build + verify + unit tests); `typescript` (matrix): `pnpm typecheck`, `pnpm test`; `napi-integration`: full suite with a real addon on disk; `qml-lint`: `qmllint` over `qml/`; `qml-tests`: `qmltestrunner` over `tests/qml/`; `packaging` (ubuntu-22.04 / windows-2022): `pnpm package` |
+| `test.yml` | same | `napi` (addon build + verify + unit tests); `typescript` (matrix): `pnpm typecheck`, `pnpm test`; `webui-real-host`: host-dependent WebUI tests against a pinned official DSH; `napi-integration`: full suite with a real addon on disk; `qml-lint`: `qmllint` over `qml/`; `qml-tests`: `qmltestrunner` over `tests/qml/`; `qt-webengine`: configure with `-DDSH_QT_WEBENGINE=ON`, assert `DSH_QT_HAS_WEBENGINE=1`, run the real Chromium e2e; `packaging` (ubuntu-22.04 / windows-2022): `pnpm package` + archive content check |
 
 ## Repository root assumption
 
@@ -101,10 +101,14 @@ Consequences for authors:
   reach for `ctx` must keep working when it is undefined — that is why
   `qml/components/Theme.qml` falls back to its own palette and why
   `qml/views/settings/*` accept a `bridgeOverride`.
-- The `qmllint` job treats warnings as failures. Context properties such as `ctx`
-  are invisible to qmllint, so the guarded access is wrapped in a scoped
-  `// qmllint disable unqualified` / `enable unqualified` pair; do not widen that
-  to the whole file.
+- The `qmllint` job treats warnings as failures. This is not just a policy: Qt
+  6.7.3 (the pinned CI version) exits 255 for **any** warning, while 6.8 returns 0,
+  so a warning-free tree is required for the job to pass. Fix the warning at its
+  source; context properties such as `ctx` that qmllint cannot resolve may use a
+  scoped `// qmllint disable unqualified` / `enable unqualified` pair, and a
+  dynamically loaded object whose static type is `QObject` may use a scoped
+  `missing-property` suppression with the reason written down. Never disable a
+  whole file or swallow the exit code.
 
 `cmake --build build --target qml-tests` runs the same suites locally when a Qt
 toolchain is present (the target is skipped with a status message otherwise).
@@ -120,7 +124,12 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
 
 `package-app` runs the `install` target and then CPack. Artifacts are written to
 `dist/package/` (`CPACK_OUTPUT_FILE_PREFIX`), which is git-ignored, and are named
-`dsh-qt-app-<version>-<system>-<processor>`. Generators per platform:
+`dsh-qt-app-<version>-<system>-<processor>`. CPack also writes
+`<archive>.sha256`. The Linux CI leg verifies the archive with
+`scripts/check-archive.sh`: it checks the checksum, materialises the **complete**
+tar listing (never `tar | head`, which closes the pipe and makes tar fail under
+`pipefail`), and requires `LICENSE` and `THIRD-PARTY-NOTICES.md` at the archive
+root. Generators per platform:
 
 | Platform | Generators |
 | --- | --- |
@@ -144,19 +153,34 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
 before step 1 with "The configuration `macos-14-arm64-us-default` is not
 supported", and `macos-13` queues indefinitely. The matrix keeps `macos-14` so the
 cancellation is explicit and visible rather than a silently missing platform.
-macOS is therefore unvalidated end to end, including the `.dmg` generator.
+macOS is therefore unvalidated end to end, including the `.dmg` generator. A
+run whose macOS leg is cancelled can also surface as run-level `cancelled`; the
+GitHub API does not name the actor, so record it as unexplained until a re-run
+confirms the non-macOS jobs' conclusions separately.
 
 **Windows addon builds are unverified locally.** The addon was developed and
 built on Linux; the Windows leg of the `napi` job is its first real MSVC compile.
 
+**Qt WebEngine needs two module archives.** `Qt6WebEngineQuick` links
+`Qt6::WebChannelQuick`, which ships in the separate `qtwebchannel` module.
+`install-qt-action` with only `modules: qtwebengine` installs an unresolvable
+CMake package; the `qt-webengine` job requests both, and CMake prints the missing
+sibling when it is absent.
+
+**The host-dependent WebUI tests have their own gate.** The unit job skips them
+when no official DSH tree is installed (the skip is counted, not hidden). The
+`webui-real-host` job installs `@deepseek-ai/dsh@0.2.2-rc.1`, sets
+`DSH_HOST_ROOT` and `DSH_REQUIRE_REAL_HOST=1` (a skip would then fail), and runs
+`tests/webui-default-off.test.ts`, which still isolates `DSH_HOME`.
+
 ## Local limits
 
-Qt/C++ compilation is deliberately excluded from the development machine: there
-is no `qmake6`, `qmllint`, `qmltestrunner` or `qmlformat`, so `native/main.cpp`
-and every `.qml` file are only statically reviewed locally (brace/paren balance,
-import and symbol checks by inspection, `cmake` configure against a stub Qt
-package for `CMakeLists.txt`). CI is the first real compile, so treat a local
-"looks fine" as a hypothesis, not a result.
+Qt/C++ compilation used to be excluded from the development machine. When a Qt
+toolchain is present, use it: Qt 6.7.3 was installed under
+`/data/qt-phase3/qt673` specifically to match CI's `qmllint` behaviour (warnings
+exit 255), and Qt 6.8 system packages build the OFF/ON binaries. A local pass is
+still not a remote CI result: Windows `.cmd` execution, the qtwebchannel module
+combination, and macOS remain remote-only.
 
 Local verification is limited to:
 
