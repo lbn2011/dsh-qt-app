@@ -18,10 +18,12 @@
  *      `url=about:blank`, `visible=0`) before the process exits 0;
  *   4. no frame or line contains the raw token.
  *
- * The second test covers T28-3: the external-browser fallback records the
- * exact URL it would hand to the desktop (`DSH_QT_OPEN_URL_LOG`) and this test
- * performs a real GET against it, while the same server rejects a missing or
- * wrong token. The hook only records; it never stands in for a load.
+ * The second test covers T28-3 without recording the URL: an isolated
+ * HOME/XDG profile registers a throw-away desktop entry, QDesktopServices
+ * really dispatches through xdg-open, and a real Chromium (headless, driven by
+ * `tests/fixtures/controlled-browser.sh`) navigates the authenticated page.
+ * The post-JavaScript DOM is the evidence; the raw token never leaves the
+ * process arguments and is never written to a log or exposed to QML.
  *
  * Not part of `pnpm test` (pattern `tests/*.test.ts`). Run after a WebEngine
  * build:
@@ -31,8 +33,8 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
-import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -88,7 +90,10 @@ async function serveMarkedPage(): Promise<Served> {
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
     response.end(
       `<!doctype html><html><head><title>${MARKER}</title></head>`
-        + `<body><h1 id="marker">${MARKER}</h1></body></html>`,
+        + `<body><h1 id="marker">${MARKER}</h1>`
+        + '<div id="js-executed">pending</div>'
+        + '<script>document.getElementById("js-executed").textContent="ran-7419"</script>'
+        + '</body></html>',
     )
   })
   await new Promise<void>((resolveListen, rejectListen) => {
@@ -161,6 +166,55 @@ async function runHost(
   return result
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms))
+}
+
+function commandAvailable(name: string): boolean {
+  return spawnSync('sh', ['-c', `command -v ${name}`], { stdio: 'ignore' }).status === 0
+}
+
+const fixtureBrowser = join(root, 'tests/fixtures/controlled-browser.sh')
+const browserAvailable =
+  commandAvailable('chromium') || commandAvailable('google-chrome') || commandAvailable('chromium-browser')
+const xvfbAvailable = commandAvailable('Xvfb')
+const browserSkip =
+  skip
+  || (!existsSync(fixtureBrowser) ? `missing browser fixture ${fixtureBrowser}` : false)
+  || (!browserAvailable ? 'no real Chromium/Chrome on PATH for the external-browser e2e' : false)
+  || (!xvfbAvailable ? 'Xvfb is required so xdg-open consults the isolated desktop entry' : false)
+
+async function startXvfb(): Promise<{ display: string; child: ChildProcess }> {
+  for (let n = 90; n < 100; n += 1) {
+    const socket = `/tmp/.X11-unix/X${String(n)}`
+    if (existsSync(socket)) continue
+    const child = spawn('Xvfb', [`:${String(n)}`, '-screen', '0', '1024x768x24', '-nolisten', 'tcp'], {
+      stdio: 'ignore',
+    })
+    for (let i = 0; i < 40; i += 1) {
+      await delay(50)
+      if (existsSync(socket)) return { display: `:${String(n)}`, child }
+      if (child.exitCode !== null) break
+    }
+    child.kill('SIGKILL')
+  }
+  throw new Error('could not start Xvfb on displays :90-:99')
+}
+
+async function waitFor(check: () => boolean, timeoutMs: number, what: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return
+    await delay(100)
+  }
+  throw new Error(`timed out waiting for ${what}`)
+}
+
+function browserProcessesFor(profile: string): string {
+  const found = spawnSync('pgrep', ['-f', profile], { encoding: 'utf8' })
+  return (found.stdout ?? '').trim()
+}
+
 test(
   'WebEngine: open → token → real Chromium load → marker/title → close reaches about:blank',
   { skip, timeout: 150_000 },
@@ -211,14 +265,48 @@ test(
 )
 
 test(
-  'external fallback: DSH_QT_OPEN_URL_LOG records the token URL and a real GET authenticates',
-  { skip, timeout: 60_000 },
+  'external browser: QDesktopServices → xdg-open → real Chromium runs the page JS marker, then cleans up',
+  { skip: browserSkip, timeout: 150_000 },
   async () => {
     const served = await serveMarkedPage()
-    const logDir = mkdtempSync(join(tmpdir(), 'dsh-qt-open-url-'))
-    const log = join(logDir, 'opened-url.log')
+    const browserRoot = mkdtempSync(join(tmpdir(), 'dsh-qt-browser-'))
+    const home = join(browserRoot, 'home')
+    const config = join(browserRoot, 'config')
+    const data = join(browserRoot, 'data')
+    const cacheDir = join(browserRoot, 'cache')
+    const profile = join(browserRoot, 'profile')
+    const dom = join(browserRoot, 'dom.html')
+    for (const dir of [home, config, data, cacheDir]) mkdirSync(dir, { recursive: true })
+    mkdirSync(join(data, 'applications'), { recursive: true })
+    writeFileSync(
+      join(data, 'applications', 'dsh-e2e-browser.desktop'),
+      '[Desktop Entry]\n'
+        + 'Type=Application\n'
+        + 'Name=DSH E2E Browser\n'
+        + `Exec=${fixtureBrowser} %u\n`
+        + 'MimeType=x-scheme-handler/http;x-scheme-handler/https;\n'
+        + 'NoDisplay=true\n',
+    )
+    writeFileSync(
+      join(config, 'mimeapps.list'),
+      '[Default Applications]\n'
+        + 'x-scheme-handler/http=dsh-e2e-browser.desktop\n'
+        + 'x-scheme-handler/https=dsh-e2e-browser.desktop\n',
+    )
+    const xvfb = await startXvfb()
     try {
-      const result = await runHost('webui-browser', { DSH_QT_OPEN_URL_LOG: log }, (host) => {
+      const result = await runHost('webui-browser', {
+        HOME: home,
+        XDG_CONFIG_HOME: config,
+        XDG_DATA_HOME: data,
+        XDG_CACHE_HOME: cacheDir,
+        DISPLAY: xvfb.display,
+        DSH_E2E_PROFILE: profile,
+        DSH_E2E_DOM: dom,
+        DSH_E2E_BROWSER: process.env['DSH_E2E_BROWSER'] ?? '',
+        DSH_QT_SELFTEST_REAL_BROWSER: '1',
+        QT_QPA_PLATFORM: 'xcb',
+      }, (host) => {
         host.register('webui.token', () => ({
           authenticatedUrl: `http://127.0.0.1:${String(served.port)}/?token=${SECRET}`,
           maskedUrl: `http://127.0.0.1:${String(served.port)}/?token=***`,
@@ -229,24 +317,28 @@ test(
       assert.equal(result.code, 0, `unexpected exit; stderr:\n${text}`)
       assert.match(text, /\[selftest\] webui\.token intent=browser outcome=external /u)
       assert.match(text, new RegExp(`masked=http://127\\.0\\.0\\.1:${String(served.port)}/\\?token=\\*\\*\\* `, 'u'))
-
-      assert.ok(existsSync(log), 'the test hook did not record the URL')
-      const mode = statSync(log).mode & 0o777
-      assert.equal(mode, 0o600, `hook log must be owner-only, got ${mode.toString(8)}`)
-      const recorded = readFileSync(log, 'utf8').trim()
-      assert.equal(recorded, `http://127.0.0.1:${String(served.port)}/?token=${SECRET}`)
-
-      // The recorded URL really authenticates; the same endpoint rejects a
-      // missing or wrong token. This is a real HTTP GET, not a dispatch claim.
-      const ok = await fetch(recorded)
-      assert.equal(ok.status, 200)
-      assert.match(await ok.text(), new RegExp(MARKER, 'u'))
-      assert.equal((await fetch(`http://127.0.0.1:${String(served.port)}/`)).status, 401)
-      assert.equal((await fetch(`http://127.0.0.1:${String(served.port)}/?token=wrong`)).status, 401)
       assert.ok(!text.includes(SECRET), 'the raw token reached stderr')
+
+      // The browser is launched detached by the desktop; wait for it to commit
+      // the page. This is execution evidence, not a dispatch claim.
+      await waitFor(() => existsSync(dom) && readFileSync(dom, 'utf8') !== '', 90_000, 'the real browser DOM')
+      const rendered = readFileSync(dom, 'utf8')
+      assert.match(rendered, /<title>DSH-WEBUI-MARKER-7419<\/title>/u)
+      assert.match(rendered, /<h1 id="marker">DSH-WEBUI-MARKER-7419<\/h1>/u)
+      assert.match(rendered, /<div id="js-executed">ran-7419<\/div>/u, 'the page JavaScript did not run in the browser')
+      assert.ok(!rendered.includes(SECRET), 'the raw token reached the rendered DOM')
+
+      assert.ok(served.authorizedHits.length > 0, 'the real browser never requested the authenticated page')
+      assert.deepEqual(served.rejectedHits, [], 'the real browser must only request the authenticated URL')
+
+      // Cleanup: the browser exits on its own, leaving no profile process.
+      await waitFor(() => browserProcessesFor(profile) === '', 30_000, 'the browser to exit')
+      rmSync(browserRoot, { recursive: true, force: true })
+      assert.ok(!existsSync(profile), 'the isolated browser profile was not cleaned up')
     } finally {
+      xvfb.child.kill('SIGKILL')
+      rmSync(browserRoot, { recursive: true, force: true })
       await closeServer(served.server)
-      rmSync(logDir, { recursive: true, force: true })
     }
   },
 )

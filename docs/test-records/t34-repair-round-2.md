@@ -22,6 +22,8 @@ WebEngine 包 `qt6-webengine-dev 6.8.2+dfsg-4` 于本轮安装
   `build-webengine/CMakeFiles/dsh-qt-app.dir/flags.make` 含
   `-DDSH_QT_HAS_WEBENGINE=1`（`grep -R -- '-DDSH_QT_HAS_WEBENGINE=1'`，同时断言二进制存在）；
 - `cmake --build build-webengine --parallel 2`；
+- apt 增加 `xvfb procps`；`browser-actions/setup-chrome@v1` 安装外部浏览器 e2e 用的 Chrome
+  （`DSH_E2E_BROWSER=google-chrome`）；
 - `DSH_QT_APP_BINARY=$PWD/build-webengine/dsh-qt-app pnpm exec tsx --test tests/webengine-chromium.e2e.ts`；
 - 失败也上传 `configure-webengine.log` 与 e2e 输出。
 
@@ -31,7 +33,7 @@ WebEngine 包 `qt6-webengine-dev 6.8.2+dfsg-4` 于本轮安装
 
 YAML 校验（本机）：`ruby -ryaml -e 'YAML.load_file(...)'` → jobs 顺序
 `napi, typescript, napi-integration, qml-lint, qml-tests, qt-webengine, packaging`；
-qt-webengine 12 个 step、packaging 10 个 step 均可解析。CI 尚未真正触发（无远程 runner），
+qt-webengine 13 个 step、packaging 10 个 step 均可解析。CI 尚未真正触发（无远程 runner），
 此限制见 §6。
 
 ## 2. T28-2：WebEngine 真实加载/关闭 e2e
@@ -65,23 +67,41 @@ qt-webengine 12 个 step、packaging 10 个 step 均可解析。CI 尚未真正�
    `webui.token intent=embed outcome=embedded` 且 masked 含 `token=***`、
    `webview.load state=loaded title=DSH-WEBUI-MARKER-7419`、server 记录到授权命中且无 401、
    `state=closed` + `webview.close visible=0 url=about:blank`、stderr 不含原始 secret。
-2. `webui-browser` + `DSH_QT_OPEN_URL_LOG`（见 §3）。
+2. 外部浏览器：隔离 HOME/XDG profile + Xvfb/xcb，`QDesktopServices` → `xdg-open` → 真实 Chromium headless 执行页面 JS（见 §3）。
 
-本机实测：`logs/t34-chromium-final.log` → 2/2 pass，0 fail，exit 0；
-构建日志 `logs/t34-webengine-build-final.log` EXIT=0。
+本机实测：`logs/t34-chromium-final.log` → 2/2 pass，0 fail，exit 0（见最终 R2 日志）；构建日志 `logs/t34-webengine-build-r2b.log` EXIT=0。
 
-## 3. T28-3：`DSH_QT_OPEN_URL_LOG` 测试注入点
+## 3. T28-3：真实外部浏览器（隔离 profile，无 URL 落盘）
 
-`native/main.cpp` 匿名命名空间新增 `recordOpenUrlForTest(const QUrl&)`：
+针对合同更正，**已删除** `DSH_QT_OPEN_URL_LOG` 与 `recordOpenUrlForTest()` 写盘路径：
+认证 URL 不再被任何日志、文件或 QML 观察。
 
-- 仅当 `DSH_QT_HOST_SELFTEST` 非空才动作（生产路径零行为）；
-- 读取 `DSH_QT_OPEN_URL_LOG`，追加 `url.toEncoded()+"\n"`，文件权限 0600；
-- 调用点在 `resolveWebuiToken_` 的 external 分支，**记录后仍走原逻辑**：selftest 为空时
-  照旧 `QDesktopServices::openUrl()`；hook 不替代加载、不改变 outcome。
+`native/main.cpp`：
 
-e2e 第 2 例：进程写入日志 → 测试读出 URL → 真实 `fetch(recorded)` 得 200 + marker；
-无 token → 401；错 token → 401；并断言 stderr `intent=browser outcome=external`、
-raw secret 未出现。实测通过（同上日志）。
+- `desktopHandOffEnabled()`：生产（`DSH_QT_HOST_SELFTEST` 为空）总是 `QDesktopServices`；
+  `DSH_QT_SELFTEST_REAL_BROWSER=1` 让专用 e2e 走完全相同的分派；
+- `offscreen`/`minimal` QPA 平台在调用前拒绝（Qt 的 “does not support openUrl” 警告会打印
+  含 token 的完整 URL，必须避免）；
+- `resolveWebuiToken_` 的 external 分支只有 `QDesktopServices::openUrl` 成功才置
+  `external`，失败为 `failed/open-failed`；没有旁路 outcome。
+
+e2e 第 2 例（`tests/webengine-chromium.e2e.ts`）：
+
+- 启动临时 Xvfb（`:90`–`:99`，`-screen 0 1024x768x24`），制品进程用 `QT_QPA_PLATFORM=xcb`；
+- 隔离 `HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME`，写
+  `data/applications/dsh-e2e-browser.desktop`（`Exec=<repo>/tests/fixtures/controlled-browser.sh %u`）
+  与 `config/mimeapps.list` 默认 handler；**不触碰生产默认浏览器配置**；
+- `QDesktopServices` 真实分派到 `xdg-open`，后者启动真实 Chromium（headless、独立
+  `--user-data-dir`）；fixture 用 `--dump-dom` 输出执行 JS 后的 DOM，URL 只作为 argv，
+  不写日志；
+- 断言：DOM 含 `<title>DSH-WEBUI-MARKER-7419</title>`、`id="marker"` 与
+  `<div id="js-executed">ran-7419</div>`（证明页面 JS 在真实浏览器执行）；server 只收到
+  正确 token 的授权请求、无 401；DOM 与 stderr 均不含 raw secret；浏览器自行退出后
+  `pgrep` 无该 profile 进程，临时 profile 目录删除；
+- 关闭清理证据 = 浏览器进程退出 + profile 目录移除 + `webui.close` 生命周期由第 1 例覆盖。
+
+本机实测：`logs/t34-browser-r2.log` → 1/1 pass，exit 0（Xvfb + Chromium 148，
+`/usr/bin/chromium`）。
 
 ## 4. T28-4：CPack 归档解包与负例
 
@@ -105,15 +125,15 @@ NSIS 与 macOS DragNDrop 留给 CI 平台 leg（未在本机声称）。
 
 | 命令 | 退出码 | 日志 | 摘要 |
 | --- | --- | --- | --- |
-| `pnpm typecheck` | 0 | `logs/t34-typecheck.log` | 无输出错误 |
-| `pnpm test` | 0 | `logs/t34-test.log` | **484/484 pass, 0 fail, 0 skipped** |
-| `pnpm build` | 0 | `logs/t34-build.log` | `tsc -p tsconfig.json` |
-| `cmake -S . -B build -DDSH_QT_WEBENGINE=OFF` | 0 | `logs/t34-configure.log` | WebEngine 关闭 |
-| `cmake --build build --parallel 2` | 0 | `logs/t34-build-qt.log` | 含 webview_host/main.cpp |
-| `cmake --build build --target qml-tests` | 0 | `logs/t34-qml-tests.log` | 全部 QML 套件通过 |
-| `qmllint qml/**/*.qml`（`/usr/lib/qt6/bin/qmllint`） | 0 | `logs/t34-qmllint.log` | 14 条既有 Warning（GeneratedView 等），本任务文件 0 |
-| `cmake --build build-webengine`（ON） | 0 | `logs/t34-webengine-build-final.log` | 链接 build-webengine/dsh-qt-app |
-| `tsx --test tests/webengine-chromium.e2e.ts`（ON 二进制） | 0 | `logs/t34-chromium-final.log` | 2/2 pass |
+| `pnpm typecheck` | 0 | `logs/t34-r2-typecheck.log` | 无错误输出 |
+| `pnpm test` | 0 | `logs/t34-r2-test.log` | **484/484 pass, 0 fail, 0 skipped**（含 packaging 5/5） |
+| `pnpm build` | 0 | `logs/t34-r2-build.log` | `tsc -p tsconfig.json` |
+| `cmake -S . -B build -DDSH_QT_WEBENGINE=OFF` | 0 | `logs/t34-r2-configure.log` | WebEngine 关闭 |
+| `cmake --build build --parallel 2` | 0 | `logs/t34-r2-build-qt.log` | 含 webview_host/main.cpp |
+| `cmake --build build --target qml-tests` | 0 | `logs/t34-r2-qml-tests.log` | 全部 QML 套件通过 |
+| `qmllint qml/**/*.qml`（绝对路径） | 0 | `logs/t34-r2-qmllint.log` | 既有 14 条 Warning，本任务文件 0 |
+| `cmake --build build-webengine`（ON） | 0 | `logs/t34-r2-webengine-build.log` | 链接 build-webengine/dsh-qt-app |
+| `tsx --test tests/webengine-chromium.e2e.ts`（ON 二进制） | 0 | `logs/t34-r2-chromium-e2e.log` | **2/2 pass**（嵌入 + 真实外部浏览器） |
 
 注：`qmllint` 首次经 systemd-run 运行返回 127（PATH 无 Qt bin，记录于
 `logs/t34-verify-summary.log`），改用绝对路径重跑后 exit 0；`logs/t34-qmllint.log` 保存的是
@@ -136,6 +156,10 @@ NSIS 与 macOS DragNDrop 留给 CI 平台 leg（未在本机声称）。
 6. **qmllint PATH**：见 §5 注。
 7. `build`（OFF）曾因 `setContainer` 未加 `#if DSH_QT_HAS_WEBENGINE` 保护而绕过
    `d->view` 类型，导致 cpack preinstall 失败；已加宏保护。
+8. **offscreen 无法分派且 Qt 打印带 token 的 URL**：首版外部浏览器 e2e 用
+   `QT_QPA_PLATFORM=offscreen`，`QPlatformServices::openUrl` 不支持并在 warning 中打印
+   `http://…?token=<secret>`；这不是测试问题而是真实泄漏路径。修复：`desktopHandOffEnabled()`
+   在 offscreen/minimal 平台调用前拒绝，外部 e2e 改用 Xvfb + xcb，token 不再进入 stderr。
 
 ## 7. 边界与未验证项（不外推）
 
@@ -147,8 +171,10 @@ NSIS 与 macOS DragNDrop 留给 CI 平台 leg（未在本机声称）。
 - e2e 使用假 HostBridgeService（不发真实 `webui.open` 到官方 WebuiService）；
   真实 `WebuiService` + 嵌入组合仍由 `tests/webui-live.e2e.ts` 在 OFF 构建下验证
   external 降级，ON 组合的“服务端真启动 + Chromium 加载”并未合在同一条用例里。
-- `DSH_QT_OPEN_URL_LOG` 只在 selftest 下写；生产 `QDesktopServices` 分支未改，但
-  “真实桌面浏览器弹出”仍无法在无桌面环境断言。
-- 范围声明：`native/webview_host.h` 与 `qml/views/WebFallbackPanel.qml` 不在合同字面
-  inScope 列表，但分别是 §2 挂钩的声明半边与生产容器注入点；不改则验收无法成立，
-  已如实计入 changedPaths。
+- `DSH_QT_OPEN_URL_LOG` 与 `recordOpenUrlForTest()` 已在本修复提交中删除；认证 URL
+  不再写任何日志/文件。外部浏览器用隔离 profile + Xvfb/xcb + 真实 Chromium 验证
+  DOM/JS，不修改生产默认浏览器配置，但有隔离 profile 仍依赖 Linux 桌面工具链
+  （xdg-open、desktop entry、Xvfb），Windows/macOS 未有对应证据。
+- 范围声明：本提交涉及 `tests/fixtures/controlled-browser.sh`（新增受控浏览器启动
+  fixture），属于合同 `tests/fixtures/`；`native/webview_host.h` 与
+  `qml/views/WebFallbackPanel.qml` 已在合同扩围后覆盖。

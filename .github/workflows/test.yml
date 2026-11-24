@@ -399,9 +399,11 @@ jobs:
   # is 1, then runs the real Chromium e2e (tests/webengine-chromium.e2e.ts)
   # against a local HTTP server.
   #
-  # Chromium inside a container needs --no-sandbox and no GPU; the offscreen
-  # platform keeps the run headless. These flags are accepted upstream for CI
-  # only — the shipped app never adds them.
+  # Chromium inside a container needs --no-sandbox and no GPU. The embedded
+  # webview test runs on the offscreen platform; the external-browser test
+  # needs a real QPlatformServices, so it starts Xvfb and runs the shipped
+  # binary on xcb inside an isolated desktop profile. These flags are accepted
+  # upstream for CI only — the shipped app never adds them.
   # ---------------------------------------------------------------------------
   qt-webengine:
     name: qt webengine (ubuntu-22.04)
@@ -439,7 +441,7 @@ jobs:
       - name: Install Chromium runtime libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends             libnss3 libnspr4 libxcomposite1 libxdamage1 libxrandr2 libxtst6             libasound2 libgbm1 libxshmfence1 libpulse0 libxkbcommon-x11-0             libxkbfile1 libxcb-cursor0 libxcb-icccm4 libxcb-image0             libxcb-keysyms1 libxcb-render-util0 libxcb-xinerama0             fonts-dejavu-core
+          sudo apt-get install -y --no-install-recommends             libnss3 libnspr4 libxcomposite1 libxdamage1 libxrandr2 libxtst6             libasound2 libgbm1 libxshmfence1 libpulse0 libxkbcommon-x11-0             libxkbfile1 libxcb-cursor0 libxcb-icccm4 libxcb-image0             libxcb-keysyms1 libxcb-render-util0 libxcb-xinerama0             fonts-dejavu-core xvfb procps
 
       - name: Build TypeScript
         run: pnpm build
@@ -470,9 +472,14 @@ jobs:
       - name: Build
         run: cmake --build build-webengine --parallel 2
 
-      - name: Real Chromium auth load/close e2e
+      # The external-browser half needs a browser that is not QtWebEngine.
+      - name: Install Chrome for the external-browser e2e
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Real Chromium auth load/close and external browser e2e
         env:
           DSH_QT_APP_BINARY: ${{ github.workspace }}/build-webengine/dsh-qt-app
+          DSH_E2E_BROWSER: google-chrome
         run: pnpm exec tsx --test tests/webengine-chromium.e2e.ts
 
       - name: Upload WebEngine e2e output

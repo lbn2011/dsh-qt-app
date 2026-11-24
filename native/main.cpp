@@ -127,30 +127,25 @@ QString configDirectory()
 }
 
 /**
- * Test-only record of the URL handed to the desktop browser.
+ * The desktop hand-off is real in production and in the isolated browser e2e.
  *
- * `tests/webengine-chromium.e2e.ts` sets `DSH_QT_OPEN_URL_LOG` and then fetches
- * the recorded URL from its own HTTP server, which proves the one-shot token
- * really authenticates the browser hand-off path. This is a record, not a
- * substitute: the external branch below still runs unchanged, and in a
- * production launch (no self-test) neither this function nor the file it
- * mentions is ever touched. The file is created owner-only because the value
- * written is a credential for the duration of the hand-off.
+ * A normal launch always dispatches through QDesktopServices. The dedicated
+ * browser test (`DSH_QT_SELFTEST_REAL_BROWSER=1`) opts a self-test run into the
+ * same dispatch so the harness can observe a real xdg-open/browser chain in a
+ * throw-away profile; every other self-test keeps the headless outcome without
+ * touching the desktop. No URL is ever written to a log.
  */
-void recordOpenUrlForTest(const QUrl &url)
+bool desktopHandOffEnabled()
 {
-    if (qEnvironmentVariableIsEmpty("DSH_QT_HOST_SELFTEST"))
-        return;
-    const QString path = qEnvironmentVariable("DSH_QT_OPEN_URL_LOG");
-    if (path.isEmpty())
-        return;
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-        return;
-    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-    file.write(url.toEncoded());
-    file.write("\n");
-    file.close();
+    // The offscreen/minimal QPA plugins have no QPlatformServices::openUrl and
+    // Qt's "not supported" warning embeds the whole URL, including the token.
+    // Refuse before the call so a headless run can never leak it; the isolated
+    // browser e2e runs on xcb under Xvfb and reaches the real dispatch.
+    const QString platform = QGuiApplication::platformName();
+    if (platform == QLatin1String("offscreen") || platform == QLatin1String("minimal"))
+        return false;
+    return qEnvironmentVariableIsEmpty("DSH_QT_HOST_SELFTEST") ||
+           qEnvironmentVariableIsSet("DSH_QT_SELFTEST_REAL_BROWSER");
 }
 
 } // namespace
@@ -1256,14 +1251,18 @@ private:
         } else if (intent == QLatin1String("embed") && webview_ != nullptr && webview_->available() &&
                    webview_->loadAuthenticated(url, masked)) {
             outcome = QStringLiteral("embedded");
-        } else if (qEnvironmentVariableIsEmpty("DSH_QT_HOST_SELFTEST") && QDesktopServices::openUrl(QUrl(url))) {
-            // No desktop in the headless self-test; the harness asserts the
-            // outcome instead of launching a browser on the build machine.
-            outcome = QStringLiteral("external");
+        } else if (desktopHandOffEnabled()) {
+            // Production path, and the isolated-profile browser e2e. The token
+            // URL is handed to the desktop exactly once; nothing records it.
+            if (QDesktopServices::openUrl(QUrl(url)))
+                outcome = QStringLiteral("external");
+            else {
+                outcome = QStringLiteral("failed");
+                failure = QStringLiteral("open-failed: the desktop refused the WebUI URL");
+            }
         } else if (!qEnvironmentVariableIsEmpty("DSH_QT_HOST_SELFTEST")) {
-            // Headless: no desktop to open a browser on. The harness records the
-            // exact URL it would have handed over and validates that URL itself.
-            recordOpenUrlForTest(QUrl(url));
+            // Headless self-tests without a desktop assert the hand-off outcome
+            // only; the isolated browser e2e above performs the real dispatch.
             outcome = QStringLiteral("external");
         } else {
             outcome = QStringLiteral("failed");

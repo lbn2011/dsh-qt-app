@@ -70,7 +70,7 @@ DSH profile (Node)
 | `tsx --test tests/generated-slot-live.e2e.ts` | 0 | 1/1：渲染→点击→Node 重渲染 | `/tmp/e2e7.log` |
 | `tsx --test tests/plugin-manager-live.e2e.ts` | 0 | 1/1：真实 ctx.pluginManager 列表/停用/启用 | `logs/t32-plugin-manager.log` |
 | `tsx --test tests/webui-external.e2e.ts` | 0 | 1/1：官方 `dsh web` 栅栏负例与端口释放 | `logs/t32-webui-external2.log` |
-| `tsx --test tests/webengine-chromium.e2e.ts` | 0 | 2/2：WebEngine=ON 真实 Chromium 认证加载/标题/maskedUrl/关闭 about:blank；`DSH_QT_OPEN_URL_LOG` 真实 GET 认证 | `logs/t34-chromium-final.log` |
+| `tsx --test tests/webengine-chromium.e2e.ts` | 0 | 2/2：WebEngine=ON 真实 Chromium 认证加载/标题/maskedUrl/关闭 about:blank；真实 QDesktopServices→xdg-open→Chromium 执行 DOM/JS 标记（隔离 profile） | `logs/t34-r2-chromium-e2e.log` |
 
 CI 锁：`.github/workflows/{build,test}.yml` 用 `NAPI_SHA` checkout addon，并断言
 `git rev-parse HEAD` 与 `package.json` 的 `dshQtNapi.commit` 等于该 SHA；
@@ -84,14 +84,15 @@ CI 另有 `qt-webengine` job（`modules: qtwebengine`、offscreen、`--no-sandbo
 
 ## 4. 缺口（如实报告，不在本轮声称完成）
 
-- **Qt WebEngine 嵌入加载仅 Linux/offscreen 本机验证**：t34 在本机 Qt 6.8.2 +
+- **Qt WebEngine 嵌入加载与外部浏览器仅 Linux 本机验证**（嵌入用 offscreen，外部浏览器用 Xvfb/xcb）：t34 在本机 Qt 6.8.2 +
   `qt6-webengine-dev` 上构建 `build-webengine`（`DSH_QT_HAS_WEBENGINE=1`），真实 Chromium
   加载标记页、标题命中、maskedUrl 只含 `token=***`、关闭后 about:blank，2/2 通过
   （`tests/webengine-chromium.e2e.ts`）。**Windows/macOS 与真实桌面窗口仍无运行证据**；
   CI 的 `qt-webengine` job 尚未在远程 runner 实际触发。「CI 必过」不成立，需首跑确认。
-- **`external` 只证明分派到浏览器分支**：自测下真实 GET 由测试进程经
-  `DSH_QT_OPEN_URL_LOG` 完成（认证链 200/401 已证），但没有桌面会话里“浏览器窗口真的弹出”的
-  断言；生产分支仍是 `QDesktopServices::openUrl`，hook 只在 selftest 下记录。
+- **外部浏览器已有真实执行证据（Linux/Xvfb）**：隔离 HOME/XDG profile 注册临时 desktop
+  entry，`QDesktopServices`→`xdg-open`→真实 Chromium headless 导航认证页，DOM 中
+  `id="js-executed"` 由页面 JS 改写为 `ran-7419`，token 不出现在 DOM/stderr，浏览器退出后
+  无 profile 进程并删除临时目录。没有 Windows/macOS 桌面会话证据；生产默认浏览器配置不变。
 - **真实模型/真实用户 profile 未跑**：`tests/official-profile.e2e.ts` 使用隔离
   `DSH_HOME` + 本地确定性假模型（一次 `bash` tool_use + 一次文本），不接触真实凭据、
   不调用付费模型；标题请求判据为 `thinking.type==='disabled' && messages.length===1`。
