@@ -1,4 +1,4 @@
-# Phase 3 实施现状（t32 修复轮候选，待 t33 独立复验）
+# Phase 3 实施现状（t47 远程复验候选，待修复）
 
 本文描述**当前代码实际接通的链路**与已跑过的验证。设计意图见
 `docs/PHASE-3-IMPLEMENTATION-PLAN.md` 与 `docs/PHASE-3-*.md`；两者冲突时以
@@ -87,16 +87,23 @@ typecheck/test/build/package/CMake configure/build 步骤经 `scripts/gate.mjs`
 `THIRD-PARTY-NOTICES.md` 随 `cmake --install`/CPack 安装到包根；`tests/packaging.test.ts`
 既实测临时 install prefix，也真实执行 `cpack -G TGZ`、校验同名 `.sha256`、解归档断言根目录
 含 `LICENSE`/`THIRD-PARTY-NOTICES.md`/`bin/dsh-qt-app`，并覆盖缺 notices、坏校验和两个负例。
-CI 另有 `qt-webengine` job（`modules: qtwebengine qtwebchannel`、offscreen、
+CI 另有 `qt-webengine` job（`modules: qtwebengine qtwebchannel qtpositioning`、offscreen、
 `--no-sandbox --disable-gpu`）编译期断言 `DSH_QT_HAS_WEBENGINE=1` 并在该构建下跑
 真实 Chromium 加载/关闭 e2e；WebEngineQuick 链接的 `Qt6::WebChannelQuick` 在独立的
-`qtwebchannel` 模块里，只装 `qtwebengine` 会让 CMake 包不可解析。
+`qtwebchannel` 模块里，其 `find_dependency(Positioning)` 又需要独立的 `qtpositioning`
+模块；只装 `qtwebengine` 会让 CMake 包不可解析。t47 远程复验发现该 job 的编译期断言
+位于 `Build` 之前却检查构建产物二进制，故真实 Chromium e2e 尚未执行，待修复。
 
 ## 4. 缺口（如实报告，不在本轮声称完成）
 
-- **远程 CI 仍以 t29 的失败为基线**：t36 的修复（归档脚本、gate `.cmd`、qtwebchannel、
-  Qt 6.7.3 lint、宿主测试门）只在本机验证，尚未推送触发远程 CI；`qt-webengine` 的
-  qtwebchannel 组合、Windows gate 真实执行、macOS 取消原因都要等审查后重跑确认。
+- **远程 CI 仍未通过（t47 复验，候选 55a0e9d）**：Windows TypeScript 单测剩 1 个平台
+  路径断言失败（`tests/packaging.test.ts` 用 `split('/')` 取 basename，Windows 反斜杠
+  路径不成立）；`qt-webengine` job 在 `Build` 前执行 `test -x build-webengine/dsh-qt-app`，
+  导致配置已确认 `Qt WebEngine embedding enabled` 后仍 exit 1，真实 Chromium e2e 未运行；
+  macOS 两 job 启动即 cancelled，未验证。已转绿：Ubuntu TypeScript、两平台 NAPI 与
+  packaging、qml tests（229/0）、qml lint、真实宿主门（3/3，skipped 0）、两平台 Qt build。
+  失败史见 `docs/test-records/t44-ci-revalidation.md`、`t45-hosted-test-failures.md`、
+  `t47-ci-revalidation.md`。
 - **Qt WebEngine 嵌入加载与外部浏览器仅 Linux 本机验证**（嵌入用 offscreen，外部浏览器用 Xvfb/xcb）：t34 在本机 Qt 6.8.2 +
   `qt6-webengine-dev` 上构建 `build-webengine`（`DSH_QT_HAS_WEBENGINE=1`），真实 Chromium
   加载标记页、标题命中、maskedUrl 只含 `token=***`、关闭后 about:blank，2/2 通过
@@ -109,8 +116,9 @@ CI 另有 `qt-webengine` job（`modules: qtwebengine qtwebchannel`、offscreen�
 - **真实模型/真实用户 profile 未跑**：`tests/official-profile.e2e.ts` 使用隔离
   `DSH_HOME` + 本地确定性假模型（一次 `bash` tool_use + 一次文本），不接触真实凭据、
   不调用付费模型；标题请求判据为 `thinking.type==='disabled' && messages.length===1`。
-- **macOS/Windows**：代码与 CI 矩阵存在，本机无运行证据；本轮 WebEngine 也只在 Linux 验证，
-  跨平台 GUI/嵌入行为需 CI 触发后补。
+- **macOS/Windows**：代码与 CI 矩阵存在；t47 已在远程真实执行 Windows/Linux 构建与
+  NAPI，Windows unit 仍有 1 个测试失败，macOS runner 启动即取消，均未验证。WebEngine
+  真实 Chromium 加载/关闭在远程尚未执行（job 步骤顺序问题），跨平台 GUI/嵌入行为待补。
 - **插件槽位注册通道的边界**：render/action 函数经 `mirrorRendererSlots` 从
   `QtRendererService.registerSlot` 镜像到 `PluginService` 的 SlotRegistry；`ui.register`
   RPC 仍只承载可序列化元数据（函数无法过线），这一语义写入契约文档。
