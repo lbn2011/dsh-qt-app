@@ -163,6 +163,200 @@ jobs:
       - name: Build TypeScript
         run: node scripts/gate.mjs -- pnpm build
 
+      # The JavaScript half of the app is a Cordis plugin. Package it from the
+      # same compiled `lib/` tree the Qt executable embeds, then prove the tarball
+      # is installable and mountable in a clean host closure. Linux only: the
+      # plugin is platform-independent, and this keeps one authoritative
+      # tarball instead of three copies with different mtimes.
+      - name: Pack the JavaScript plugin
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist/plugin
+          mkdir -p dist/plugin
+          npm pack --pack-destination dist/plugin --json > dist/plugin/pack.json
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict'
+          import { createHash } from 'node:crypto'
+          import { execFileSync } from 'node:child_process'
+          import { readFileSync, writeFileSync } from 'node:fs'
+
+          const dir = 'dist/plugin'
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+          const packed = JSON.parse(readFileSync(`${dir}/pack.json`, 'utf8'))
+          assert.equal(packed.length, 1, 'npm pack must describe exactly one tarball')
+          const meta = packed[0]
+          assert.equal(meta.name, pkg.name)
+          assert.equal(meta.version, pkg.version)
+          assert.equal(meta.filename, `${pkg.name.replace(/^@/, '').replace(/\//g, '-')}-${pkg.version}.tgz`)
+          assert.equal(pkg.license, 'MIT')
+          assert.equal(pkg.main, 'lib/index.js')
+          assert.equal(pkg.types, 'lib/index.d.ts')
+          assert.equal(pkg.exports['.'].default, './lib/index.js')
+          assert.equal(pkg.exports['.'].types, './lib/index.d.ts')
+          assert.equal(pkg.exports['./package.json'], './package.json')
+          const packedFiles = new Set(meta.files.map((file) => `package/${file.path}`))
+          for (const file of ['package/lib/index.js', 'package/lib/index.d.ts', 'package/LICENSE', 'package/THIRD-PARTY-NOTICES.md']) {
+            assert.ok(packedFiles.has(file), `tarball is missing ${file}`)
+          }
+
+          const tarball = `${dir}/${meta.filename}`
+          const bytes = readFileSync(tarball)
+          const sha256 = createHash('sha256').update(bytes).digest('hex')
+          writeFileSync(`${tarball}.sha256`, `${sha256}  ${meta.filename}\n`)
+
+          const sourceSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+          const workflowSha = process.env.GITHUB_SHA || ''
+          if (workflowSha !== '' && workflowSha !== sourceSha)
+            throw new Error(`workflow SHA ${workflowSha} does not describe checked-out source ${sourceSha}`)
+          const provenance = {
+            schemaVersion: 1,
+            package: pkg.name,
+            version: pkg.version,
+            license: pkg.license,
+            tarball: meta.filename,
+            size: bytes.length,
+            sha256,
+            entry: pkg.main,
+            types: pkg.types,
+            addonSha: pkg.dshQtNapi?.commit ?? null,
+            source: {
+              repository: process.env.GITHUB_REPOSITORY || 'lbn2011/dsh-qt-app',
+              workflow: process.env.GITHUB_WORKFLOW || 'build',
+              workflowSha: workflowSha || null,
+              sourceSha,
+              sourceMatchesWorkflow: workflowSha === '' ? null : workflowSha === sourceSha,
+              ref: process.env.GITHUB_REF_NAME || 'local',
+              runId: process.env.GITHUB_RUN_ID || null,
+              runAttempt: process.env.GITHUB_RUN_ATTEMPT || null,
+            },
+            node: process.version,
+            generatedAt: new Date().toISOString(),
+            download: 'GitHub Actions artifact dsh-qt-app-plugin; no registry or permanent URL',
+          }
+          writeFileSync(`${dir}/provenance.json`, JSON.stringify(provenance, null, 2) + '\n')
+          console.log(`packed ${meta.filename} (${bytes.length} bytes, sha256 ${sha256})`)
+          NODE
+
+      - name: Verify plugin tarball contents and import closure
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t TARBALLS < <(find dist/plugin -maxdepth 1 -name '*.tgz' -print)
+          test "${#TARBALLS[@]}" -eq 1
+          TARBALL="${TARBALLS[0]}"
+          tar -tzf "$TARBALL" | sort > dist/plugin/tarball-files.txt
+          for required in \
+            package/LICENSE \
+            package/THIRD-PARTY-NOTICES.md \
+            package/lib/index.js \
+            package/lib/index.d.ts \
+            package/qml/main.qml \
+            package/native/main.cpp; do
+            grep -qx "$required" dist/plugin/tarball-files.txt || {
+              echo "::error::tarball is missing $required"
+              exit 1
+            }
+          done
+          tar -xOf "$TARBALL" package/LICENSE | grep -qi 'MIT License'
+          tar -xOf "$TARBALL" package/THIRD-PARTY-NOTICES.md | grep -qi 'third-party'
+          UNPACK="$RUNNER_TEMP/dsh-qt-plugin-unpack"
+          rm -rf "$UNPACK"
+          mkdir -p "$UNPACK"
+          tar -xzf "$TARBALL" -C "$UNPACK"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict'
+          import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+          import { dirname, extname, join, relative, resolve } from 'node:path'
+
+          const root = process.env.RUNNER_TEMP + '/dsh-qt-plugin-unpack/package'
+          const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+          assert.equal(pkg.name, '@deepseek-ai/dsh-qt-app')
+          assert.equal(pkg.main, 'lib/index.js')
+          assert.equal(pkg.exports['.'].default, './lib/index.js')
+
+          const files = []
+          const walk = (dir) => {
+            for (const entry of readdirSync(dir, { withFileTypes: true })) {
+              const path = join(dir, entry.name)
+              if (entry.isDirectory()) walk(path)
+              else files.push(path)
+            }
+          }
+          walk(join(root, 'lib'))
+          const scripts = files.filter((file) => extname(file) === '.js')
+          assert.ok(scripts.length > 40, `expected built lib scripts, found ${scripts.length}`)
+          const missing = []
+          const relativePattern = /(?:\bfrom\s*|\bimport\s*\()\s*['"](\.[^'"]+)['"]/g
+          for (const file of scripts) {
+            const text = readFileSync(file, 'utf8')
+            for (const match of text.matchAll(relativePattern)) {
+              const spec = match[1]
+              let target = resolve(dirname(file), spec)
+              const candidates = [target, `${target}.js`, `${target}.d.ts`, join(target, 'index.js')]
+              if (!candidates.some((candidate) => existsSync(candidate) && statSync(candidate).isFile()))
+                missing.push(`${relative(root, file)} -> ${spec}`)
+            }
+          }
+          assert.deepEqual(missing, [], `tarball import closure is incomplete: ${missing.join(', ')}`)
+          console.log(`checked ${scripts.length} lib scripts; relative import closure complete`)
+          NODE
+
+      - name: Activate the packed plugin in a clean host closure
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL="$(realpath "$(find dist/plugin -maxdepth 1 -name '*.tgz' -print -quit)")"
+          HOST="$RUNNER_TEMP/dsh-qt-plugin-host"
+          rm -rf "$HOST"
+          mkdir -p "$HOST"
+          cd "$HOST"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund --ignore-scripts "$TARBALL"
+          PLUGIN_TARBALL="$TARBALL" node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict'
+          import { Context } from '@deepseek-ai/cordis'
+          import plugin, { apply, inject, name, version } from '@deepseek-ai/dsh-qt-app'
+
+          assert.equal(typeof apply, 'function')
+          assert.deepEqual(inject, [])
+          assert.equal(plugin.apply, apply)
+          const bridge = {
+            version: 't58-fixture',
+            renderMarkdown: (text) => `<p>${text}</p>`,
+            highlightCode: (code) => `<code>${code}</code>`,
+          }
+          const ctx = new Context()
+          await ctx.plugin(plugin, {
+            bridge,
+            autoLaunch: false,
+            autoStartEventLoop: false,
+            napiPath: '/nonexistent/dsh-qt-napi/qt-bridge.node',
+          })
+          assert.ok(ctx.qtRenderer, 'plugin did not register ctx.qtRenderer')
+          assert.equal(ctx.qtRenderer.stats.name, name)
+          assert.equal(ctx.qtRenderer.stats.version, version)
+          assert.equal(ctx.qtRenderer.qmlEntry, 'qrc:/qml/main.qml')
+          assert.equal(await ctx.qtRenderer.renderMarkdown('artifact'), '<p>artifact</p>')
+          console.log(`activated ${name}@${version} from ${process.env.PLUGIN_TARBALL}`)
+          NODE
+
+      - name: Upload JavaScript plugin
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-qt-app-plugin
+          path: |
+            dist/plugin/*.tgz
+            dist/plugin/*.sha256
+            dist/plugin/provenance.json
+            dist/plugin/tarball-files.txt
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Install Linux Qt dependencies
         if: runner.os == 'Linux'
         run: |
