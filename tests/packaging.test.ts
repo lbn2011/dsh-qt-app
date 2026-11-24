@@ -78,6 +78,18 @@ function runCpack(generator: string, output: string): string {
   return join(output, archives[0] as string)
 }
 
+/**
+ * The file name of `filePath`, whichever separator style it uses.
+ *
+ * The hosted Windows runners hand us `C:\...\bad.tar.gz`, where splitting on
+ * `/` alone yields the whole path, so the comparison below must understand both
+ * separators on every host (T48-1).
+ */
+function fileName(filePath: string): string {
+  const cut = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'))
+  return cut === -1 ? filePath : filePath.slice(cut + 1)
+}
+
 /** Parses an adjacent `<archive>.sha256` file. */
 function readChecksumFile(archive: string): string {
   const file = `${archive}.sha256`
@@ -85,7 +97,7 @@ function readChecksumFile(archive: string): string {
   const text = readFileSync(file, 'utf8').trim()
   const match = /^([0-9a-f]{64})\s+\*?(.+)$/u.exec(text)
   assert.ok(match !== null, `malformed checksum file: ${JSON.stringify(text)}`)
-  assert.equal(match[2], archive.split('/').pop(), 'checksum file names a different archive')
+  assert.equal(match[2], fileName(archive), 'checksum file names a different archive')
   return match[1] as string
 }
 
@@ -148,6 +160,12 @@ test('an archive missing the notices is rejected', () => {
   execFileSync('tar', ['-czf', archive, '-C', staging, 'dsh-qt-app-bad'], { stdio: 'pipe' })
   const packagedRoot = extractArchive(archive)
   assert.throws(() => assertLicenseMaterial(packagedRoot), /THIRD-PARTY-NOTICES\.md/u)
+})
+
+test('the checksum name check understands Windows and POSIX paths', () => {
+  assert.equal(fileName('C:\\Users\\runner\\AppData\\Local\\Temp\\dsh-qt-badsum-x\\bad.tar.gz'), 'bad.tar.gz')
+  assert.equal(fileName('/tmp/dsh-qt-badsum-x/bad.tar.gz'), 'bad.tar.gz')
+  assert.equal(fileName('bad.tar.gz'), 'bad.tar.gz')
 })
 
 test('a checksum that does not describe the archive is rejected', () => {

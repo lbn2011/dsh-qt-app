@@ -538,8 +538,11 @@ jobs:
             -DDSH_QT_WEBENGINE=ON \
             -DCMAKE_BUILD_TYPE=Release 2>&1 | tee configure-webengine.log
 
-      # Two independent assertions: CMake found the module (so the flag cannot
-      # silently be 0) and the compiled target really carries the definition.
+      # Two independent assertions that only need the configure output: CMake
+      # found the module (so the flag cannot silently be 0) and the generated
+      # target really carries the definition. The binary does not exist until
+      # the build step below, so it is checked after the build (T48-2: asserting
+      # it here failed the job before the e2e could run).
       - name: Assert the WebEngine branch is compiled in
         run: |
           set -euo pipefail
@@ -552,10 +555,22 @@ jobs:
             echo '::error::the dsh-qt-app target does not compile with DSH_QT_HAS_WEBENGINE=1'
             exit 1
           fi
-          test -x build-webengine/dsh-qt-app
 
       - name: Build
         run: cmake --build build-webengine --parallel 2
+
+      # Now that the artifact exists, prove it is runnable and actually links the
+      # WebEngine library the compile definition claims.
+      - name: Assert the built binary links Qt WebEngine
+        run: |
+          set -euo pipefail
+          test -x build-webengine/dsh-qt-app
+          if ! ldd build-webengine/dsh-qt-app | grep -q 'libQt6WebEngineQuick'; then
+            echo '::error::the built binary does not link Qt6WebEngineQuick'
+            ldd build-webengine/dsh-qt-app | sort || true
+            exit 1
+          fi
+          echo "webengine libraries linked: $(ldd build-webengine/dsh-qt-app | grep -c 'libQt6WebEngine')"
 
       # The external-browser half needs a browser that is not QtWebEngine.
       - name: Install Chrome for the external-browser e2e
@@ -565,14 +580,18 @@ jobs:
         env:
           DSH_QT_APP_BINARY: ${{ github.workspace }}/build-webengine/dsh-qt-app
           DSH_E2E_BROWSER: google-chrome
-        run: pnpm exec tsx --test tests/webengine-chromium.e2e.ts
+        run: |
+          set -euo pipefail
+          pnpm exec tsx --test tests/webengine-chromium.e2e.ts 2>&1 | tee webengine-e2e.log
 
       - name: Upload WebEngine e2e output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: webengine-e2e
-          path: configure-webengine.log
+          path: |
+            configure-webengine.log
+            webengine-e2e.log
           if-no-files-found: warn
           retention-days: 7
 
