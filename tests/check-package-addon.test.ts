@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 
 // The gate that checks the *packaged* archive, i.e. what a user installs. The
@@ -62,9 +63,34 @@ interface Run {
   stderr: string
 }
 
-function run(args: string[]): Run {
-  const result = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' })
+function run(args: string[], cli: string = script): Run {
+  const result = spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8' })
   return { status: result.status, stdout: result.stdout, stderr: result.stderr }
+}
+
+// T80-1: the gate used to decide "am I the entry point?" by comparing
+// `import.meta.url` against a hand-built `file://${process.argv[1]}`. That
+// comparison is never true on Windows (argv[1] starts with a drive letter) and
+// is also false for any path a file URL has to percent-encode, so the CLI ran
+// nothing and exited 0 — a gate that silently passes is worse than no gate. A
+// checkout path is not something the build controls, so the tests below run the
+// CLI from a directory that contains a space, a '#', and a literal '%41'.
+function copyCliToHostilePath(): string {
+  const base = mkdtempSync(join(tmpdir(), 'dsh gate path '))
+  const checkout = join(base, 'checkout #1 %41')
+  mkdirSync(join(checkout, 'scripts'), { recursive: true })
+  const copy = join(checkout, 'scripts', 'check-package-addon.mjs')
+  copyFileSync(script, copy)
+  return copy
+}
+
+function withHostileCli(fn: (cli: string) => void): void {
+  const cli = copyCliToHostilePath()
+  try {
+    fn(cli)
+  } finally {
+    rmSync(join(cli, '..', '..'), { recursive: true, force: true })
+  }
 }
 
 function withPackage(options: TreeOptions, fn: (tree: string) => void): void {
@@ -205,5 +231,52 @@ test('treats a malformed triple as a usage error', () => {
     const result = run(['--dir', tree, '--triple', 'linux'])
     assert.equal(result.status, 2)
     assert.match(result.stderr, /--triple must look like/u)
+  })
+})
+
+test('runs from a checkout path that needs URL escaping (T80-1)', () => {
+  withHostileCli((cli) => {
+    withPackage({ triple: 'win32-x64' }, (tree) => {
+      const result = run(['--dir', tree, '--triple', 'win32-x64'], cli)
+      assert.equal(result.status, 0, result.stderr)
+      assert.match(result.stdout, /dsh-qt-napi\/prebuild\/win32-x64\/qt-bridge\.node is PE/u)
+      assert.match(result.stdout, /win32-x64 package carries the addon at the path the loader searches/u)
+    })
+  })
+})
+
+test('rejects a wrong digest from a checkout path that needs URL escaping (T80-1)', () => {
+  withHostileCli((cli) => {
+    withPackage({ triple: 'linux-x64' }, (tree) => {
+      const result = run(
+        ['--dir', tree, '--triple', 'linux-x64', '--expect-sha256', '0'.repeat(64)],
+        cli,
+      )
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /does not match --expect-sha256/u)
+    })
+  })
+})
+
+test('rejects the wrong architecture from a checkout path that needs URL escaping (T80-1)', () => {
+  withHostileCli((cli) => {
+    withPackage({ triple: 'win32-x64', addonFormats: { 'win32-x64': 'elf' } }, (tree) => {
+      const result = run(['--dir', tree, '--triple', 'win32-x64'], cli)
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /is ELF, but a win32-x64 package needs PE/u)
+    })
+  })
+})
+
+test('importing the gate runs no checks', () => {
+  withHostileCli((cli) => {
+    const result = spawnSync(
+      process.execPath,
+      ['--input-type=module', '-e', `await import(${JSON.stringify(pathToFileURL(cli).href)})`],
+      { encoding: 'utf8' },
+    )
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout, '')
+    assert.equal(result.stderr, '')
   })
 })

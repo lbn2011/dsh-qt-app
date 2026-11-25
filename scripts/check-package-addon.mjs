@@ -36,6 +36,7 @@
 import { createHash } from 'node:crypto'
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
 import { join, relative } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 const USAGE = `usage: check-package-addon.mjs --dir <unpacked-root> --triple <platform>-<arch> [--expect-source <file>] [--expect-sha256 <hex>] [--expect-addon required|degraded]`
 
@@ -298,6 +299,10 @@ function main() {
   console.log(`check-package-addon: ${args.triple} package carries the addon at the path the loader searches`)
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Run only when executed directly, never on import. Compare through
+// pathToFileURL: `file://${process.argv[1]}` never matched on Windows
+// (`file://D:\a\...` vs `file:///D:/a/...`) and also missed paths that a file
+// URL percent-encodes, so the gate silently did nothing and exited 0 (T80-1).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main()
 }
