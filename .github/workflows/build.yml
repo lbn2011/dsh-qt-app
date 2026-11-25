@@ -398,20 +398,48 @@ jobs:
       - name: Package
         run: node scripts/gate.mjs -- pnpm package
 
-      - name: Assert packaging bundled the addon
+      # Inspect the archive CPack actually produced, not the install rules that
+      # fed it. A package without qt-bridge.node still starts but silently loses
+      # the Native Markdown renderer; a package carrying ANOTHER platform's binary
+      # starts too, because the loader's require() failure degrades instead of
+      # throwing (T29-A). Only unpacking the archive shows either one.
+      - name: Assert the packaged archive carries the addon for this target
         shell: bash
         run: |
-          # A package without qt-bridge.node still starts, but silently loses the
-          # Native Markdown renderer — exactly the regression this check exists for.
           if [ ! -f build/CPackConfig.cmake ]; then
             echo "::error::CPack was not configured"
             exit 1
           fi
-          if ! grep -qi 'qt-bridge.node' build/cmake_install.cmake; then
-            echo "::error::install rules do not mention qt-bridge.node"
+          ls -la dist/package/ 2>/dev/null || true
+
+          # The triple is the one the packaged app computes at runtime, so take it
+          # from the same source: Node's process.platform/process.arch.
+          triple="$(node -p "process.platform + '-' + process.arch")"
+          archive=""
+          for candidate in dist/package/*.tar.gz dist/package/*.zip; do
+            if [ -f "$candidate" ]; then archive="$candidate"; break; fi
+          done
+          if [ -z "$archive" ]; then
+            echo "::error::pnpm package produced no archive in dist/package/"
             exit 1
           fi
-          ls -la dist/package/ 2>/dev/null || true
+
+          rm -rf unpacked && mkdir -p unpacked
+          case "$archive" in
+            *.tar.gz) tar -xzf "$archive" -C unpacked ;;
+            *.zip) 7z x -y -ounpacked "$archive" > /dev/null ;;
+            *) echo "::error::unsupported archive type: $archive"; exit 1 ;;
+          esac
+          root="$(find unpacked -mindepth 1 -maxdepth 1 -type d | head -1)"
+          echo "checking $archive (triple $triple) in $root"
+
+          # --expect-source is the artifact this job downloaded and staged from, so
+          # the packaged bytes must match it exactly: a substitution of any kind
+          # fails here rather than at the user's first Markdown message.
+          node scripts/check-package-addon.mjs \
+            --dir "$root" \
+            --triple "$triple" \
+            --expect-source "dsh-qt-napi/prebuild/$triple/qt-bridge.node"
 
       - name: Stage executable
         shell: bash

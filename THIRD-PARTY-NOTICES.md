@@ -64,8 +64,12 @@ from a Qt installation inherit whatever terms that installation carries.
 Qt WebEngine is an optional, compile-time feature (`-DDSH_QT_WEBENGINE=ON`
 with the `qtwebengine` module installed; the build reports
 `DSH_QT_HAS_WEBENGINE=1`). The `qt-webengine` CI job is configured to build
-and exercise that branch; that job has not yet been observed running on a
-hosted runner, so no remote CI result is claimed here. When the feature is
+and exercise that branch. That job has run on a hosted `ubuntu-22.04` runner
+(workflow run 45444359081, commit `5671824`): it configured with
+`-DDSH_QT_WEBENGINE=ON`, asserted that the built binary links
+`libQt6WebEngineQuick`, and passed both real-Chromium cases — embedded
+load/token/close and the external-browser launch. Linux is therefore verified;
+Windows and macOS WebEngine runs are not covered by CI. When the feature is
 enabled the executable links Qt WebEngine and Chromium, and the notices below
 cover them. Qt WebEngine itself is under the
 LGPL-3.0 (with the usual Qt commercial alternative); Chromium is under the

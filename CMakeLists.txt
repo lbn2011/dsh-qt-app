@@ -194,11 +194,19 @@ endif()
 # prebuild/<platform>-<arch>/ directory or a build/Release directory). CI passes
 # the artifact it just downloaded; local builds may leave it unset, in which case
 # the host falls back to the degraded <pre> renderer at runtime.
+#
+# Only the directory for THIS build's target triple is acceptable. dsh-qt-napi
+# commits prebuild/linux-x64/qt-bridge.node on purpose, so a Windows job has both
+# prebuild/linux-x64/ and prebuild/win32-x64/ on disk; picking the wrong one ships
+# a binary the loader cannot require() and degrades silently (T29-A). The rules
+# live in scripts/cmake/dsh-qt-napi-addon.cmake and fail the configure instead.
 # ---------------------------------------------------------------------------
 set(DSH_QT_NAPI_DIR "" CACHE PATH
   "Directory holding the dsh-qt-napi addon (qt-bridge.node) to bundle with the app")
 
 set(DSH_QT_NAPI_ADDON "" CACHE FILEPATH "Resolved dsh-qt-napi addon path (internal)")
+
+include("${CMAKE_CURRENT_LIST_DIR}/scripts/cmake/dsh-qt-napi-addon.cmake")
 
 # Also accept the location through the environment so CI (and `pnpm package`)
 # do not have to thread a -D flag through every command line.
@@ -206,72 +214,30 @@ if(NOT DSH_QT_NAPI_DIR AND DEFINED ENV{DSH_QT_NAPI_DIR})
   set(DSH_QT_NAPI_DIR "$ENV{DSH_QT_NAPI_DIR}")
   message(STATUS "dsh-qt-app: DSH_QT_NAPI_DIR taken from the environment: ${DSH_QT_NAPI_DIR}")
 endif()
-if(DSH_QT_NAPI_DIR)
-  if(NOT IS_DIRECTORY "${DSH_QT_NAPI_DIR}")
-    message(FATAL_ERROR "DSH_QT_NAPI_DIR is not a directory: ${DSH_QT_NAPI_DIR}")
-  endif()
 
-  # Three layouts occur in practice, and the order below is deliberate rather
-  # than accidental: `file(GLOB)` returns alphabetically sorted paths, so
-  # globbing all candidates at once silently preferred build/Release over the
-  # published prebuild/<triple>/ layout ("build" < "prebuild"). The published
-  # layout wins because that is what the release workflow uploads.
-  set(_dsh_qt_napi_candidates "")
+# The triple is the one the packaged app looks for at runtime
+# (<app root>/dsh-qt-napi/prebuild/<triple>/qt-bridge.node), computed HERE rather
+# than taken from the input path: a local build/Release/ directory has no triple
+# in its name, and a downloaded artifact may carry several.
+dsh_qt_napi_target_triple(DSH_QT_NAPI_TRIPLE)
+message(STATUS "dsh-qt-app: napi prebuild triple is ${DSH_QT_NAPI_TRIPLE}")
 
-  file(GLOB _dsh_qt_napi_prebuild "${DSH_QT_NAPI_DIR}/prebuild/*/qt-bridge.node")
-  list(SORT _dsh_qt_napi_prebuild)
-  list(APPEND _dsh_qt_napi_candidates ${_dsh_qt_napi_prebuild})
-  list(APPEND _dsh_qt_napi_candidates
-    "${DSH_QT_NAPI_DIR}/qt-bridge.node"
-    "${DSH_QT_NAPI_DIR}/build/Release/qt-bridge.node"
-    "${DSH_QT_NAPI_DIR}/build/Debug/qt-bridge.node")
+# Strict resolution: the target triple decides, a foreign platform never stands in
+# for it, and the chosen file's object format must match the triple.
+# tests/cmake/napi-addon-resolution.cmake covers every rule, including the baseline
+# algorithm that put a Linux ELF inside the Windows package (T29-A).
+dsh_qt_napi_stage(_dsh_qt_napi_addon _dsh_qt_napi_mode
+  "${DSH_QT_NAPI_DIR}" "${DSH_QT_NAPI_TRIPLE}")
 
-  foreach(_candidate IN LISTS _dsh_qt_napi_candidates)
-    if(EXISTS "${_candidate}")
-      set(DSH_QT_NAPI_ADDON "${_candidate}")
-      break()
-    endif()
-  endforeach()
-
-  if(NOT DSH_QT_NAPI_ADDON)
-    message(FATAL_ERROR
-      "DSH_QT_NAPI_DIR=${DSH_QT_NAPI_DIR} contains no qt-bridge.node. "
-      "Build the addon first (npm run build in dsh-qt-napi) or point the option at its prebuild/<triple>/ directory.")
-  endif()
-
+if(_dsh_qt_napi_mode STREQUAL "bundled")
+  set(DSH_QT_NAPI_ADDON "${_dsh_qt_napi_addon}"
+    CACHE FILEPATH "Resolved dsh-qt-napi addon path (internal)" FORCE)
   message(STATUS "dsh-qt-app: bundling dsh-qt-napi addon ${DSH_QT_NAPI_ADDON}")
 else()
+  set(DSH_QT_NAPI_ADDON ""
+    CACHE FILEPATH "Resolved dsh-qt-napi addon path (internal)" FORCE)
   message(STATUS "dsh-qt-app: no DSH_QT_NAPI_DIR given — packaging will ship the degraded renderer")
 endif()
-
-# The addon is installed into exactly the layout the loader already searches, so
-# a packaged app finds it with no environment variable set:
-#
-#   <app root>/dsh-qt-napi/prebuild/<platform>-<arch>/qt-bridge.node
-#
-# That is the `<searchRoot>/<pkg>/prebuild/<triple>/` rule in
-# src/qt-bridge/napi-loader.ts, with searchRoot = the app directory. The triple
-# mimics Node's process.platform/process.arch names because that is the string the
-# loader builds, and it is computed HERE rather than taken from the input path
-# (a local build/Release/ directory has no triple in its name).
-if(WIN32)
-  set(_dsh_qt_platform win32)
-elseif(APPLE)
-  set(_dsh_qt_platform darwin)
-else()
-  set(_dsh_qt_platform linux)
-endif()
-
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
-  set(_dsh_qt_arch arm64)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-  set(_dsh_qt_arch x64)
-else()
-  set(_dsh_qt_arch "${CMAKE_SYSTEM_PROCESSOR}")
-endif()
-
-set(DSH_QT_NAPI_TRIPLE "${_dsh_qt_platform}-${_dsh_qt_arch}")
-message(STATUS "dsh-qt-app: napi prebuild triple is ${DSH_QT_NAPI_TRIPLE}")
 
 # ---------------------------------------------------------------------------
 # Installation layout

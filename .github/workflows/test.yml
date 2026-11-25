@@ -178,6 +178,23 @@ jobs:
         run: |
           node -e "const p=require('./package.json'); const want=process.env.NAPI_SHA; const got=p.dshQtNapi&&p.dshQtNapi.commit; if(got!==want){console.error('addon SHA lock mismatch: package.json='+got+' env='+want);process.exit(1)} console.log('addon SHA lock ok: '+got)"
 
+      # The staging rules decide which prebuild directory travels inside the
+      # package, so they run on every OS. Script mode: no Qt, no compiler, and the
+      # fixtures are four-byte files carrying real object-format magic.
+      # The legacy run is the negative control — the baseline 5671824 algorithm
+      # must still fail the case table, or the table has stopped detecting T29-A.
+      - name: Assert the addon staging rules pick the target triple
+        shell: bash
+        run: |
+          cmake -DMODE=resolver -DDSH_QT_NAPI_TEST_ROOT=build/napi-fixtures-resolver \
+            -P tests/cmake/napi-addon-resolution.cmake
+          if cmake -DMODE=legacy -DDSH_QT_NAPI_TEST_ROOT=build/napi-fixtures-legacy \
+              -P tests/cmake/napi-addon-resolution.cmake; then
+            echo "::error::the baseline staging algorithm no longer fails the case table"
+            exit 1
+          fi
+          echo "baseline staging algorithm still fails the table, as expected"
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -652,8 +669,7 @@ jobs:
 
 
       # The package is only trustworthy if its license material survived
-      # archiving. This is the Linux leg; Windows NSIS/ZIP is covered by the
-      # packaging matrix (the local TGZ acceptance test is tests/packaging.test.ts).
+      # archiving, and if the executable inside it is for the platform it claims.
       - name: Assert archive ships LICENSE + notices + SHA-256
         if: runner.os == 'Linux'
         shell: bash
@@ -667,6 +683,33 @@ jobs:
             exit 1
           fi
           bash scripts/check-archive.sh "${archives[0]}"
+
+      # Same contents check on the archive itself, on BOTH legs. check-archive.sh
+      # only reads .tar.gz, so the Windows ZIP/NSIS package went unverified; this
+      # step unpacks whatever CPack produced and inspects it. This job builds
+      # without the addon on purpose (degraded renderer), and the gate enforces
+      # exactly that: no dsh-qt-napi/ tree, LICENSE + notices present, and a host
+      # executable whose object format matches the runner.
+      - name: Assert the package contents match the platform
+        shell: bash
+        run: |
+          triple="$(node -p "process.platform + '-' + process.arch")"
+          archive=""
+          for candidate in dist/package/*.tar.gz dist/package/*.zip; do
+            if [ -f "$candidate" ]; then archive="$candidate"; break; fi
+          done
+          if [ -z "$archive" ]; then
+            echo "::error::pnpm package produced no archive in dist/package/"
+            exit 1
+          fi
+          rm -rf unpacked && mkdir -p unpacked
+          case "$archive" in
+            *.tar.gz) tar -xzf "$archive" -C unpacked ;;
+            *.zip) 7z x -y -ounpacked "$archive" > /dev/null ;;
+            *) echo "::error::unsupported archive type: $archive"; exit 1 ;;
+          esac
+          root="$(find unpacked -mindepth 1 -maxdepth 1 -type d | head -1)"
+          node scripts/check-package-addon.mjs --dir "$root" --triple "$triple" --expect-addon degraded
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
