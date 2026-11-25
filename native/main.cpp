@@ -50,18 +50,27 @@
 #include <QUrl>
 #include <QVariant>
 #include <QVariantMap>
+#include <QWindow>
 #include <QtGlobal>
 
 #if defined(Q_OS_WIN)
 #include <io.h>
+#include <windows.h>
 #else
 #include <cerrno>
 #include <cstring>
+#include <poll.h>
 #include <unistd.h>
 #endif
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 #include "config.h"
 #include "webview_host.h"
@@ -370,6 +379,19 @@ public:
         flushTimer_ = new QTimer(this);
         flushTimer_->setSingleShot(true);
         connect(flushTimer_, &QTimer::timeout, this, &StdioTransport::flush_);
+        // Windows has no QSocketNotifier support for pipes, so the timer path is
+        // the only option there. POSIX keeps the notifier by default and opts
+        // into the same timer path with DSH_QT_STDIO_POLL=1, which is how the
+        // regression suite drives the Windows read loop on a Linux runner.
+#if defined(Q_OS_WIN)
+        polledReads_ = true;
+#else
+        polledReads_ = qEnvironmentVariableIsSet("DSH_QT_STDIO_POLL");
+#endif
+        // Test-only: reproduce the pre-fix read loop (a blocking ::read on every
+        // tick, with no readiness check) so the regression can prove it fails
+        // there. Nothing outside the test suite sets this.
+        legacyBlockingRead_ = qEnvironmentVariableIsSet("DSH_QT_STDIO_TEST_LEGACY_READ");
     }
 
     ~StdioTransport() override { stop(); }
@@ -379,17 +401,28 @@ public:
         if (active_)
             return true;
         active_ = true;
-#ifndef Q_OS_WIN
-        readNotifier_ = new QSocketNotifier(0, QSocketNotifier::Read, this);
-        connect(readNotifier_, &QSocketNotifier::activated, this, [this]() { readAvailable(); });
-#else
-        // QSocketNotifier cannot watch a pipe on Windows, so poll instead. The
-        // interval is short enough to feel instant and long enough to cost
-        // nothing measurable.
-        pollTimer_ = new QTimer(this);
-        pollTimer_->setInterval(25);
-        connect(pollTimer_, &QTimer::timeout, this, &StdioTransport::readAvailable);
-        pollTimer_->start();
+        if (polledReads_) {
+            // Short enough to feel instant, long enough to cost nothing
+            // measurable. The read itself is readiness-gated (see
+            // stdinReadable_), so an idle pipe costs one PeekNamedPipe/poll per
+            // tick instead of parking the GUI thread inside ::read.
+            pollTimer_ = new QTimer(this);
+            pollTimer_->setInterval(25);
+            connect(pollTimer_, &QTimer::timeout, this, &StdioTransport::readAvailable);
+            pollTimer_->start();
+        } else {
+            readNotifier_ = new QSocketNotifier(0, QSocketNotifier::Read, this);
+            connect(readNotifier_, &QSocketNotifier::activated, this, [this]() { readAvailable(); });
+        }
+#if defined(Q_OS_WIN)
+        // stdout is written from a worker thread on Windows: an anonymous pipe
+        // has no writability probe, so a peer that stops reading would park the
+        // GUI thread inside WriteFile forever.
+        {
+            std::lock_guard<std::mutex> lock(writerMutex_);
+            writerStop_ = false;
+        }
+        writer_ = std::thread([this]() { writerLoop_(); });
 #endif
         emit stateChanged();
         return true;
@@ -397,23 +430,22 @@ public:
 
     void stop()
     {
-        // Each platform declares exactly one of the two readiness members, so the
-        // idle check has to name only the one that exists in this build. Naming
-        // both fails to compile on the other platform.
-#if defined(Q_OS_WIN)
-        const bool idle = !active_ && pollTimer_ == nullptr;
-#else
-        const bool idle = !active_ && readNotifier_ == nullptr;
-#endif
-        if (idle)
+        if (!active_ && pollTimer_ == nullptr && readNotifier_ == nullptr)
             return;
         active_ = false;
-#ifndef Q_OS_WIN
         delete readNotifier_;
         readNotifier_ = nullptr;
-#else
         delete pollTimer_;
         pollTimer_ = nullptr;
+#if defined(Q_OS_WIN)
+        {
+            std::lock_guard<std::mutex> lock(writerMutex_);
+            writerStop_ = true;
+            pending_.clear();
+        }
+        writerWake_.notify_all();
+        if (writer_.joinable())
+            writer_.join();
 #endif
         emit stateChanged();
     }
@@ -429,7 +461,7 @@ public:
 
     qint64 bytesIn() const { return bytesIn_; }
 
-    qint64 bytesOut() const { return bytesOut_; }
+    qint64 bytesOut() const { return bytesOut_.load(); }
 
     int queuedFrames() const { return static_cast<int>(outbound_.size()); }
 
@@ -477,21 +509,42 @@ private:
 
     void flush_()
     {
+#if defined(Q_OS_WIN)
+        // Hand the queue to the writer thread and return: the GUI thread never
+        // calls WriteFile, so a peer that stops reading cannot park it.
+        {
+            std::lock_guard<std::mutex> lock(writerMutex_);
+            while (!outbound_.isEmpty()) {
+                const QByteArray frame = outbound_.takeFirst();
+                if (!frame.isEmpty())
+                    pending_.push_back(frame);
+            }
+        }
+        writerWake_.notify_one();
+#else
         while (!outbound_.isEmpty()) {
             QByteArray &front = outbound_.first();
             if (front.isEmpty()) {
                 outbound_.removeFirst();
                 continue;
             }
-            qint64 written = 0;
-#if defined(Q_OS_WIN)
-            written = ::_write(1, front.constData(), static_cast<unsigned int>(front.size()));
-            if (written < 0) {
+            // Ask the kernel whether the pipe can take bytes right now. Writing
+            // blind is what turns a slow reader into a frozen UI thread.
+            struct pollfd writable = {1, POLLOUT, 0};
+            const int ready = ::poll(&writable, 1, 0);
+            if (ready == 0) {
                 scheduleFlush_();
                 return;
             }
-#else
-            written = ::write(1, front.constData(), static_cast<size_t>(front.size()));
+            if (ready < 0) {
+                if (errno == EINTR)
+                    continue;
+                emit failed(QStringLiteral("stdout poll failed: ")
+                            + QString::fromLocal8Bit(std::strerror(errno)));
+                stop();
+                return;
+            }
+            const qint64 written = ::write(1, front.constData(), static_cast<size_t>(front.size()));
             if (written < 0) {
                 if (errno == EINTR)
                     continue;
@@ -503,7 +556,6 @@ private:
                 stop();
                 return;
             }
-#endif
             bytesOut_ += written;
             outboundBytes_ -= written;
             if (written < front.size()) {
@@ -513,11 +565,93 @@ private:
             }
             outbound_.removeFirst();
         }
+#endif
+    }
+
+#if defined(Q_OS_WIN)
+    /** Drains `pending_` on its own thread; the GUI thread only enqueues. */
+    void writerLoop_()
+    {
+        std::unique_lock<std::mutex> lock(writerMutex_);
+        for (;;) {
+            writerWake_.wait(lock, [this]() { return writerStop_ || !pending_.empty(); });
+            if (writerStop_ && pending_.empty())
+                return;
+            QByteArray frame = pending_.front();
+            pending_.pop_front();
+            lock.unlock();
+            const int written = ::_write(1, frame.constData(), static_cast<unsigned int>(frame.size()));
+            if (written < 0) {
+                const int error = errno;
+                lock.lock();
+                pending_.clear();
+                writerStop_ = true;
+                lock.unlock();
+                const QString reason = QStringLiteral("stdout write failed: ")
+                                       + QString::fromLocal8Bit(std::strerror(error));
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, reason]() {
+                        emit failed(reason);
+                        stop();
+                    },
+                    Qt::QueuedConnection);
+                return;
+            }
+            bytesOut_ += written;
+            outboundBytes_ -= written;
+            if (written < frame.size()) {
+                // Partial write: keep the remainder at the head of the queue and
+                // pause briefly so a stalled reader cannot spin a core.
+                lock.lock();
+                pending_.push_front(frame.mid(written));
+                lock.unlock();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                lock.lock();
+            }
+        }
+    }
+#endif
+
+    /**
+     * True when stdin has bytes (or has reached EOF/error) waiting right now.
+     *
+     * This is the whole fix for the Windows freeze: ::read on an idle anonymous
+     * pipe blocks, and a blocked GUI thread stops repainting, stops every QTimer
+     * (including the 5 s handshake deadline) and looks exactly like "the process
+     * is alive but the window is dead". PeekNamedPipe reports the queued byte
+     * count without consuming anything, so the read below can never wait.
+     */
+    bool stdinReadable_()
+    {
+#if defined(Q_OS_WIN)
+        const HANDLE handle = GetStdHandle(STD_INPUT_HANDLE);
+        if (handle == nullptr || handle == INVALID_HANDLE_VALUE)
+            return false;
+        DWORD available = 0;
+        if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) {
+            // A closed peer is readable: the read below returns 0 and the EOF
+            // path runs. Any other failure is treated as "nothing to read".
+            return GetLastError() == ERROR_BROKEN_PIPE;
+        }
+        return available > 0;
+#else
+        struct pollfd descriptor = {0, POLLIN, 0};
+        const int ready = ::poll(&descriptor, 1, 0);
+        if (ready < 0)
+            return errno == EINTR;
+        return ready > 0 && (descriptor.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
+#endif
     }
 
     void readAvailable()
     {
         if (!active_)
+            return;
+        // Never enter ::read without proof that it cannot block. The legacy
+        // switch exists only so the regression suite can demonstrate the
+        // pre-fix behaviour on a silent-but-open pipe.
+        if (!legacyBlockingRead_ && !stdinReadable_())
             return;
         char chunk[4096];
         qint64 got = 0;
@@ -575,19 +709,27 @@ private:
     }
 
     QTimer *flushTimer_ = nullptr;
-#ifndef Q_OS_WIN
     QSocketNotifier *readNotifier_ = nullptr;
-#else
     QTimer *pollTimer_ = nullptr;
-#endif
     QByteArray inbound_;
     QList<QByteArray> outbound_;
-    qint64 outboundBytes_ = 0;
+    // Bytes still owed to the peer: read on the GUI thread (send/backpressure)
+    // and decremented by the Windows writer thread, so it has to be atomic.
+    std::atomic<qint64> outboundBytes_{0};
+    std::atomic<qint64> bytesOut_{0};
     qint64 bytesIn_ = 0;
-    qint64 bytesOut_ = 0;
     int droppedFrames_ = 0;
     bool overflowReported_ = false;
     bool active_ = false;
+    bool polledReads_ = false;
+    bool legacyBlockingRead_ = false;
+#if defined(Q_OS_WIN)
+    std::thread writer_;
+    std::mutex writerMutex_;
+    std::condition_variable writerWake_;
+    std::deque<QByteArray> pending_;
+    bool writerStop_ = false;
+#endif
 };
 
 /**
@@ -1369,6 +1511,59 @@ private:
     QHash<QString, QString> webuiIntents_;
 };
 
+/**
+ * GUI-thread heartbeat, for the pipe-blocking regression
+ * (tests/gui-heartbeat.e2e.ts).
+ *
+ * One line per tick, written straight to the file and flushed, so a reader that
+ * polls the file sees the event loop turning in real time. If something parks
+ * the GUI thread — the pre-fix Windows read loop did exactly that — the file
+ * stops growing while the process stays alive, which is the failure mode users
+ * see as "the window never appears".
+ *
+ *   hb <sequence> <elapsed-ms> <top-level-windows> <exposed> <visible>
+ *
+ * Off unless DSH_QT_HEARTBEAT_FILE is set, so production runs pay nothing.
+ */
+static void startGuiHeartbeat(QCoreApplication &app)
+{
+    const QString path = qEnvironmentVariable("DSH_QT_HEARTBEAT_FILE");
+    if (path.isEmpty())
+        return;
+    auto *file = new QFile(path, &app);
+    if (!file->open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return;
+    auto *elapsed = new QElapsedTimer;
+    elapsed->start();
+    auto *sequence = new int(0);
+    auto *timer = new QTimer(&app);
+    timer->setInterval(50);
+    QObject::connect(timer, &QTimer::timeout, &app, [file, elapsed, sequence]() {
+        int windows = 0;
+        int exposed = 0;
+        int visible = 0;
+        const QWindowList topLevel = QGuiApplication::topLevelWindows();
+        for (QWindow *window : topLevel) {
+            if (window == nullptr)
+                continue;
+            ++windows;
+            if (window->isExposed())
+                ++exposed;
+            if (window->isVisible())
+                ++visible;
+        }
+        file->write(QStringLiteral("hb %1 %2 %3 %4 %5\n")
+                        .arg(++*sequence)
+                        .arg(elapsed->elapsed())
+                        .arg(windows)
+                        .arg(exposed)
+                        .arg(visible)
+                        .toUtf8());
+        file->flush();
+    });
+    timer->start();
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(DSH_QT_HAS_WEBENGINE) && DSH_QT_HAS_WEBENGINE
@@ -1381,6 +1576,10 @@ int main(int argc, char *argv[])
     QGuiApplication::setOrganizationName(QStringLiteral(DSH_QT_APP_ORGANIZATION));
 
     QQuickStyle::setStyle(QStringLiteral("Basic"));
+
+    // Before anything can block: the regression reads this file to tell a live
+    // GUI thread from a parked one.
+    startGuiHeartbeat(app);
 
     // Declared before the engine: the engine must not outlive the objects it
     // exposes through context properties.

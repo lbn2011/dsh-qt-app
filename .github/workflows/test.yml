@@ -469,6 +469,132 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # qt-gui-heartbeat: prove the GUI thread keeps running while stdin is idle.
+  #
+  # T93-1: the Windows read loop called ::_read from a 25 ms timer. On Windows
+  # that call blocks on an idle anonymous pipe, so the GUI thread parked, every
+  # QTimer stopped (including the 5 s handshake deadline) and the process stayed
+  # alive with no window and no log line. The Linux build reads through
+  # QSocketNotifier, which is why the suite never caught it.
+  #
+  # The test asks the binary for a heartbeat: a 50 ms QTimer on the GUI thread
+  # appends `hb <seq> <elapsed> <windows> <exposed> <visible>` to
+  # DSH_QT_HEARTBEAT_FILE. The test then holds stdin open and silent and
+  # requires the ticks to keep coming, with a real QWindow created and exposed.
+  # Its second case sets DSH_QT_STDIO_TEST_LEGACY_READ=1, which reproduces the
+  # pre-fix read shape inside the same binary, and requires that same heartbeat
+  # to stall — the red side of the regression, so this cannot pass by only
+  # checking that the process is alive.
+  #
+  # Both hosted runners run it on purpose: Windows is where the defect lives,
+  # Linux is where the fixed read path must stay identical. The Windows runner
+  # has no physical display; if window exposure turns out to be unavailable
+  # there, set DSH_QT_EXPECT_NO_DESKTOP=1 on that job and record the exposure
+  # gap in the test record — never drop the heartbeat assertion instead.
+  # ---------------------------------------------------------------------------
+  qt-gui-heartbeat:
+    name: qt gui heartbeat (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      # The xcb/GL libraries are what the Qt Quick window and the offscreen
+      # platform plugin link against; install-qt-action does not install them.
+      - name: Install Linux Qt runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libgl1-mesa-dev libxkbcommon-dev libxcb-cursor0
+
+      - name: Build TypeScript
+        run: pnpm build
+
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDSH_QT_WEBENGINE=OFF
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --parallel 2
+
+      # MSVC is a multi-config generator: the executable lands in build/Release.
+      # Resolve it once here so the test step cannot silently skip itself on a
+      # path that does not exist (the e2e skips when the binary is missing).
+      - name: Resolve the binary under test
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            candidate="build/Release/dsh-qt-app.exe"
+            [ -f "$candidate" ] || candidate="build/dsh-qt-app.exe"
+          else
+            candidate="build/dsh-qt-app"
+          fi
+          if [ ! -f "$candidate" ]; then
+            echo "::error::no dsh-qt-app binary was built; build/ contains:"
+            ls -R build | head -50 || true
+            exit 1
+          fi
+          echo "binary=$candidate"
+          echo "DSH_QT_APP_BINARY=$GITHUB_WORKSPACE/$candidate" >> "$GITHUB_ENV"
+
+      - name: Run the GUI heartbeat regression
+        shell: bash
+        run: |
+          set -o pipefail
+          pnpm exec tsx --test tests/gui-heartbeat.e2e.ts 2>&1 | tee gui-heartbeat.log
+
+      # A skip would leave the log green without a single assertion, so the
+      # summary is checked as well as the exit code.
+      - name: Assert the regression really ran
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -qE '^# SKIP|skipped [1-9]' gui-heartbeat.log; then
+            echo '::error::the GUI heartbeat regression skipped itself — see gui-heartbeat.log'
+            exit 1
+          fi
+          if ! grep -qE 'pass 3' gui-heartbeat.log; then
+            echo '::error::expected three passing cases in gui-heartbeat.log'
+            tail -40 gui-heartbeat.log
+            exit 1
+          fi
+
+      - name: Upload the GUI heartbeat log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-heartbeat-log-${{ matrix.os }}
+          path: gui-heartbeat.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # qt-webengine: compile the WebEngine branch and prove it really loads.
   #
   # The mandatory Qt jobs above use the default Qt install, which does not ship
