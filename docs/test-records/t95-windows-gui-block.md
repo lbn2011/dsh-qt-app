@@ -49,17 +49,22 @@ readable, which is exactly why no test caught it.
   `ERROR_PIPE_NOT_CONNECTED` mean EOF; **any other** `PeekNamedPipe` failure emits
   `failed("stdin peek failed (error N)")` and stops the transport through the
   existing failure path instead of being swallowed as "nothing to read".
-* **Writes never block the GUI thread on Windows.** `flush_()` moves the queued
-  frames into a `pending_` deque and wakes a dedicated writer thread
-  (`writerLoop_`), which performs the blocking `::_write` outside the GUI
+* **Writes never block the GUI thread on either platform.** The queue is the
+  single source of truth; `flush_()` on Windows only wakes a dedicated writer
+  thread (`writerLoop_`), which performs the blocking `::_write` outside the GUI
   thread, handles partial writes (5 ms backoff) and reports a hard failure back
-  through a queued connection. The POSIX branch gained a `POLLOUT` gate with
-  `::poll(..., 0)`, so a slow reader cannot spin the event loop there either.
-* **Unchanged:** frame order, the 4 MB inbound / 8 MB outbound caps and the
-  oldest-first drop policy, the handshake protocol, the EOF semantics ("a broken
-  pipe is not fatal" for the connection, "do not linger as a ghost window" for
-  the window), and the Linux read path (`QSocketNotifier` stays the default
-  there; `DSH_QT_STDIO_POLL=1` only selects the polled path for tests).
+  through a queued connection. On POSIX `flush_()` writes in place but only after
+  `::poll(POLLOUT, 0)` says the descriptor takes bytes, and never more than one
+  `PIPE_BUF` per call — a slow reader cannot spin or park the event loop there
+  either.
+* **Unchanged:** frame order, the 4 MB inbound / 8 MB outbound caps, the
+  handshake protocol, the EOF semantics ("a broken pipe is not fatal" for the
+  connection, "do not linger as a ghost window" for the window), and the Linux
+  read path (`QSocketNotifier` stays the default there; `DSH_QT_STDIO_POLL=1`
+  only selects the polled path for tests). **Changed in repair round 3:** the
+  drop policy now removes only frames that have not started going out, overflow
+  degrades instead of disconnecting, and both caps are counted over one queue —
+  see §8.
 * **Test instrumentation, not production behaviour.** `startGuiHeartbeat()`
   appends `hb <seq> <elapsedMs> <topLevelWindows> <exposed> <visible>` to
   `DSH_QT_HEARTBEAT_FILE` every 50 ms from the GUI thread, and
@@ -260,3 +265,95 @@ is set there and the summary says exposure was not asserted).
   this defect from any other cause. The delivered binary (`43d15d59`) has no
   heartbeat channel, so that evidence can only come from a build that includes
   this change.
+
+## 8. Repair round 3 (t98 review items A–H)
+
+Base: `a56529c` on `phase3/t95-win-pipe`. All work below is in `native/main.cpp`,
+`tests/gui-heartbeat.e2e.ts` and `.github/workflows/test.yml`; no packaging, no
+installer, no delivered artifact was touched.
+
+### 8.1 Overflow degrades instead of disconnecting (A, B, F)
+
+* One queue (`OutboundQueue`) owns the bytes; the old `outbound_` + `pending_`
+  pair is gone, so the 8 MB cap now counts **everything** that has not been
+  written yet and `queuedFrames()`/`queuedBytes()` read the same source.
+* `dropOldestToFit()` skips frames that already started going out (and frames
+  pinned by a warning) and removes whole frames only, oldest first. A frame on
+  the wire always finishes, so a peer never sees half a line.
+* When only started frames are left, the **new** frame is dropped instead of
+  tearing the session down. Both paths increment `droppedFrames`, and the
+  transport emits one `warn` per episode (`outbound queue overflow; dropped N
+  stale frame(s)` / `outbound queue is full of frames already on the wire; …`).
+* `warn` is a separate signal from `failed`: it never reaches a disconnect path.
+  `DshQtBridge` turns it into a `transport.warn` event carrying `reason`,
+  `droppedFrames` and `queuedBytes`, sent **uncapped and pinned** so the report
+  of a loss cannot itself be the frame the loss drops.
+* `stop()` clears the queue, adds the discarded frames to `droppedFrames` and
+  reports them (`dropped N unsent frame(s) while stopping the transport`).
+* `rejectProtocol_()` now answers with a nack plus a `transport.warn` instead of
+  disconnecting; only a handshake-epoch mismatch stays fatal.
+* The regression gained three cases: overflow-survives-and-parses (10 × 1 MB
+  replies while the reader is paused), oversized-inbound-resynchronises, and
+  stdin-redirected-from-a-file. The existing bounded-exit case now writes raw
+  frames and `waitExit()` clears its timer, so a stalled reader cannot leave a
+  pending promise behind at file end (that flake hid a real hang once). The overflow case asserts the session stays
+  connected, the GUI keeps ticking, every reply that did arrive is a whole
+  1 MB frame, `handled + dropped <= 10`, and a later `host.ping` still answers.
+  It deliberately does **not** claim all ten requests were answered: replies
+  that arrive after the caller's 5 s timeout are timeouts, not answers.
+
+### 8.2 Non-pipe stdin (C, E)
+
+`stdinReadiness_()` classifies the handle once with `GetFileType`. A pipe is
+peeked with `PeekNamedPipe`; anything else (a redirected file, a console) is
+polled with `WaitForSingleObject(handle, 0)` — never a blocking wait. A file is
+always signalled, so the read returns 0 at EOF; a console is signalled only when
+there is input. `ERROR_BROKEN_PIPE`/`ERROR_PIPE_NOT_CONNECTED` mean EOF; every
+other peek failure goes to `failed()` instead of being read as "nothing yet".
+`tests/gui-heartbeat.e2e.ts` covers the redirected-file shape on Linux (empty
+file as stdin, ≥15 beats, process stays up); the Windows console shape is **not**
+executed here.
+
+### 8.3 Inbound limits (D, G)
+
+`readAvailable()` drains in bounded slices (`kReadBudgetPerTick`, 64 KB per
+tick) so a burst cannot starve the GUI thread, and an oversized inbound line is
+dropped through the next newline — including when the newline has not arrived
+yet (`discardingLine_`), so the tail of a discarded line is never parsed as a
+fresh frame. Malformed JSON is dropped with one `transport.warn` instead of
+being fatal.
+
+### 8.4 Red/green evidence (local, Linux)
+
+| Case | Before (`a56529c`) | After |
+| --- | --- | --- |
+| overflow (10 × 1 MB, reader paused) | disconnect via `fail_`, no warning | stays connected, one `transport.warn` with `droppedFrames >= 1`, GUI keeps ticking |
+| oversized inbound (5 MB line, then ping) | tail of the line parsed as a new frame → `malformed frame` | dropped to the next newline, `transport.warn` reports the oversize, ping answers |
+| queue selftest | 17 checks | 17 checks, now including started/pinned protection |
+| full e2e file | 7 cases | 10 cases, all passing |
+
+Commands (Linux, this machine):
+
+```
+cmake -S . -B /tmp/t95-build -DCMAKE_BUILD_TYPE=Release -DDSH_QT_WEBENGINE=OFF
+cmake --build /tmp/t95-build --parallel 2
+DSH_QT_APP_BINARY=/tmp/t95-build/dsh-qt-app pnpm exec tsx --test tests/gui-heartbeat.e2e.ts
+DSH_QT_OUTBOUND_QUEUE_SELFTEST=1 /tmp/t95-build/dsh-qt-app
+node scripts/gate.mjs -- pnpm typecheck
+node scripts/gate.mjs -- pnpm test
+git diff --check
+```
+
+`pnpm test` runs `tests/*.test.ts` only — it does **not** cover
+`tests/gui-heartbeat.e2e.ts`, which needs a built binary and is run explicitly
+(as above, and in the `qt-gui-heartbeat` CI job).
+
+### 8.5 Still not verified here
+
+* No Windows machine was available: the `PeekNamedPipe`, `WaitForSingleObject`
+  and writer-thread paths were compiled and reviewed, not executed.
+* The Windows console (non-pipe) stdin shape has no executed test.
+* `qt-gui-heartbeat` has not run on a hosted runner yet; the CI job is the entry
+  point and asserts `pass 10`, `fail 0`, no skips.
+* `QT_QPA_PLATFORM=offscreen` exposes a top-level window here, but that is not a
+  visible first window on a user's desktop.

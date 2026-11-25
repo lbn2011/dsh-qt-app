@@ -39,7 +39,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -83,6 +83,24 @@ function readBeats(path: string): Beat[] {
 }
 
 /** Longest stretch between two consecutive ticks, in ms. */
+function settleWithin<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  // A request to a process that died without answering would otherwise keep the
+  // file-level promise pending and turn a clear failure into a runner timeout.
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      () => {
+        clearTimeout(timer)
+        resolve(null)
+      },
+    )
+  })
+}
+
 function longestGap(beats: readonly Beat[]): number {
   let gap = 0
   for (let index = 1; index < beats.length; index += 1)
@@ -148,10 +166,20 @@ function launch(options: {
   ): Promise<{ code: number | null; signal: NodeJS.Signals | null } | null> => {
     if (child.exitCode !== null || child.signalCode !== null)
       return { code: child.exitCode, signal: child.signalCode }
-    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((done) => {
-      child.once('exit', (code, signal) => done({ code, signal }))
+    // The timer is cleared when the process exits: a `Promise.race` against an
+    // un-cancelled `delay` leaves a pending timer behind, and the test runner
+    // reports that as "promise resolution is still pending" at file end.
+    return new Promise<{ code: number | null; signal: NodeJS.Signals | null } | null>((done) => {
+      const timer = setTimeout(() => {
+        child.off('exit', onExit)
+        done(null)
+      }, ms)
+      const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+        clearTimeout(timer)
+        done({ code, signal })
+      }
+      child.once('exit', onExit)
     })
-    return Promise.race([exited, delay(ms).then(() => null)])
   }
 
   const stop = async (): Promise<{ code: number | null; signal: NodeJS.Signals | null }> => {
@@ -230,7 +258,7 @@ test(
       // A frame unblocks the read and the protocol advances — the app answers —
       // yet the GUI thread only turns for that one frame and parks again. That
       // combination is the defect: the pipe works, the window does not.
-      const reply = await session.host.invoke('host.ping')
+      const reply = await settleWithin(session.host.invoke('host.ping'), 6_000)
       assert.deepEqual(reply, { pending: 0, state: 'connected' }, 'the frozen app still answered a frame')
       await delay(500)
       // Whether the parked loop turns once more depends on which of the two
@@ -366,12 +394,17 @@ test(
       await session.waitConnected()
       session.child.stdout.pause()
       // Two 200 KB replies overflow any pipe buffer, so the writer is parked.
-      void session.host.invoke('host.echo', { bytes: 200_000 }).catch(() => {})
-      void session.host.invoke('host.echo', { bytes: 200_000 }).catch(() => {})
+      // Raw frames: the host's request bookkeeping would leave a pending promise
+      // behind once the process exits, and this case is about the transport.
+      const ask = (id: string, method: string, params?: Record<string, unknown>): void => {
+        session.child.stdin.write(`${JSON.stringify({ v: 1, kind: 'req', id, method, params })}\n`)
+      }
+      ask('stall-0', 'host.echo', { bytes: 200_000 })
+      ask('stall-1', 'host.echo', { bytes: 200_000 })
       await delay(750)
       assert.equal(session.child.exitCode, null, 'the app should still be running before it is asked to quit')
       const quitAt = Date.now()
-      void session.host.invoke('host.quit').catch(() => {})
+      ask('quit-0', 'host.quit')
       const result = await session.waitExit(5_000)
       const waited = Date.now() - quitAt
       assert.notEqual(result, null, 'the app hung instead of exiting with a stalled reader')
@@ -406,3 +439,162 @@ test('the outbound queue keeps one byte count and drops the oldest frames', { sk
   )
   assert.match(output, /outbound-queue selftest: pass/)
 })
+
+test(
+  'overflow degrades instead of disconnecting, and every received frame still parses',
+  { skip: skipReason, timeout: 120_000 },
+  async () => {
+    // t98 finding 1/2: overflow used to go through the fatal path, and the drop
+    // policy could remove a frame that was already half-written. Now the oldest
+    // *unstarted* frames go, the frame on the wire always finishes, and the loss
+    // is reported once as a `transport.warn` event — no disconnect.
+    const session = launch({ polled: true, testHooks: true, label: 'overflow' })
+    const events: { name: string; payload: Record<string, unknown> }[] = []
+    session.host.onEvent((event) => {
+      events.push({ name: event.name, payload: (event.payload ?? {}) as Record<string, unknown> })
+    })
+    try {
+      await session.waitConnected()
+      const beatsBefore = readBeats(session.beats).length
+      session.child.stdout.pause()
+      // Ten 1 MB replies: the first fills the pipe and is already on the wire, the
+      // rest queue well past the 8 MB cap.
+      const requests = Array.from({ length: 10 }, () =>
+        session.host.invoke('host.echo', { bytes: 1_000_000 }).then(
+          (value) => ({ ok: true as const, value }),
+          (error: unknown) => ({ ok: false as const, error }),
+        ),
+      )
+      await delay(4_000)
+      const beatsDuring = readBeats(session.beats)
+      assert.ok(
+        beatsDuring.length - beatsBefore >= 30,
+        `the GUI thread stalled while its reader was paused (${beatsBefore} → ${beatsDuring.length} beats)`,
+      )
+      assert.equal(session.child.exitCode, null, 'overflow must not kill the session')
+      session.child.stdout.resume()
+      const results = await Promise.all(requests)
+
+      // The warning is queued behind the replies that were already waiting, so
+      // it arrives once the reader drains them — wait for it rather than assume
+      // it is already here.
+      const warnDeadline = Date.now() + 15_000
+      while (
+        events.every((event) => event.name !== 'transport.warn') &&
+        Date.now() < warnDeadline
+      ) {
+        await delay(50)
+      }
+      const warn = events.find((event) => event.name === 'transport.warn')
+      assert.ok(
+        warn !== undefined,
+        `no transport.warn event reached the host: names=${JSON.stringify(events.map((e) => e.name))} ` +
+          `state=${session.host.state} exit=${String(session.child.exitCode)} beats=${readBeats(session.beats).length} ` +
+          `fulfilled=${results.filter((r) => r.ok).length} rejected=${results.filter((r) => !r.ok).length} ` +
+          `lastError=${String(session.host.lastError)} stats=${JSON.stringify(session.host.stats)}`,
+      )
+      const dropped = Number(warn!.payload.droppedFrames ?? 0)
+      assert.ok(dropped > 0, `the warn event did not report a drop count: ${JSON.stringify(warn!.payload)}`)
+
+      const fulfilled = results.filter((result) => result.ok)
+      assert.ok(fulfilled.length > 0, 'no reply survived the stall')
+      for (const result of fulfilled) {
+        const payload = (result as { ok: true; value: { bytes: number; payload: string } }).value
+        assert.equal(payload.payload.length, 1_000_000, 'a reply was split or truncated across the stall')
+      }
+      // Accounting stays honest in both directions: the drop is reported, and no
+      // more replies are counted as answered than the requests that were sent.
+      // A reply that arrives after its caller gave up is a timeout, not an
+      // answer, so this case does not claim all ten were answered.
+      const stats = session.host.stats
+      assert.ok(
+        stats.handled + dropped <= 10,
+        `handled ${stats.handled} + dropped ${dropped} exceeds the ${10} requests sent`,
+      )
+      assert.ok(
+        stats.handled >= 1,
+        `no reply was handled at all (timeouts ${stats.timeouts}, dropped ${dropped})`,
+      )
+      const ping = await session.host.invoke('host.ping')
+      assert.deepEqual(ping, { pending: 0, state: 'connected' }, 'the session did not survive the overflow')
+      assert.equal(session.child.exitCode, null, 'the process is still running after the overflow')
+    } finally {
+      await session.stop()
+    }
+  },
+)
+
+test(
+  'an oversized inbound frame is dropped and the next frame still parses',
+  { skip: skipReason, timeout: 120_000 },
+  async () => {
+    // t98 finding 7 (inbound side): the buffer used to be cleared and the tail of
+    // the oversized line parsed as if it were a fresh frame. Now the transport
+    // resynchronises on the next newline and keeps the session.
+    const session = launch({ polled: true, testHooks: true, label: 'inbound-overflow' })
+    const events: { name: string; payload: Record<string, unknown> }[] = []
+    session.host.onEvent((event) => {
+      events.push({ name: event.name, payload: (event.payload ?? {}) as Record<string, unknown> })
+    })
+    try {
+      await session.waitConnected()
+      const oversized = JSON.stringify({
+        v: 1,
+        kind: 'req',
+        id: 'oversized-1',
+        method: 'host.ping',
+        params: { pad: 'x'.repeat(5_000_000) },
+      })
+      session.child.stdin.write(`${oversized}\n`)
+      await delay(1_000)
+      assert.equal(session.child.exitCode, null, 'the app exited on an oversized inbound frame')
+      const ping = await settleWithin(session.host.invoke('host.ping'), 5_000)
+      assert.deepEqual(ping, { pending: 0, state: 'connected' }, 'the session died on an oversized frame')
+      const warn = events.find((event) => event.name === 'transport.warn')
+      assert.ok(warn !== undefined, 'the oversized frame was dropped without telling the host')
+      assert.match(String(warn!.payload.reason ?? ''), /inbound frame exceeded/)
+      assert.equal(session.child.exitCode, null, 'the process is still running')
+    } finally {
+      await session.stop()
+    }
+  },
+)
+
+test(
+  'stdin redirected from a file does not freeze the GUI thread',
+  { skip: skipReason, timeout: 60_000 },
+  async () => {
+    // t98 finding 3: a non-pipe stdin used to take the plain blocking read. On
+    // Windows a redirected file is "always readable", and an empty console is
+    // never readable — both used to park the GUI thread. Here stdin is a real
+    // file with no data: the app must keep ticking, and it must not spin either.
+    const beats = join(tmpdir(), `dsh-qt-heartbeat-${process.pid}-file-stdin.txt`)
+    const input = join(tmpdir(), `dsh-qt-stdin-${process.pid}.txt`)
+    rmSync(beats, { force: true })
+    rmSync(input, { force: true })
+    writeFileSync(input, '')
+    const fd = openSync(input, 'r')
+    const child = spawn(binary, [], {
+      cwd: root,
+      env: {
+        ...process.env,
+        DSH_QT_HEARTBEAT_FILE: beats,
+        QT_QPA_PLATFORM: process.platform === 'win32' ? 'windows' : 'offscreen',
+      },
+      stdio: [fd, 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    closeSync(fd)
+    child.stdout?.resume()
+    child.stderr?.resume()
+    try {
+      await delay(1_500)
+      const sampled = readBeats(beats)
+      assert.ok(sampled.length >= 15, `the GUI thread stopped ticking with file stdin (${sampled.length} beats)`)
+      assert.equal(child.exitCode, null, 'the app exited instead of staying up with an empty file stdin')
+    } finally {
+      child.kill()
+      rmSync(input, { force: true })
+    }
+  },
+)

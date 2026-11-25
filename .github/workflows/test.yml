@@ -585,8 +585,8 @@ jobs:
             echo '::error::the GUI heartbeat regression skipped itself — see gui-heartbeat.log'
             exit 1
           fi
-          if ! grep -qE 'pass 7' gui-heartbeat.log; then
-            echo '::error::expected seven passing cases in gui-heartbeat.log'
+          if ! grep -qE 'pass 10' gui-heartbeat.log; then
+            echo '::error::expected ten passing cases in gui-heartbeat.log'
             tail -60 gui-heartbeat.log
             exit 1
           fi

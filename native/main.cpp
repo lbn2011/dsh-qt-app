@@ -376,53 +376,104 @@ public:
     int frames() const { return static_cast<int>(frames_.size()); }
     bool isEmpty() const { return frames_.isEmpty(); }
 
-    void append(const QByteArray &frame)
+    void append(const QByteArray &frame, bool pinned = false)
     {
         if (frame.isEmpty())
             return;
-        frames_.append(frame);
+        Frame entry;
+        entry.data = frame;
+        entry.pinned = pinned;
+        frames_.append(entry);
         bytes_ += frame.size();
     }
 
-    /** Pops the front frame; the caller owns those bytes until it requeues them. */
-    bool take(QByteArray &frame)
+    /**
+     * The frame currently being written, marked as started.
+     *
+     * A started frame has bytes on the wire already, so it can never be dropped:
+     * removing it would leave a half line behind and desynchronise the peer's
+     * line-delimited parser. The caller writes from it and reports progress with
+     * `consumeFront()`.
+     */
+    QByteArray *front()
     {
         if (frames_.isEmpty())
-            return false;
-        frame = frames_.takeFirst();
-        bytes_ -= frame.size();
-        return true;
+            return nullptr;
+        frames_.first().started = true;
+        return &frames_.first().data;
     }
 
-    /** Puts an unwritten tail back at the head, so ordering is preserved. */
-    void requeueFront(const QByteArray &frame)
+    /** Removes `count` written bytes; pops the frame once it is fully sent. */
+    void consumeFront(int count)
     {
-        if (frame.isEmpty())
+        if (frames_.isEmpty() || count <= 0)
             return;
-        frames_.prepend(frame);
-        bytes_ += frame.size();
+        Frame &entry = frames_.first();
+        const int taken = count < entry.data.size() ? count : entry.data.size();
+        bytes_ -= taken;
+        entry.data.remove(0, taken);
+        if (entry.data.isEmpty())
+            frames_.removeFirst();
     }
 
-    /** Drops whole frames from the head until `incoming` more bytes fit. */
+    /**
+     * Drops whole frames that have not started yet.
+     *
+     * Returns the number dropped, or -1 when the incoming frame does not fit even
+     * after every droppable frame is gone — the caller must then drop the
+     * *incoming* frame instead, because the only thing left is a frame already on
+     * the wire.
+     */
     int dropOldestToFit(qint64 incoming, qint64 cap)
     {
+        if (bytes_ + incoming <= cap)
+            return 0;
         int dropped = 0;
-        while (!frames_.isEmpty() && bytes_ + incoming > cap) {
-            bytes_ -= frames_.first().size();
-            frames_.removeFirst();
+        int index = 0;
+        while (index < frames_.size() && bytes_ + incoming > cap) {
+            if (frames_[index].started || frames_[index].pinned) {
+                ++index;
+                continue;
+            }
+            bytes_ -= frames_[index].data.size();
+            frames_.removeAt(index);
             ++dropped;
         }
+        if (bytes_ + incoming > cap)
+            return -1;
         return dropped;
     }
 
-    void clear()
+    /** Drops everything and reports how many frames that discarded. */
+    int clear()
     {
+        const int count = static_cast<int>(frames_.size());
         frames_.clear();
         bytes_ = 0;
+        return count;
+    }
+
+    int startedFrames() const
+    {
+        int count = 0;
+        for (const Frame &frame : frames_) {
+            if (frame.started)
+                ++count;
+        }
+        return count;
     }
 
 private:
-    QList<QByteArray> frames_;
+    struct Frame
+    {
+        QByteArray data;
+        bool started = false;
+        // Warnings are never the frame an overflow discards: they exist to
+        // explain the loss, and they are tiny and emitted once per episode.
+        bool pinned = false;
+    };
+
+    QList<Frame> frames_;
     qint64 bytes_ = 0;
 };
 
@@ -510,6 +561,12 @@ public:
     {
         if (active_)
             return true;
+        // Invariant: once the writer thread had to be detached it still owns fd 1
+        // and may write at any moment. Starting a second writer would interleave
+        // two writers on one pipe and split lines, so a detached transport is
+        // terminal — it never restarts, and the caller has to build a new one.
+        if (writerDetached_)
+            return false;
         active_ = true;
         if (polledReads_) {
             // Short enough to feel instant, long enough to cost nothing
@@ -578,16 +635,27 @@ public:
                     state_->orphaned = true;
                 }
                 writer_.detach();
-                emit failed(QStringLiteral("stdout writer did not stop within %1 ms; detached it")
-                                .arg(kWriterJoinTimeoutMs));
+                writerDetached_ = true;
+                emit warn(QStringLiteral("stdout writer did not stop within %1 ms; detached it "
+                                         "and this transport will not restart")
+                              .arg(kWriterJoinTimeoutMs));
             }
         }
 #endif
+        int discarded = 0;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            state_->queue.clear();
+            // Frames that never reached the peer are dropped replies: count them
+            // so the loss is visible in droppedFrames()/queuedBytes() instead of
+            // vanishing with the queue.
+            discarded = state_->queue.clear();
+            state_->droppedFrames += discarded;
         }
         state_->overflowReported = false;
+        if (discarded > 0) {
+            emit warn(QStringLiteral("dropped %1 unsent frame(s) while stopping the transport")
+                          .arg(discarded));
+        }
         emit stateChanged();
     }
 
@@ -620,7 +688,36 @@ public:
 
     int droppedFrames() const { return state_->droppedFrames.load(); }
 
-    /** Queue one message; flushes immediately when the pipe accepts it. */
+    /**
+     * Queue one message; flushes immediately when the pipe accepts it.
+     *
+     * Overflow is a degradation, not a failure: the peer stopped reading, so the
+     * oldest frames that have not started on the wire are dropped, the caller is
+     * told once through `warn()`, and the session stays up. A frame that is
+     * already half-written is never dropped — dropping it would leave a partial
+     * line and desynchronise the reader — so when only such a frame is left the
+     * *new* frame is the one that goes, and it is counted as dropped.
+     */
+    /**
+     * Queue a small diagnostic frame even when the queue is over its cap.
+     *
+     * A warning explains an overflow, so the overflow must not be allowed to
+     * swallow the warning itself. Only warn frames take this path and each
+     * episode reports once, so the extra memory stays bounded.
+     */
+    void sendUncapped(const QJsonObject &message)
+    {
+        if (!active_)
+            return;
+        QByteArray line = QJsonDocument(message).toJson(QJsonDocument::Compact);
+        line.append('\n');
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->queue.append(line, /*pinned=*/true);
+        }
+        flush_();
+    }
+
     void send(const QJsonObject &message)
     {
         if (!active_)
@@ -628,22 +725,37 @@ public:
         QByteArray line = QJsonDocument(message).toJson(QJsonDocument::Compact);
         line.append('\n');
         int dropped = 0;
+        bool refused = false;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            // Drop from the head of the one queue: a stale reply is worth less
-            // than staying alive, and the requester has already timed out.
             dropped = state_->queue.dropOldestToFit(line.size(), kMaxOutboundBytes);
-            state_->droppedFrames += dropped;
-            state_->queue.append(line);
+            if (dropped < 0) {
+                refused = true;
+                dropped = 0;
+                state_->droppedFrames += 1;
+            } else {
+                state_->droppedFrames += dropped;
+                state_->queue.append(line);
+            }
         }
-        if (dropped > 0 && !state_->overflowReported.exchange(true))
-            emit failed(QStringLiteral("outbound queue overflow; dropping the oldest replies"));
+        if ((refused || dropped > 0) && !state_->overflowReported.exchange(true)) {
+            emit warn(refused
+                          ? QStringLiteral("outbound queue is full of frames already on the wire; "
+                                           "dropping new replies until the peer reads again")
+                          : QStringLiteral("outbound queue overflow; dropped %1 stale frame(s)")
+                                .arg(dropped));
+        }
         flush_();
     }
 
 signals:
     void messageReceived(const QJsonObject &message);
     void failed(const QString &reason);
+    /**
+     * A non-fatal degradation: the session keeps running and the caller gets one
+     * event per episode. Never connect this to a disconnect path.
+     */
+    void warn(const QString &reason);
     void stateChanged();
 
 private:
@@ -672,49 +784,46 @@ private:
         state_->wake.notify_one();
 #else
         for (;;) {
-            QByteArray frame;
-            if (!state_->queue.take(frame))
+            QByteArray *frame = state_->queue.front();
+            if (frame == nullptr)
                 return;
-            while (!frame.isEmpty()) {
-                // Ask the kernel whether the pipe can take bytes right now.
-                // Writing blind is what turns a slow reader into a frozen UI.
-                struct pollfd writable = {1, POLLOUT, 0};
-                const int ready = ::poll(&writable, 1, 0);
-                if (ready == 0) {
-                    state_->queue.requeueFront(frame);
+            // Ask the kernel whether the pipe can take bytes right now. Writing
+            // blind is what turns a slow reader into a frozen UI thread.
+            struct pollfd writable = {1, POLLOUT, 0};
+            const int ready = ::poll(&writable, 1, 0);
+            if (ready == 0) {
+                // The frame stays at the head, marked started, and is resumed by
+                // the next flush — never dropped, so the line stays whole.
+                scheduleFlush_();
+                return;
+            }
+            if (ready < 0) {
+                if (errno == EINTR)
+                    continue;
+                emit failed(QStringLiteral("stdout poll failed: ")
+                            + QString::fromLocal8Bit(std::strerror(errno)));
+                stop();
+                return;
+            }
+            // At most PIPE_BUF per call: a larger blocking write can park until
+            // the whole buffer drains, which is the very thing this class
+            // promises never to do on the GUI thread.
+            const int chunk = frame->size() > kWriteChunkBytes ? kWriteChunkBytes : frame->size();
+            const ssize_t written = ::write(1, frame->constData(), static_cast<size_t>(chunk));
+            if (written < 0) {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     scheduleFlush_();
                     return;
                 }
-                if (ready < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    state_->queue.requeueFront(frame);
-                    emit failed(QStringLiteral("stdout poll failed: ")
-                                + QString::fromLocal8Bit(std::strerror(errno)));
-                    stop();
-                    return;
-                }
-                // At most PIPE_BUF per call: a larger blocking write can park
-                // until the whole buffer drains, which is the very thing this
-                // class promises never to do on the GUI thread.
-                const int chunk = frame.size() > kWriteChunkBytes ? kWriteChunkBytes : frame.size();
-                const ssize_t written = ::write(1, frame.constData(), static_cast<size_t>(chunk));
-                if (written < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    state_->queue.requeueFront(frame);
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        scheduleFlush_();
-                        return;
-                    }
-                    emit failed(QStringLiteral("stdout write failed: ")
-                                + QString::fromLocal8Bit(std::strerror(errno)));
-                    stop();
-                    return;
-                }
-                state_->bytesOut += written;
-                frame.remove(0, static_cast<int>(written));
+                emit failed(QStringLiteral("stdout write failed: ")
+                            + QString::fromLocal8Bit(std::strerror(errno)));
+                stop();
+                return;
             }
+            state_->bytesOut += written;
+            state_->queue.consumeFront(static_cast<int>(written));
         }
 #endif
     }
@@ -737,12 +846,13 @@ private:
                     return;
                 continue;
             }
-            QByteArray frame;
-            if (!state->queue.take(frame))
-                continue;
-            const int chunk = frame.size() > kWriteChunkBytes ? kWriteChunkBytes : frame.size();
+            QByteArray *frame = state->queue.front();
+            const int chunk = frame->size() > kWriteChunkBytes ? kWriteChunkBytes : frame->size();
+            // Copy before unlocking: the queue may be dropped into while the
+            // write is in flight, and a started frame is never removed anyway.
+            const QByteArray piece = frame->left(chunk);
             lock.unlock();
-            const int written = ::_write(1, frame.constData(), static_cast<unsigned int>(chunk));
+            const int written = ::_write(1, piece.constData(), static_cast<unsigned int>(piece.size()));
             const int error = written < 0 ? errno : 0;
             lock.lock();
             if (written < 0) {
@@ -764,10 +874,11 @@ private:
                 return;
             }
             state->bytesOut += written;
-            if (written < frame.size()) {
-                // Partial write: keep the remainder at the head of the queue and
-                // pause briefly so a stalled reader cannot spin a core.
-                state->queue.requeueFront(frame.mid(written));
+            state->queue.consumeFront(written);
+            if (written < piece.size()) {
+                // Partial write: the frame stays at the head, still marked
+                // started, and we pause briefly so a stalled reader cannot spin
+                // a core. Nothing is requeued, so no line can be split or lost.
                 lock.unlock();
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 lock.lock();
@@ -776,15 +887,6 @@ private:
     }
 #endif
 
-    /**
-     * True when stdin has bytes (or has reached EOF/error) waiting right now.
-     *
-     * This is the whole fix for the Windows freeze: ::read on an idle anonymous
-     * pipe blocks, and a blocked GUI thread stops repainting, stops every QTimer
-     * (including the 5 s handshake deadline) and looks exactly like "the process
-     * is alive but the window is dead". PeekNamedPipe reports the queued byte
-     * count without consuming anything, so the read below can never wait.
-     */
     /**
      * What stdin looks like right now, without touching it.
      *
@@ -810,19 +912,28 @@ private:
                 *reason = QStringLiteral("stdin handle is not available");
             return StdinReadiness::Failed;
         }
-        // Only pipes get the peek treatment. A redirected file or console has no
-        // byte count to peek at, and ::read on a file at EOF simply returns 0, so
-        // those fall back to the plain blocking read this class always used.
-        if (!stdinIsPipe_)
-            return StdinReadiness::Ready;
+        // Only pipes have a byte count to peek at. A redirected file or a console
+        // needs a different zero-timeout probe, because a bare ::read there can
+        // block the GUI thread just like a pipe: a file is always "signaled" (and
+        // returns 0 at EOF), while a console is signaled only when input is
+        // pending. Never wait with a timeout here — the event loop has to turn.
+        if (!stdinIsPipe_) {
+            const DWORD state = WaitForSingleObject(handle, 0);
+            if (state == WAIT_OBJECT_0)
+                return StdinReadiness::Ready;
+            if (state == WAIT_TIMEOUT)
+                return StdinReadiness::Idle;
+            if (reason != nullptr)
+                *reason = QStringLiteral("stdin wait failed (error %1)").arg(GetLastError());
+            return StdinReadiness::Failed;
+        }
         DWORD available = 0;
         if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) {
             const DWORD error = GetLastError();
             if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED)
                 return StdinReadiness::Broken;
-            if (reason != nullptr) {
+            if (reason != nullptr)
                 *reason = QStringLiteral("stdin peek failed (error %1)").arg(error);
-            }
             return StdinReadiness::Failed;
         }
         return available > 0 ? StdinReadiness::Ready : StdinReadiness::Idle;
@@ -915,9 +1026,38 @@ private:
         }
         if (moved == 0)
             return;
+        if (discardingLine_) {
+            // The rest of an oversized line: throw bytes away until its newline,
+            // then resume normal parsing with whatever follows it.
+            const int newline = inbound_.indexOf('\n');
+            if (newline < 0) {
+                inbound_.clear();
+                return;
+            }
+            inbound_.remove(0, newline + 1);
+            discardingLine_ = false;
+        }
         if (inbound_.size() > kMaxInboundBytes) {
-            inbound_.clear();
-            emit failed(QStringLiteral("inbound buffer overflow; dropping partial message"));
+            // A frame longer than the cap cannot be reassembled, so drop through
+            // to the next newline and keep going. Parsing what is left would treat
+            // the tail of an oversized line as a fresh frame, and the session is
+            // not worth tearing down over one hostile length. When the newline has
+            // not arrived yet, remember that we are inside a discarded line so its
+            // remainder is thrown away instead of being parsed.
+            const int newline = inbound_.indexOf('\n');
+            if (newline < 0) {
+                inbound_.clear();
+                discardingLine_ = true;
+            } else {
+                inbound_.remove(0, newline + 1);
+            }
+            ++oversizedInbound_;
+            if (!oversizedInboundReported_) {
+                oversizedInboundReported_ = true;
+                emit warn(QStringLiteral("inbound frame exceeded %1 bytes; dropped it and "
+                                         "resynchronised on the next newline")
+                              .arg(kMaxInboundBytes));
+            }
             return;
         }
         int start = 0;
@@ -939,7 +1079,15 @@ private:
         QJsonParseError error{};
         const QJsonDocument document = QJsonDocument::fromJson(line, &error);
         if (error.error != QJsonParseError::NoError || !document.isObject()) {
-            emit failed(QStringLiteral("malformed frame from Node: ") + error.errorString());
+            // One bad line must not kill the session: the line has already ended,
+            // so framing is intact and the next frame can be parsed normally.
+            ++malformedInbound_;
+            if (!malformedInboundReported_) {
+                malformedInboundReported_ = true;
+                emit warn(QStringLiteral("malformed frame from Node (%1); dropping it and "
+                                         "continuing")
+                              .arg(error.errorString()));
+            }
             return;
         }
         emit messageReceived(document.object());
@@ -957,6 +1105,13 @@ private:
     bool polledReads_ = false;
     bool legacyBlockingRead_ = false;
     bool stdinIsPipe_ = false;
+    // Set when the writer thread had to be detached; start() refuses afterwards.
+    bool writerDetached_ = false;
+    bool discardingLine_ = false;
+    int oversizedInbound_ = 0;
+    bool oversizedInboundReported_ = false;
+    int malformedInbound_ = 0;
+    bool malformedInboundReported_ = false;
 #if defined(Q_OS_WIN)
     std::thread writer_;
     std::future<void> writerDone_;
@@ -1004,6 +1159,7 @@ public:
     {
         connect(transport_, &StdioTransport::messageReceived, this, &DshQtBridge::handleMessage_);
         connect(transport_, &StdioTransport::failed, this, &DshQtBridge::handleTransportFailure_);
+        connect(transport_, &StdioTransport::warn, this, &DshQtBridge::handleTransportWarning_);
         connect(transport_, &StdioTransport::stateChanged, this, &DshQtBridge::transportStateChanged);
 
         elapsed_.start();
@@ -1355,7 +1511,8 @@ private:
             return; // duplicate ack: the first one already won
         const QString epoch = frame.value(QStringLiteral("epoch")).toString();
         if (epoch != epoch_) {
-            rejectProtocol_(QStringLiteral("protocol"), QStringLiteral("hello.ack epoch does not match this session"));
+            rejectProtocol_(QStringLiteral("protocol"), QStringLiteral("hello.ack epoch does not match this session"),
+                            true);
             return;
         }
         connecting_ = false;
@@ -1499,14 +1656,26 @@ private:
         emit eventReceived(name, topic, payload);
     }
 
-    void rejectProtocol_(const QString &code, const QString &message)
+    /**
+     * Answer a bad frame with a nack and keep the session.
+     *
+     * A malformed request is one bad line, not a dead peer: the line already
+     * ended, so framing is intact and the next frame can be handled normally.
+     * `fatal` is reserved for handshake-level violations, where continuing would
+     * mean talking to a peer that disagrees about the session itself.
+     */
+    void rejectProtocol_(const QString &code, const QString &message, bool fatal = false)
     {
         if (transport_->isActive()) {
             sendFrame_(QJsonObject{{QStringLiteral("kind"), QStringLiteral("nack")},
                                    {QStringLiteral("code"), code},
                                    {QStringLiteral("message"), message}});
         }
-        failConnection_(QStringLiteral("protocol: ") + message);
+        if (fatal) {
+            failConnection_(QStringLiteral("protocol: ") + message);
+            return;
+        }
+        handleTransportWarning_(QStringLiteral("protocol: ") + message);
     }
 
     void failConnection_(const QString &reason)
@@ -1549,6 +1718,34 @@ private:
     void handleTransportFailure_(const QString &reason)
     {
         failConnection_(reason);
+    }
+
+    /**
+     * A degradation the transport survived: queue overflow, a dropped oversized
+     * frame, a malformed line, a detached writer. None of these may disconnect —
+     * they are reported once per episode so the host can turn them into a
+     * readable error and the UI can show a warning.
+     */
+    void handleTransportWarning_(const QString &reason)
+    {
+        lastWarning_ = reason;
+        if (transport_->isActive()) {
+            // Uncapped: the warning describes the overflow and must not be the
+            // frame the overflow drops.
+            QJsonObject frame{
+                {QStringLiteral("kind"), QStringLiteral("evt")},
+                {QStringLiteral("seq"), eventSeq_++},
+                {QStringLiteral("epoch"), epoch_},
+                {QStringLiteral("name"), QStringLiteral("transport.warn")},
+                {QStringLiteral("payload"),
+                 QJsonObject{{QStringLiteral("reason"), reason},
+                             {QStringLiteral("droppedFrames"), transport_->droppedFrames()},
+                             {QStringLiteral("queuedBytes"), transport_->queuedBytes()}}}};
+            frame.insert(QStringLiteral("v"), 1);
+            transport_->sendUncapped(frame);
+        }
+        emit eventReceived(QStringLiteral("transport.warn"), QStringLiteral("transport"),
+                           QVariantMap{{QStringLiteral("reason"), reason}});
     }
 
     void expirePending_()
@@ -1739,6 +1936,7 @@ private:
     qint64 eventSeq_ = 0;
     bool connecting_ = false;
     bool connected_ = false;
+    QString lastWarning_;
     // Test-only method set (host.echo); see handleHostRequest_.
     bool testHooks_ = qEnvironmentVariableIsSet("DSH_QT_TEST_HOOKS");
     bool hadConnected_ = false;
@@ -1849,14 +2047,7 @@ static int runOutboundQueueSelftest()
         check(queue.dropOldestToFit(5, 30) == 1,
               "drops the oldest frame when the incoming one would exceed the cap");
         check(queue.bytes() == 20 && queue.frames() == 1, "recounts after a drop");
-        QByteArray frame;
-        check(queue.take(frame) && frame.size() == 20, "take pops the surviving frame");
-        check(queue.bytes() == 0 && queue.isEmpty(), "take leaves nothing owed");
-        queue.requeueFront(frame);
-        check(queue.bytes() == 20 && queue.frames() == 1,
-              "requeueFront puts an unwritten tail back at the head");
-        queue.clear();
-        check(queue.bytes() == 0 && queue.isEmpty(), "clear zeroes the counter");
+        check(queue.clear() == 1 && queue.isEmpty(), "clear reports how many frames it discarded");
     }
     {
         OutboundQueue queue;
@@ -1867,27 +2058,45 @@ static int runOutboundQueueSelftest()
               "drops as many frames as the incoming one needs");
     }
     {
+        // The frame on the wire must never be dropped: doing so would leave a
+        // half line behind. When nothing else is left, the *incoming* frame goes.
         OutboundQueue queue;
-        for (int i = 0; i < 5; ++i)
-            queue.append(QByteArray(100, 'x'));
-        check(queue.dropOldestToFit(100, 500) == 1,
-              "frees exactly enough room for the incoming frame");
-        check(queue.frames() == 4, "removes whole frames only");
+        queue.append(QByteArray(400, 'a'));
+        QByteArray *head = queue.front();
+        check(head != nullptr && head->size() == 400, "front() hands out the frame being written");
+        check(queue.startedFrames() == 1, "front() marks the frame as started");
+        check(queue.dropOldestToFit(500, 800) == -1,
+              "refuses to drop a started frame and reports that the incoming one must go");
+        check(queue.bytes() == 400 && queue.frames() == 1,
+              "the started frame is still intact after a refused drop");
+        queue.consumeFront(150);
+        check(queue.bytes() == 250 && queue.frames() == 1, "consumeFront trims the written bytes");
+        queue.consumeFront(250);
+        check(queue.isEmpty(), "consumeFront pops the frame once it is fully written");
+        check(queue.startedFrames() == 0, "no frame stays marked started after it is sent");
     }
     {
-        // The writer holds one frame while another arrives past the cap. With a
-        // single queue this still drops; the old two-list version could not.
+        // Started frame at the head, stale frames behind it: the stale ones go
+        // first, so ordering is preserved and the wire stays consistent.
         OutboundQueue queue;
-        QByteArray inFlight;
-        queue.append(QByteArray(400, 'a'));
-        check(queue.take(inFlight) && inFlight.size() == 400,
-              "take models the writer holding a frame");
-        queue.append(QByteArray(400, 'b'));
-        check(queue.bytes() == 400 && queue.frames() == 1,
-              "the in-flight frame is not counted twice");
-        queue.requeueFront(inFlight);
-        check(queue.dropOldestToFit(400, 800) == 1 && queue.bytes() == 400,
-              "a partially written frame can still be dropped to make room");
+        queue.append(QByteArray(200, 'a'));
+        queue.append(QByteArray(200, 'b'));
+        queue.append(QByteArray(200, 'c'));
+        QByteArray *head = queue.front();
+        check(head != nullptr && head->size() == 200, "front() starts the first frame");
+        const int dropped = queue.dropOldestToFit(400, 600);
+        check(dropped == 2, "drops the unstarted frames behind the one on the wire");
+        check(queue.frames() == 1 && queue.bytes() == 200,
+              "only the started frame survives, and it is whole");
+        queue.consumeFront(200);
+        check(queue.isEmpty(), "the surviving frame still drains normally");
+    }
+    {
+        OutboundQueue queue;
+        queue.append(QByteArray(100, 'x'));
+        queue.append(QByteArray(100, 'x'));
+        check(queue.clear() == 2 && queue.bytes() == 0,
+              "clear discards everything and reports the count");
     }
     std::printf("outbound-queue selftest: %s\n", failures == 0 ? "pass" : "FAIL");
     std::fflush(stdout);
