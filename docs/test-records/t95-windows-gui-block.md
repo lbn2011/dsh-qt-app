@@ -127,9 +127,11 @@ Full suite and typecheck (unchanged by this work):
 
 ## 5. What is *not* verified here
 
-* **No Windows machine was available.** The Windows branch of the fix
-  (`PeekNamedPipe`, the writer thread) has been compiled and reviewed on Linux
-  only; `Q_OS_WIN` code paths were not executed locally. The new CI job
+* **No Windows machine or Windows toolchain was available.** The `Q_OS_WIN`
+  branches of the fix (`PeekNamedPipe`, the `GetFileType` classification,
+  `CancelSynchronousIo`, the writer thread) are **reviewed but neither compiled
+  nor executed** here — this host only has a Linux compiler, so even the syntax
+  of those branches is unproven locally. The CI job compiles and runs them. The new CI job
   `qt-gui-heartbeat` runs the same test on `windows-2022` and `ubuntu-22.04`; its
   first remote run is the missing evidence, and it has not been observed yet.
 * **A pristine `5744512` binary cannot produce this evidence at all** — it has no
@@ -302,17 +304,23 @@ installer, no delivered artifact was touched.
   It deliberately does **not** claim all ten requests were answered: replies
   that arrive after the caller's 5 s timeout are timeouts, not answers.
 
-### 8.2 Non-pipe stdin (C, E)
+### 8.2 Non-pipe stdin (C, E, R4)
 
-`stdinReadiness_()` classifies the handle once with `GetFileType`. A pipe is
-peeked with `PeekNamedPipe`; anything else (a redirected file, a console) is
-polled with `WaitForSingleObject(handle, 0)` — never a blocking wait. A file is
-always signalled, so the read returns 0 at EOF; a console is signalled only when
-there is input. `ERROR_BROKEN_PIPE`/`ERROR_PIPE_NOT_CONNECTED` mean EOF; every
-other peek failure goes to `failed()` instead of being read as "nothing yet".
+`stdinReadiness_()` classifies the handle once with `GetFileType` and each kind
+has its own contract:
+
+| Kind | How readiness is decided | Why it cannot block |
+| --- | --- | --- |
+| pipe (`FILE_TYPE_PIPE`) | `PeekNamedPipe` byte count | a peek never reads; 0 bytes means "nothing yet" |
+| disk file (`FILE_TYPE_DISK`) | `WaitForSingleObject(handle, 0)` | a file is always signalled and `_read` returns 0 at EOF |
+| console (`FILE_TYPE_CHAR`) | **refused** — one `transport.warn`, no read | a console is signalled by any input *record*, and its input is not a byte stream: "signalled" does **not** mean a synchronous read returns |
+| unknown | **refused** — one `transport.warn`, no read | nothing proves a read cannot block |
+
+`ERROR_BROKEN_PIPE`/`ERROR_PIPE_NOT_CONNECTED` mean EOF; every other peek
+failure goes to `failed()` instead of being read as "nothing yet".
 `tests/gui-heartbeat.e2e.ts` covers the redirected-file shape on Linux (empty
 file as stdin, ≥15 beats, process stays up); the Windows console shape is **not**
-executed here.
+executed here — it is now a documented refusal rather than a silent assumption.
 
 ### 8.3 Inbound limits (D, G)
 
@@ -323,6 +331,11 @@ yet (`discardingLine_`), so the tail of a discarded line is never parsed as a
 fresh frame. Malformed JSON is dropped with one `transport.warn` instead of
 being fatal.
 
+Parsing continues in the same pass (R1): after the oversized line is cut, the
+loop keeps going, so frames that arrived **behind** it in the same read are
+answered without waiting for the peer to send anything else, and an idle tick
+still parses whatever a previous read left buffered.
+
 ### 8.4 Red/green evidence (local, Linux)
 
 | Case | Before (`a56529c`) | After |
@@ -330,7 +343,9 @@ being fatal.
 | overflow (10 × 1 MB, reader paused) | disconnect via `fail_`, no warning | stays connected, one `transport.warn` with `droppedFrames >= 1`, GUI keeps ticking |
 | oversized inbound (5 MB line, then ping) | tail of the line parsed as a new frame → `malformed frame` | dropped to the next newline, `transport.warn` reports the oversize, ping answers |
 | queue selftest | 17 checks | 17 checks, now including started/pinned protection |
-| full e2e file | 7 cases | 10 cases, all passing |
+| resync: 4 MB line + request in one write (R1) | request never answered until more bytes arrived | answered in the same pass |
+| resync: late newline (R1) | answered | answered |
+| full e2e file | 7 cases | 11 cases, all passing |
 
 Commands (Linux, this machine):
 
@@ -350,10 +365,12 @@ git diff --check
 
 ### 8.5 Still not verified here
 
-* No Windows machine was available: the `PeekNamedPipe`, `WaitForSingleObject`
-  and writer-thread paths were compiled and reviewed, not executed.
-* The Windows console (non-pipe) stdin shape has no executed test.
+* No Windows machine **and no Windows toolchain** was available: the
+  `PeekNamedPipe`, `GetFileType`, `CancelSynchronousIo` and writer-thread paths
+  are reviewed, not compiled and not executed here. CI compiles and runs them.
+* The Windows console (non-pipe) stdin shape has no executed test; the transport
+  now refuses it with a warning instead of assuming a read is safe.
 * `qt-gui-heartbeat` has not run on a hosted runner yet; the CI job is the entry
-  point and asserts `pass 10`, `fail 0`, no skips.
+  point and asserts `pass 11`, `fail 0`, no skips.
 * `QT_QPA_PLATFORM=offscreen` exposes a top-level window here, but that is not a
   visible first window on a user's desktop.

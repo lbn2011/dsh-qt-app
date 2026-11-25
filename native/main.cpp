@@ -491,6 +491,9 @@ struct WriterState
     OutboundQueue queue;
     std::atomic<qint64> bytesOut{0};
     std::atomic<int> droppedFrames{0};
+    // Drops already announced to the host; the difference is what still has to
+    // be reported once the queue drains (t103 R2).
+    std::atomic<int> reportedDrops{0};
     std::atomic<bool> overflowReported{false};
     bool stop = false;
     bool orphaned = false;
@@ -544,14 +547,23 @@ public:
         // there. Nothing outside the test suite sets this.
         legacyBlockingRead_ = qEnvironmentVariableIsSet("DSH_QT_STDIO_TEST_LEGACY_READ");
 #if defined(Q_OS_WIN)
-        // Only a pipe needs the peek-before-read dance. A redirected file or a
-        // console has no byte count to peek at, and reading from those at EOF
-        // returns 0 rather than blocking, so they take the plain read path.
+        // Classify once, then handle each kind explicitly (t103 R4). Never infer
+        // "a read cannot block" from a signalled wait: a console is signalled by
+        // any pending input record, and its input is not a byte stream at all.
         const HANDLE stdinHandle = GetStdHandle(STD_INPUT_HANDLE);
-        stdinIsPipe_ = stdinHandle != nullptr && stdinHandle != INVALID_HANDLE_VALUE
-                       && GetFileType(stdinHandle) == FILE_TYPE_PIPE;
+        const DWORD stdinType = (stdinHandle == nullptr || stdinHandle == INVALID_HANDLE_VALUE)
+                                    ? FILE_TYPE_UNKNOWN
+                                    : GetFileType(stdinHandle);
+        if (stdinType == FILE_TYPE_PIPE)
+            stdinKind_ = StdinKind::Pipe;
+        else if (stdinType == FILE_TYPE_DISK)
+            stdinKind_ = StdinKind::File;
+        else if (stdinType == FILE_TYPE_CHAR)
+            stdinKind_ = StdinKind::Console;
+        else
+            stdinKind_ = StdinKind::Unknown;
 #else
-        stdinIsPipe_ = true;
+        stdinKind_ = StdinKind::Pipe;
 #endif
     }
 
@@ -688,6 +700,12 @@ public:
 
     int droppedFrames() const { return state_->droppedFrames.load(); }
 
+    /** Cumulative inbound frames dropped for exceeding the cap (t103 R2). */
+    int oversizedInbound() const { return oversizedInbound_; }
+
+    /** Cumulative inbound lines that were not valid JSON (t103 R2). */
+    int malformedInbound() const { return malformedInbound_; }
+
     /**
      * Queue one message; flushes immediately when the pipe accepts it.
      *
@@ -699,13 +717,15 @@ public:
      * *new* frame is the one that goes, and it is counted as dropped.
      */
     /**
-     * Queue a small diagnostic frame even when the queue is over its cap.
+     * Queue a diagnostic frame from the reserve, never past the cap.
      *
-     * A warning explains an overflow, so the overflow must not be allowed to
-     * swallow the warning itself. Only warn frames take this path and each
-     * episode reports once, so the extra memory stays bounded.
+     * A warning explains an overflow, so the overflow must not be the first
+     * thing that swallows it. It must not push the queue past
+     * `kMaxOutboundBytes` either (t103 R2): normal replies are capped at
+     * `kMaxOutboundBytes - kControlReserveBytes`, which keeps the reserve
+     * available for exactly these frames and keeps the total bounded.
      */
-    void sendUncapped(const QJsonObject &message)
+    void sendControl_(const QJsonObject &message)
     {
         if (!active_)
             return;
@@ -713,7 +733,17 @@ public:
         line.append('\n');
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            state_->queue.append(line, /*pinned=*/true);
+            const int dropped = state_->queue.dropOldestToFit(line.size(), kMaxOutboundBytes);
+            if (dropped < 0) {
+                // Only frames already on the wire are left, and cutting one would
+                // corrupt the stream, so this report is skipped. The counters stay
+                // cumulative, so the next report still carries the true total.
+                state_->reportedDrops = state_->droppedFrames.load();
+            } else {
+                state_->droppedFrames += dropped;
+                state_->reportedDrops = state_->droppedFrames.load();
+                state_->queue.append(line, /*pinned=*/true);
+            }
         }
         flush_();
     }
@@ -726,9 +756,11 @@ public:
         line.append('\n');
         int dropped = 0;
         bool refused = false;
+        int reportedTotal = 0;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            dropped = state_->queue.dropOldestToFit(line.size(), kMaxOutboundBytes);
+            dropped = state_->queue.dropOldestToFit(line.size(),
+                                                    kMaxOutboundBytes - kControlReserveBytes);
             if (dropped < 0) {
                 refused = true;
                 dropped = 0;
@@ -737,15 +769,49 @@ public:
                 state_->droppedFrames += dropped;
                 state_->queue.append(line);
             }
+            if ((refused || dropped > 0) && !state_->overflowReported.exchange(true)) {
+                reportedTotal = state_->droppedFrames.load();
+                state_->reportedDrops = reportedTotal;
+            }
         }
-        if ((refused || dropped > 0) && !state_->overflowReported.exchange(true)) {
+        if (reportedTotal > 0) {
+            // One warning per episode, carrying the cumulative count so the host
+            // can reconcile exactly what it did not receive (t103 R2).
             emit warn(refused
-                          ? QStringLiteral("outbound queue is full of frames already on the wire; "
-                                           "dropping new replies until the peer reads again")
-                          : QStringLiteral("outbound queue overflow; dropped %1 stale frame(s)")
-                                .arg(dropped));
+                          ? QStringLiteral("outbound queue is full of frames already on the "
+                                           "wire; %1 frame(s) dropped so far, new replies are "
+                                           "dropped until the peer reads again")
+                                .arg(reportedTotal)
+                          : QStringLiteral("outbound queue overflow; %1 frame(s) dropped so far")
+                                .arg(reportedTotal));
         }
         flush_();
+    }
+
+    /**
+     * Called after every successful write: when the queue has drained, announce
+     * the total that was lost and re-arm the overflow latch so the next episode
+     * reports again instead of staying silent for the rest of the session
+     * (t103 R2). The drain threshold is a quarter of the cap so the latch cannot
+     * flap around the limit and turn this into a warning storm.
+     */
+    void maybeReportDrain_()
+    {
+        int total = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (state_->queue.bytes() > kMaxOutboundBytes / 4)
+                return;
+            const int dropped = state_->droppedFrames.load();
+            const int reported = state_->reportedDrops.load();
+            state_->overflowReported = false;
+            if (dropped <= reported)
+                return;
+            state_->reportedDrops = dropped;
+            total = dropped;
+        }
+        emit warn(QStringLiteral("outbound queue drained; %1 frame(s) were dropped in total")
+                      .arg(total));
     }
 
 signals:
@@ -761,6 +827,10 @@ signals:
 private:
     static constexpr int kMaxInboundBytes = 4 * 1024 * 1024;
     static constexpr int kMaxOutboundBytes = 8 * 1024 * 1024;
+    // Headroom kept for control frames (warnings). Normal replies are capped at
+    // kMaxOutboundBytes - kControlReserveBytes so a warning always fits inside
+    // the same cap instead of being pushed past it.
+    static constexpr int kControlReserveBytes = 4096;
     // Bytes we are willing to move per read tick. Draining a burst in one tick
     // keeps throughput in the MB/s range instead of one 4 KB chunk per timer
     // shot, while the budget keeps a firehose peer from starving the GUI.
@@ -824,6 +894,7 @@ private:
             }
             state_->bytesOut += written;
             state_->queue.consumeFront(static_cast<int>(written));
+            maybeReportDrain_();
         }
 #endif
     }
@@ -883,6 +954,11 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 lock.lock();
             }
+            // Reporting needs the same mutex, so it runs unlocked. The signal is
+            // delivered to the GUI thread through the bridge's queued connection.
+            lock.unlock();
+            maybeReportDrain_();
+            lock.lock();
         }
     }
 #endif
@@ -900,7 +976,19 @@ private:
         Ready,
         Idle,
         Broken,
-        Failed
+        Failed,
+        // The handle exists but is not something we may read synchronously
+        // (a Win32 console, or a type we cannot name): refuse instead of block.
+        Unsupported
+    };
+
+    // What GetFileType said about stdin, decided once in the constructor.
+    enum class StdinKind
+    {
+        Pipe,
+        File,
+        Console,
+        Unknown
     };
 
     StdinReadiness stdinReadiness_(QString *reason = nullptr)
@@ -912,21 +1000,36 @@ private:
                 *reason = QStringLiteral("stdin handle is not available");
             return StdinReadiness::Failed;
         }
-        // Only pipes have a byte count to peek at. A redirected file or a console
-        // needs a different zero-timeout probe, because a bare ::read there can
-        // block the GUI thread just like a pipe: a file is always "signaled" (and
-        // returns 0 at EOF), while a console is signaled only when input is
-        // pending. Never wait with a timeout here — the event loop has to turn.
-        if (!stdinIsPipe_) {
-            const DWORD state = WaitForSingleObject(handle, 0);
-            if (state == WAIT_OBJECT_0)
-                return StdinReadiness::Ready;
-            if (state == WAIT_TIMEOUT)
-                return StdinReadiness::Idle;
+        // Three handle kinds behave differently, so classify once with
+        // GetFileType instead of inferring anything from a wait (t103 R4):
+        //
+        //   pipe    — PeekNamedPipe reports the byte count; zero bytes means the
+        //             read would block, so it is only entered when bytes exist.
+        //   file    — a redirected file is always readable and returns 0 at EOF,
+        //             so a plain read cannot park the thread on an idle stream.
+        //   console — "signaled" only means some input record is pending (a
+        //             key-up, a mouse move, a window event), *not* that a
+        //             blocking byte read is safe. Console input is not a byte
+        //             stream anyway, so this transport refuses to read it and
+        //             says so instead of guessing.
+        //   unknown — same refusal: never block the GUI thread on a handle whose
+        //             semantics we cannot name.
+        if (stdinKind_ == StdinKind::Console) {
             if (reason != nullptr)
-                *reason = QStringLiteral("stdin wait failed (error %1)").arg(GetLastError());
-            return StdinReadiness::Failed;
+                *reason = QStringLiteral("stdin is a Win32 console, not a byte stream; the "
+                                         "transport will not read it (it would block the GUI "
+                                         "thread)");
+            return StdinReadiness::Unsupported;
         }
+        if (stdinKind_ == StdinKind::Unknown) {
+            if (reason != nullptr)
+                *reason = QStringLiteral("stdin handle type is unknown; the transport will not "
+                                         "read it, because a synchronous read there can block "
+                                         "the GUI thread");
+            return StdinReadiness::Unsupported;
+        }
+        if (stdinKind_ == StdinKind::File)
+            return StdinReadiness::Ready;
         DWORD available = 0;
         if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) {
             const DWORD error = GetLastError();
@@ -1015,8 +1118,22 @@ private:
                 stop();
                 return;
             }
-            if (readiness == StdinReadiness::Idle)
+            if (readiness == StdinReadiness::Unsupported) {
+                // A Win32 console (or a handle we cannot classify) is not a
+                // byte stream: "signaled" there does not mean a synchronous read
+                // is safe, so this transport refuses to read it instead of
+                // parking the GUI thread (t103 R4).
+                reportUnsupportedStdin_(reason);
                 return;
+            }
+            if (readiness == StdinReadiness::Idle) {
+                // No new bytes arrived, but a previous read may still hold
+                // complete lines: cutting an oversized line out of the buffer
+                // leaves the frames behind it queued, and they must be answered
+                // without waiting for the peer to send something else (t103 R1).
+                parseInbound_();
+                return;
+            }
         }
         const qint64 moved = readOnce_();
         if (moved < 0) {
@@ -1024,54 +1141,97 @@ private:
             stop();
             return;
         }
-        if (moved == 0)
+        parseInbound_();
+    }
+
+    /**
+     * Drops every oversized line and parses every complete line in `inbound_`.
+     *
+     * The oversized branch must not return: the bytes after the dropped line's
+     * newline are already buffered, and leaving them unparsed is exactly the
+     * stall t103 R1 found. The loop therefore keeps cutting until the buffer is
+     * inside the cap or inside a discarded line, then parses what is left.
+     */
+    void parseInbound_()
+    {
+        if (inbound_.isEmpty())
             return;
-        if (discardingLine_) {
-            // The rest of an oversized line: throw bytes away until its newline,
-            // then resume normal parsing with whatever follows it.
-            const int newline = inbound_.indexOf('\n');
-            if (newline < 0) {
-                inbound_.clear();
-                return;
+        for (;;) {
+            if (discardingLine_) {
+                // The rest of an oversized line: throw bytes away until its
+                // newline, then resume normal parsing with whatever follows it.
+                const int newline = inbound_.indexOf('\n');
+                if (newline < 0) {
+                    inbound_.clear();
+                    return;
+                }
+                inbound_.remove(0, newline + 1);
+                discardingLine_ = false;
             }
-            inbound_.remove(0, newline + 1);
-            discardingLine_ = false;
-        }
-        if (inbound_.size() > kMaxInboundBytes) {
+            if (inbound_.size() <= kMaxInboundBytes)
+                break;
             // A frame longer than the cap cannot be reassembled, so drop through
-            // to the next newline and keep going. Parsing what is left would treat
-            // the tail of an oversized line as a fresh frame, and the session is
-            // not worth tearing down over one hostile length. When the newline has
-            // not arrived yet, remember that we are inside a discarded line so its
-            // remainder is thrown away instead of being parsed.
+            // to the next newline and keep going with what follows it. Parsing
+            // the tail as a fresh frame is what used to turn one hostile length
+            // into a stream of malformed frames.
             const int newline = inbound_.indexOf('\n');
+            ++oversizedInbound_;
             if (newline < 0) {
                 inbound_.clear();
                 discardingLine_ = true;
-            } else {
-                inbound_.remove(0, newline + 1);
+                reportOversizedInbound_();
+                return;
             }
-            ++oversizedInbound_;
-            if (!oversizedInboundReported_) {
-                oversizedInboundReported_ = true;
-                emit warn(QStringLiteral("inbound frame exceeded %1 bytes; dropped it and "
-                                         "resynchronised on the next newline")
-                              .arg(kMaxInboundBytes));
-            }
-            return;
+            inbound_.remove(0, newline + 1);
+            reportOversizedInbound_();
         }
         int start = 0;
+        bool parsedAny = false;
         for (;;) {
             const int newline = inbound_.indexOf('\n', start);
             if (newline < 0)
                 break;
             const QByteArray line = inbound_.mid(start, newline - start).trimmed();
             start = newline + 1;
-            if (!line.isEmpty())
+            if (!line.isEmpty()) {
+                parsedAny = true;
                 handleLine_(line);
+            }
         }
         if (start > 0)
             inbound_.remove(0, start);
+        if (parsedAny && !discardingLine_ && inbound_.isEmpty()) {
+            // The burst is fully consumed and parsing is healthy again, so the
+            // next hostile line reports on its own instead of staying silent for
+            // the rest of the session. One report per burst keeps this from
+            // becoming a warning storm.
+            oversizedInboundReported_ = false;
+            malformedInboundReported_ = false;
+        }
+    }
+
+    void reportOversizedInbound_()
+    {
+        // One report per episode: the latch is re-armed when a line parses
+        // again, so a second hostile line later in the session is not silent.
+        if (oversizedInboundReported_)
+            return;
+        oversizedInboundReported_ = true;
+        emit warn(QStringLiteral("inbound frame exceeded %1 bytes; dropped it and "
+                                 "resynchronised on the next newline")
+                      .arg(kMaxInboundBytes));
+    }
+
+    void reportUnsupportedStdin_(const QString &reason)
+    {
+        if (unsupportedStdinReported_)
+            return;
+        unsupportedStdinReported_ = true;
+        emit warn(reason.isEmpty()
+                      ? QStringLiteral("stdin is not a pipe or a file; the transport will not "
+                                       "read it, because a synchronous read there can block the "
+                                       "GUI thread")
+                      : reason);
     }
 
     void handleLine_(const QByteArray &line)
@@ -1104,7 +1264,7 @@ private:
     bool active_ = false;
     bool polledReads_ = false;
     bool legacyBlockingRead_ = false;
-    bool stdinIsPipe_ = false;
+    StdinKind stdinKind_ = StdinKind::Unknown;
     // Set when the writer thread had to be detached; start() refuses afterwards.
     bool writerDetached_ = false;
     bool discardingLine_ = false;
@@ -1112,6 +1272,7 @@ private:
     bool oversizedInboundReported_ = false;
     int malformedInbound_ = 0;
     bool malformedInboundReported_ = false;
+    bool unsupportedStdinReported_ = false;
 #if defined(Q_OS_WIN)
     std::thread writer_;
     std::future<void> writerDone_;
@@ -1740,9 +1901,13 @@ private:
                 {QStringLiteral("payload"),
                  QJsonObject{{QStringLiteral("reason"), reason},
                              {QStringLiteral("droppedFrames"), transport_->droppedFrames()},
-                             {QStringLiteral("queuedBytes"), transport_->queuedBytes()}}}};
+                             {QStringLiteral("queuedBytes"), transport_->queuedBytes()},
+                             {QStringLiteral("oversizedInbound"),
+                              transport_->oversizedInbound()},
+                             {QStringLiteral("malformedInbound"),
+                              transport_->malformedInbound()}}}};
             frame.insert(QStringLiteral("v"), 1);
-            transport_->sendUncapped(frame);
+            transport_->sendControl_(frame);
         }
         emit eventReceived(QStringLiteral("transport.warn"), QStringLiteral("transport"),
                            QVariantMap{{QStringLiteral("reason"), reason}});

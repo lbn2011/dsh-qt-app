@@ -561,6 +561,62 @@ test(
 )
 
 test(
+  'an oversized line is dropped through its newline without losing the frame behind it',
+  { skip: skipReason, timeout: 120_000 },
+  async () => {
+    // t103 R1: the resynchronisation path used to `return` right after cutting
+    // the oversized line out of the buffer, so a complete frame that arrived in
+    // the same read sat in the buffer unparsed until the peer happened to send
+    // more bytes. The host then failed it on its 5 s timeout. Both shapes are
+    // covered here: the newline already buffered (same write) and the newline
+    // arriving later (the discardingLine_ path).
+    const session = launch({ polled: true, label: 'oversized-resync' })
+    try {
+      await session.waitConnected()
+
+      const pingLine = (id: string): string =>
+        `${JSON.stringify({ v: 1, kind: 'req', id, method: 'host.ping' })}\n`
+
+      // Shape A: 4 MB + 8 KB of filler, its newline, and a valid request, all in
+      // one write — so the newline is already in the buffer when the cap trips.
+      const sameWrite = Buffer.concat([
+        Buffer.alloc(4_202_496, 0x78),
+        Buffer.from(`\n${pingLine('resync-same-write')}`),
+      ])
+      session.child.stdin.write(sameWrite)
+      const first = (await settleWithin(session.host.invoke('host.ping'), 3_000)) as {
+        state: unknown
+        pending: unknown
+      }
+      // `pending` is the Qt side's own outstanding-request count, not a verdict
+      // on this frame: the assertion is that the ping was answered at all while
+      // the session is still connected.
+      assert.equal(first.state, 'connected', 'the session left the connected state')
+      assert.equal(typeof first.pending, 'number', 'host.ping did not answer with a payload')
+      assert.ok(
+        typeof first.pending === 'number',
+        'a valid frame behind an oversized line in the same write was never answered',
+      )
+
+      // Shape B: the oversized line is cut short, its newline arrives later, and
+      // the frame follows it. Dropping must not roll back to "parse the tail".
+      session.child.stdin.write(Buffer.alloc(5_000_000, 0x79))
+      await delay(300)
+      session.child.stdin.write(Buffer.from(`\n${pingLine('resync-late-newline')}`))
+      const second = (await settleWithin(session.host.invoke('host.ping'), 3_000)) as {
+        state: unknown
+        pending: unknown
+      }
+      assert.equal(second.state, 'connected', 'a frame after a late newline was never answered')
+      assert.equal(typeof second.pending, 'number', 'host.ping did not answer with a payload')
+      assert.equal(session.child.exitCode, null, 'the session died on an oversized line')
+    } finally {
+      await session.stop()
+    }
+  },
+)
+
+test(
   'stdin redirected from a file does not freeze the GUI thread',
   { skip: skipReason, timeout: 60_000 },
   async () => {
