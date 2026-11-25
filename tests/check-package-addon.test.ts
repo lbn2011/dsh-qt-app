@@ -84,6 +84,19 @@ function copyCliToHostilePath(): string {
   return copy
 }
 
+// The gate reports the addon relative to the unpacked archive root, and
+// `path.relative()` spells that with the host separator: `dsh-qt-napi/prebuild/
+// <triple>/qt-bridge.node` on Linux, `dsh-qt-napi\prebuild\<triple>\...` on
+// Windows (T84-1: assertions that hard-coded `/` went red on windows-2022 while
+// the gate itself was correct). Pin the exact loader path for the requested
+// triple, accepting either separator, and keep format, digest and target strict.
+const SEP = '[\\\\/]'
+
+function loaderAddonPath(triple: string): RegExp {
+  const rel = ['dsh-qt-napi', 'prebuild', triple, 'qt-bridge\\.node'].join(SEP)
+  return new RegExp(`check-package-addon: ${rel} is `, 'u')
+}
+
 function withHostileCli(fn: (cli: string) => void): void {
   const cli = copyCliToHostilePath()
   try {
@@ -106,7 +119,9 @@ test('accepts a package that carries the addon for its own triple', () => {
   withPackage({ triple: 'linux-x64' }, (tree) => {
     const result = run(['--dir', tree, '--triple', 'linux-x64'])
     assert.equal(result.status, 0, result.stderr)
-    assert.match(result.stdout, /dsh-qt-napi\/prebuild\/linux-x64\/qt-bridge\.node is ELF/u)
+    assert.match(result.stdout, loaderAddonPath('linux-x64'))
+    assert.match(result.stdout, /is ELF sha256 [0-9a-f]{64} \(target linux-x64\)/u)
+    assert.match(result.stdout, /linux-x64 package carries the addon at the path the loader searches/u)
   })
 })
 
@@ -239,7 +254,8 @@ test('runs from a checkout path that needs URL escaping (T80-1)', () => {
     withPackage({ triple: 'win32-x64' }, (tree) => {
       const result = run(['--dir', tree, '--triple', 'win32-x64'], cli)
       assert.equal(result.status, 0, result.stderr)
-      assert.match(result.stdout, /dsh-qt-napi\/prebuild\/win32-x64\/qt-bridge\.node is PE/u)
+      assert.match(result.stdout, loaderAddonPath('win32-x64'))
+      assert.match(result.stdout, /is PE sha256 [0-9a-f]{64} \(target win32-x64\)/u)
       assert.match(result.stdout, /win32-x64 package carries the addon at the path the loader searches/u)
     })
   })
@@ -279,4 +295,71 @@ test('importing the gate runs no checks', () => {
     assert.equal(result.stdout, '')
     assert.equal(result.stderr, '')
   })
+})
+
+// Verbatim stdout from the two CI jobs that disagreed in T84-1: the
+// windows-2022 job printed the addon path with backslashes, the ubuntu-22.04
+// job with forward slashes, and only the Windows one went red. Both must be
+// accepted by the same assertion, and both keep their format, digest and target.
+const CI_SAMPLES = [
+  {
+    job: 'windows-2022',
+    triple: 'win32-x64',
+    eol: '\r\n',
+    path: 'dsh-qt-napi\\prebuild\\win32-x64\\qt-bridge.node',
+    digest: 'ba6a1f2f644e0870c6aee38d1c6d7b463397d5e8171e08eeb7da40d3fcfa977e',
+    format: 'PE',
+  },
+  {
+    job: 'ubuntu-22.04',
+    triple: 'linux-x64',
+    eol: '\n',
+    path: 'dsh-qt-napi/prebuild/linux-x64/qt-bridge.node',
+    digest: '86bdc061d786dcefbb992f54dcef974ee7dc50862575e46fbb626eef6731a60f',
+    format: 'ELF',
+  },
+] as const
+
+for (const sample of CI_SAMPLES) {
+  test(`accepts the ${sample.job} CI sample (T84-1)`, () => {
+    const stdout = [
+      `check-package-addon: ${sample.path} is ${sample.format} sha256 ${sample.digest} (target ${sample.triple})`,
+      `check-package-addon: ${sample.triple} package carries the addon at the path the loader searches`,
+      '',
+    ].join(sample.eol)
+    assert.match(stdout, loaderAddonPath(sample.triple))
+    assert.match(stdout, new RegExp(`is ${sample.format} sha256 ${sample.digest} \\(target ${sample.triple}\\)`, 'u'))
+  })
+}
+
+test('rejects the same file name reported for another directory (T84-1)', () => {
+  for (const separator of ['/', '\\']) {
+    const wrongTriple = ['dsh-qt-napi', 'prebuild', 'linux-x64', 'qt-bridge.node'].join(separator)
+    const wrongParent = ['vendor', 'dsh-qt-napi', 'prebuild', 'win32-x64', 'qt-bridge.node'].join(separator)
+    for (const line of [wrongTriple, wrongParent]) {
+      const stdout = `check-package-addon: ${line} is PE sha256 ${'0'.repeat(64)} (target win32-x64)\n`
+      assert.doesNotMatch(stdout, loaderAddonPath('win32-x64'), `${line} must not satisfy the win32-x64 assertion`)
+    }
+  }
+})
+
+test('rejects a package whose addon sits in a same-named directory elsewhere', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-pkg-addon-'))
+  const tree = join(dir, 'pkg')
+  mkdirSync(join(tree, 'bin'), { recursive: true })
+  writeFileSync(join(tree, 'LICENSE'), 'MIT License\n')
+  writeFileSync(join(tree, 'THIRD-PARTY-NOTICES.md'), '# notices\n')
+  writeFileSync(join(tree, 'bin', 'dsh-qt-app.exe'), MAGIC.pe)
+  // The loader searches `<root>/dsh-qt-napi/prebuild/win32-x64/qt-bridge.node`.
+  // The same names under a different parent must not satisfy it.
+  const stray = join(tree, 'vendor', 'dsh-qt-napi', 'prebuild', 'win32-x64')
+  mkdirSync(stray, { recursive: true })
+  writeFileSync(join(stray, 'qt-bridge.node'), MAGIC.pe)
+  try {
+    const result = run(['--dir', tree, '--triple', 'win32-x64'])
+    assert.equal(result.status, 1, result.stdout)
+    assert.match(result.stderr, /no dsh-qt-napi\/prebuild\/\*\/qt-bridge\.node/u)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
