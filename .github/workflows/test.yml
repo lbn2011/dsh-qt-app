@@ -565,6 +565,12 @@ jobs:
 
       - name: Run the GUI heartbeat regression
         shell: bash
+        env:
+          # A hosted Windows runner has no interactive desktop, so a window is
+          # created and shown but never exposed. Asserting exposure there would
+          # be false; the job summary records that it was not asserted. Linux runs
+          # under the offscreen QPA, which does report exposure, so it asserts it.
+          DSH_QT_EXPECT_NO_DESKTOP: ${{ matrix.os == 'windows-2022' && '1' || '0' }}
         run: |
           set -o pipefail
           pnpm exec tsx --test tests/gui-heartbeat.e2e.ts 2>&1 | tee gui-heartbeat.log
@@ -579,10 +585,37 @@ jobs:
             echo '::error::the GUI heartbeat regression skipped itself — see gui-heartbeat.log'
             exit 1
           fi
-          if ! grep -qE 'pass 3' gui-heartbeat.log; then
-            echo '::error::expected three passing cases in gui-heartbeat.log'
-            tail -40 gui-heartbeat.log
+          if ! grep -qE 'pass 7' gui-heartbeat.log; then
+            echo '::error::expected seven passing cases in gui-heartbeat.log'
+            tail -60 gui-heartbeat.log
             exit 1
+          fi
+          if ! grep -qE 'fail 0' gui-heartbeat.log; then
+            echo '::error::a GUI heartbeat case failed — see gui-heartbeat.log'
+            tail -60 gui-heartbeat.log
+            exit 1
+          fi
+
+      # Item G of the review: when the runner has no visible desktop the
+      # exposure assertion is downgraded, so say so in the job summary instead of
+      # letting a green job imply a first window was observed.
+      - name: Record whether window exposure was asserted
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q 'window exposure is not asserted here' gui-heartbeat.log; then
+            {
+              echo '### Window exposure: NOT asserted on this runner'
+              echo
+              echo 'The GUI-thread heartbeat was asserted; no visible desktop was available,'
+              echo 'so this job claims no first-window observation.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo '### Window exposure: asserted'
+              echo
+              echo 'A top-level window was created and exposed while stdin was idle.'
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload the GUI heartbeat log

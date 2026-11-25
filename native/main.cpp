@@ -40,6 +40,7 @@
 #include <QQuickWindow>
 #include <QQuickStyle>
 #include <QSaveFile>
+#include <QSharedPointer>
 #include <QSocketNotifier>
 #include <QStandardPaths>
 #include <QString>
@@ -68,6 +69,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -353,20 +355,118 @@ private:
 };
 
 /**
+ * Every byte that has been queued but not yet written, plus the drop policy.
+ *
+ * Kept as its own class so the accounting can be exercised without a pipe:
+ * `DSH_QT_OUTBOUND_QUEUE_SELFTEST=1` replays a scripted sequence through
+ * exactly this code (tests/outbound-queue.test.ts), including the paths that
+ * need a stalled writer.
+ *
+ * The single queue is the point. An earlier revision kept one list on the GUI
+ * side and a second one inside the Windows writer thread, which meant the cap
+ * only ever saw half the backlog: once the writer held the frames, `send()`
+ * could no longer drop anything and the GUI list grew without bound. Now one
+ * counter covers frames waiting for the writer and frames the writer is
+ * chewing on, and a drop removes whole frames from the head of that queue.
+ */
+class OutboundQueue
+{
+public:
+    qint64 bytes() const { return bytes_; }
+    int frames() const { return static_cast<int>(frames_.size()); }
+    bool isEmpty() const { return frames_.isEmpty(); }
+
+    void append(const QByteArray &frame)
+    {
+        if (frame.isEmpty())
+            return;
+        frames_.append(frame);
+        bytes_ += frame.size();
+    }
+
+    /** Pops the front frame; the caller owns those bytes until it requeues them. */
+    bool take(QByteArray &frame)
+    {
+        if (frames_.isEmpty())
+            return false;
+        frame = frames_.takeFirst();
+        bytes_ -= frame.size();
+        return true;
+    }
+
+    /** Puts an unwritten tail back at the head, so ordering is preserved. */
+    void requeueFront(const QByteArray &frame)
+    {
+        if (frame.isEmpty())
+            return;
+        frames_.prepend(frame);
+        bytes_ += frame.size();
+    }
+
+    /** Drops whole frames from the head until `incoming` more bytes fit. */
+    int dropOldestToFit(qint64 incoming, qint64 cap)
+    {
+        int dropped = 0;
+        while (!frames_.isEmpty() && bytes_ + incoming > cap) {
+            bytes_ -= frames_.first().size();
+            frames_.removeFirst();
+            ++dropped;
+        }
+        return dropped;
+    }
+
+    void clear()
+    {
+        frames_.clear();
+        bytes_ = 0;
+    }
+
+private:
+    QList<QByteArray> frames_;
+    qint64 bytes_ = 0;
+};
+
+/**
+ * State the Windows writer thread shares with the transport.
+ *
+ * It lives in a `shared_ptr` so a thread that could not be joined in time can
+ * still be detached safely: after `orphaned` is set the thread only touches
+ * this struct, never the transport object, and the struct outlives both.
+ */
+struct WriterState
+{
+    mutable std::mutex mutex;
+    std::condition_variable wake;
+    OutboundQueue queue;
+    std::atomic<qint64> bytesOut{0};
+    std::atomic<int> droppedFrames{0};
+    std::atomic<bool> overflowReported{false};
+    bool stop = false;
+    bool orphaned = false;
+};
+
+/**
  * Non-blocking newline-delimited JSON over the host's standard streams.
  *
  * The Node side writes one JSON object per line to our stdin and reads replies
- * the same way. Three properties matter more than throughput here:
+ * the same way. Four properties matter more than throughput here:
  *
  *   1. **Never block the UI thread.** Reads happen only when the descriptor is
- *      readable; writes are attempted immediately and, if the pipe is full,
- *      handed to a timer instead of spinning or waiting.
+ *      readable; writes are handed to the writer thread on Windows and, on
+ *      POSIX, written in `<= PIPE_BUF` chunks only after `poll(POLLOUT)` says
+ *      the pipe can take bytes. No path on the GUI thread can park in a
+ *      blocking read or a blocking write.
  *   2. **Never grow without bound.** A peer that stops reading must not turn
- *      into an out-of-memory crash, so both directions have hard caps and the
- *      oldest outbound frame is dropped first.
+ *      into an out-of-memory crash, so one queue with one byte counter covers
+ *      everything that has not been written yet, and the oldest frames are
+ *      dropped first.
  *   3. **A broken pipe is not fatal.** The application keeps running with the
  *      QML-only behaviour it had before this phase; it simply reports the state
  *      so the UI can say "not connected to Node".
+ *   4. **Shutting down is bounded.** `stop()` cancels a writer that is parked
+ *      inside `WriteFile` and waits a fixed two seconds; a writer that still
+ *      has not returned is detached with the shared state above, so the process
+ *      always exits instead of hanging on `join()`.
  */
 class StdioTransport : public QObject
 {
@@ -392,6 +492,16 @@ public:
         // tick, with no readiness check) so the regression can prove it fails
         // there. Nothing outside the test suite sets this.
         legacyBlockingRead_ = qEnvironmentVariableIsSet("DSH_QT_STDIO_TEST_LEGACY_READ");
+#if defined(Q_OS_WIN)
+        // Only a pipe needs the peek-before-read dance. A redirected file or a
+        // console has no byte count to peek at, and reading from those at EOF
+        // returns 0 rather than blocking, so they take the plain read path.
+        const HANDLE stdinHandle = GetStdHandle(STD_INPUT_HANDLE);
+        stdinIsPipe_ = stdinHandle != nullptr && stdinHandle != INVALID_HANDLE_VALUE
+                       && GetFileType(stdinHandle) == FILE_TYPE_PIPE;
+#else
+        stdinIsPipe_ = true;
+#endif
     }
 
     ~StdioTransport() override { stop(); }
@@ -404,7 +514,7 @@ public:
         if (polledReads_) {
             // Short enough to feel instant, long enough to cost nothing
             // measurable. The read itself is readiness-gated (see
-            // stdinReadable_), so an idle pipe costs one PeekNamedPipe/poll per
+            // stdinReadiness_), so an idle pipe costs one PeekNamedPipe/poll per
             // tick instead of parking the GUI thread inside ::read.
             pollTimer_ = new QTimer(this);
             pollTimer_->setInterval(25);
@@ -419,10 +529,14 @@ public:
         // has no writability probe, so a peer that stops reading would park the
         // GUI thread inside WriteFile forever.
         {
-            std::lock_guard<std::mutex> lock(writerMutex_);
-            writerStop_ = false;
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->stop = false;
+            state_->orphaned = false;
+            state_->queue.clear();
         }
-        writer_ = std::thread([this]() { writerLoop_(); });
+        std::packaged_task<void()> task([this, state = state_]() { writerLoop_(state); });
+        writerDone_ = task.get_future();
+        writer_ = std::thread(std::move(task));
 #endif
         emit stateChanged();
         return true;
@@ -430,7 +544,12 @@ public:
 
     void stop()
     {
-        if (!active_ && pollTimer_ == nullptr && readNotifier_ == nullptr)
+#if defined(Q_OS_WIN)
+        const bool writerBusy = writer_.joinable();
+#else
+        const bool writerBusy = false;
+#endif
+        if (!active_ && pollTimer_ == nullptr && readNotifier_ == nullptr && !writerBusy)
             return;
         active_ = false;
         delete readNotifier_;
@@ -438,15 +557,37 @@ public:
         delete pollTimer_;
         pollTimer_ = nullptr;
 #if defined(Q_OS_WIN)
-        {
-            std::lock_guard<std::mutex> lock(writerMutex_);
-            writerStop_ = true;
-            pending_.clear();
+        if (writer_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                state_->stop = true;
+                state_->queue.clear();
+            }
+            state_->wake.notify_all();
+            // A writer parked inside WriteFile on a full pipe never observes
+            // `stop` on its own, and joining it would hang the GUI thread. So
+            // cancel that one call and wait a fixed budget; past it the thread
+            // is detached and may only touch the shared state.
+            ::CancelSynchronousIo(writer_.native_handle());
+            if (writerDone_.wait_for(std::chrono::milliseconds(kWriterJoinTimeoutMs))
+                == std::future_status::ready) {
+                writer_.join();
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(state_->mutex);
+                    state_->orphaned = true;
+                }
+                writer_.detach();
+                emit failed(QStringLiteral("stdout writer did not stop within %1 ms; detached it")
+                                .arg(kWriterJoinTimeoutMs));
+            }
         }
-        writerWake_.notify_all();
-        if (writer_.joinable())
-            writer_.join();
 #endif
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->queue.clear();
+        }
+        state_->overflowReported = false;
         emit stateChanged();
     }
 
@@ -461,11 +602,23 @@ public:
 
     qint64 bytesIn() const { return bytesIn_; }
 
-    qint64 bytesOut() const { return bytesOut_.load(); }
+    qint64 bytesOut() const { return state_->bytesOut.load(); }
 
-    int queuedFrames() const { return static_cast<int>(outbound_.size()); }
+    /** Frames still queued for the writer, on either side of the hand-off. */
+    int queuedFrames() const
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        return state_->queue.frames();
+    }
 
-    int droppedFrames() const { return droppedFrames_; }
+    /** Bytes still owed to the peer: the single cap from `kMaxOutboundBytes`. */
+    qint64 queuedBytes() const
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        return state_->queue.bytes();
+    }
+
+    int droppedFrames() const { return state_->droppedFrames.load(); }
 
     /** Queue one message; flushes immediately when the pipe accepts it. */
     void send(const QJsonObject &message)
@@ -474,21 +627,17 @@ public:
             return;
         QByteArray line = QJsonDocument(message).toJson(QJsonDocument::Compact);
         line.append('\n');
-        if (outboundBytes_ + line.size() > kMaxOutboundBytes) {
-            // Drop the oldest frame: a stale reply is worth less than staying
-            // alive, and the requester has already timed out on its side.
-            while (!outbound_.isEmpty() && outboundBytes_ + line.size() > kMaxOutboundBytes) {
-                outboundBytes_ -= outbound_.first().size();
-                outbound_.removeFirst();
-                ++droppedFrames_;
-            }
-            if (!overflowReported_) {
-                overflowReported_ = true;
-                emit failed(QStringLiteral("outbound queue overflow; dropping the oldest replies"));
-            }
+        int dropped = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            // Drop from the head of the one queue: a stale reply is worth less
+            // than staying alive, and the requester has already timed out.
+            dropped = state_->queue.dropOldestToFit(line.size(), kMaxOutboundBytes);
+            state_->droppedFrames += dropped;
+            state_->queue.append(line);
         }
-        outboundBytes_ += line.size();
-        outbound_.append(line);
+        if (dropped > 0 && !state_->overflowReported.exchange(true))
+            emit failed(QStringLiteral("outbound queue overflow; dropping the oldest replies"));
         flush_();
     }
 
@@ -500,6 +649,15 @@ signals:
 private:
     static constexpr int kMaxInboundBytes = 4 * 1024 * 1024;
     static constexpr int kMaxOutboundBytes = 8 * 1024 * 1024;
+    // Bytes we are willing to move per read tick. Draining a burst in one tick
+    // keeps throughput in the MB/s range instead of one 4 KB chunk per timer
+    // shot, while the budget keeps a firehose peer from starving the GUI.
+    static constexpr int kReadBudgetPerTick = 64 * 1024;
+    // PIPE_BUF is 4096 on both platforms; writing more than that in one call can
+    // block until the reader drains the whole buffer.
+    static constexpr int kWriteChunkBytes = 4096;
+    // How long stop() waits for a writer parked in WriteFile before detaching it.
+    static constexpr int kWriterJoinTimeoutMs = 2000;
 
     void scheduleFlush_(int delayMs = 5)
     {
@@ -510,101 +668,106 @@ private:
     void flush_()
     {
 #if defined(Q_OS_WIN)
-        // Hand the queue to the writer thread and return: the GUI thread never
-        // calls WriteFile, so a peer that stops reading cannot park it.
-        {
-            std::lock_guard<std::mutex> lock(writerMutex_);
-            while (!outbound_.isEmpty()) {
-                const QByteArray frame = outbound_.takeFirst();
-                if (!frame.isEmpty())
-                    pending_.push_back(frame);
-            }
-        }
-        writerWake_.notify_one();
+        // The frame is already in the queue; the writer thread owns WriteFile.
+        state_->wake.notify_one();
 #else
-        while (!outbound_.isEmpty()) {
-            QByteArray &front = outbound_.first();
-            if (front.isEmpty()) {
-                outbound_.removeFirst();
-                continue;
-            }
-            // Ask the kernel whether the pipe can take bytes right now. Writing
-            // blind is what turns a slow reader into a frozen UI thread.
-            struct pollfd writable = {1, POLLOUT, 0};
-            const int ready = ::poll(&writable, 1, 0);
-            if (ready == 0) {
-                scheduleFlush_();
+        for (;;) {
+            QByteArray frame;
+            if (!state_->queue.take(frame))
                 return;
-            }
-            if (ready < 0) {
-                if (errno == EINTR)
-                    continue;
-                emit failed(QStringLiteral("stdout poll failed: ")
-                            + QString::fromLocal8Bit(std::strerror(errno)));
-                stop();
-                return;
-            }
-            const qint64 written = ::write(1, front.constData(), static_cast<size_t>(front.size()));
-            if (written < 0) {
-                if (errno == EINTR)
-                    continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            while (!frame.isEmpty()) {
+                // Ask the kernel whether the pipe can take bytes right now.
+                // Writing blind is what turns a slow reader into a frozen UI.
+                struct pollfd writable = {1, POLLOUT, 0};
+                const int ready = ::poll(&writable, 1, 0);
+                if (ready == 0) {
+                    state_->queue.requeueFront(frame);
                     scheduleFlush_();
                     return;
                 }
-                emit failed(QStringLiteral("stdout write failed: ") + QString::fromLocal8Bit(std::strerror(errno)));
-                stop();
-                return;
+                if (ready < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    state_->queue.requeueFront(frame);
+                    emit failed(QStringLiteral("stdout poll failed: ")
+                                + QString::fromLocal8Bit(std::strerror(errno)));
+                    stop();
+                    return;
+                }
+                // At most PIPE_BUF per call: a larger blocking write can park
+                // until the whole buffer drains, which is the very thing this
+                // class promises never to do on the GUI thread.
+                const int chunk = frame.size() > kWriteChunkBytes ? kWriteChunkBytes : frame.size();
+                const ssize_t written = ::write(1, frame.constData(), static_cast<size_t>(chunk));
+                if (written < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    state_->queue.requeueFront(frame);
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        scheduleFlush_();
+                        return;
+                    }
+                    emit failed(QStringLiteral("stdout write failed: ")
+                                + QString::fromLocal8Bit(std::strerror(errno)));
+                    stop();
+                    return;
+                }
+                state_->bytesOut += written;
+                frame.remove(0, static_cast<int>(written));
             }
-            bytesOut_ += written;
-            outboundBytes_ -= written;
-            if (written < front.size()) {
-                front.remove(0, static_cast<int>(written));
-                scheduleFlush_();
-                return;
-            }
-            outbound_.removeFirst();
         }
 #endif
     }
 
 #if defined(Q_OS_WIN)
-    /** Drains `pending_` on its own thread; the GUI thread only enqueues. */
-    void writerLoop_()
+    /**
+     * Drains the shared queue on its own thread; the GUI thread only appends.
+     *
+     * It may block in `_write` — that is the whole point of moving it off the
+     * GUI thread — and it stops touching the transport as soon as `orphaned`
+     * is set, so `stop()` can detach it instead of hanging on `join()`.
+     */
+    void writerLoop_(const std::shared_ptr<WriterState> &state)
     {
-        std::unique_lock<std::mutex> lock(writerMutex_);
+        std::unique_lock<std::mutex> lock(state->mutex);
         for (;;) {
-            writerWake_.wait(lock, [this]() { return writerStop_ || !pending_.empty(); });
-            if (writerStop_ && pending_.empty())
-                return;
-            QByteArray frame = pending_.front();
-            pending_.pop_front();
+            state->wake.wait(lock, [&state]() { return state->stop || !state->queue.isEmpty(); });
+            if (state->queue.isEmpty()) {
+                if (state->stop)
+                    return;
+                continue;
+            }
+            QByteArray frame;
+            if (!state->queue.take(frame))
+                continue;
+            const int chunk = frame.size() > kWriteChunkBytes ? kWriteChunkBytes : frame.size();
             lock.unlock();
-            const int written = ::_write(1, frame.constData(), static_cast<unsigned int>(frame.size()));
+            const int written = ::_write(1, frame.constData(), static_cast<unsigned int>(chunk));
+            const int error = written < 0 ? errno : 0;
+            lock.lock();
             if (written < 0) {
-                const int error = errno;
-                lock.lock();
-                pending_.clear();
-                writerStop_ = true;
+                state->queue.clear();
+                state->stop = true;
+                const bool report = !state->orphaned;
                 lock.unlock();
-                const QString reason = QStringLiteral("stdout write failed: ")
-                                       + QString::fromLocal8Bit(std::strerror(error));
-                QMetaObject::invokeMethod(
-                    this,
-                    [this, reason]() {
-                        emit failed(reason);
-                        stop();
-                    },
-                    Qt::QueuedConnection);
+                if (report) {
+                    const QString reason = QStringLiteral("stdout write failed (error %1)")
+                                               .arg(error);
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, reason]() {
+                            emit failed(reason);
+                            stop();
+                        },
+                        Qt::QueuedConnection);
+                }
                 return;
             }
-            bytesOut_ += written;
-            outboundBytes_ -= written;
+            state->bytesOut += written;
             if (written < frame.size()) {
                 // Partial write: keep the remainder at the head of the queue and
                 // pause briefly so a stalled reader cannot spin a core.
-                lock.lock();
-                pending_.push_front(frame.mid(written));
+                state->queue.requeueFront(frame.mid(written));
                 lock.unlock();
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 lock.lock();
@@ -622,26 +785,108 @@ private:
      * is alive but the window is dead". PeekNamedPipe reports the queued byte
      * count without consuming anything, so the read below can never wait.
      */
-    bool stdinReadable_()
+    /**
+     * What stdin looks like right now, without touching it.
+     *
+     * `Ready` means a read cannot block; `Idle` means wait for the next tick;
+     * `Broken` means the peer closed, which is an ordinary EOF and not an error.
+     * A pipe that has data but no longer a reader reports `Broken` too, because
+     * `PeekNamedPipe` fails with ERROR_BROKEN_PIPE and `::_read` then returns 0.
+     */
+    enum class StdinReadiness
+    {
+        Ready,
+        Idle,
+        Broken,
+        Failed
+    };
+
+    StdinReadiness stdinReadiness_(QString *reason = nullptr)
     {
 #if defined(Q_OS_WIN)
         const HANDLE handle = GetStdHandle(STD_INPUT_HANDLE);
-        if (handle == nullptr || handle == INVALID_HANDLE_VALUE)
-            return false;
+        if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+            if (reason != nullptr)
+                *reason = QStringLiteral("stdin handle is not available");
+            return StdinReadiness::Failed;
+        }
+        // Only pipes get the peek treatment. A redirected file or console has no
+        // byte count to peek at, and ::read on a file at EOF simply returns 0, so
+        // those fall back to the plain blocking read this class always used.
+        if (!stdinIsPipe_)
+            return StdinReadiness::Ready;
         DWORD available = 0;
         if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) {
-            // A closed peer is readable: the read below returns 0 and the EOF
-            // path runs. Any other failure is treated as "nothing to read".
-            return GetLastError() == ERROR_BROKEN_PIPE;
+            const DWORD error = GetLastError();
+            if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED)
+                return StdinReadiness::Broken;
+            if (reason != nullptr) {
+                *reason = QStringLiteral("stdin peek failed (error %1)").arg(error);
+            }
+            return StdinReadiness::Failed;
         }
-        return available > 0;
+        return available > 0 ? StdinReadiness::Ready : StdinReadiness::Idle;
 #else
+        Q_UNUSED(reason);
         struct pollfd descriptor = {0, POLLIN, 0};
         const int ready = ::poll(&descriptor, 1, 0);
         if (ready < 0)
-            return errno == EINTR;
-        return ready > 0 && (descriptor.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
+            return errno == EINTR ? StdinReadiness::Idle : StdinReadiness::Failed;
+        if (ready == 0)
+            return StdinReadiness::Idle;
+        if ((descriptor.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) == 0)
+            return StdinReadiness::Idle;
+        return StdinReadiness::Ready;
 #endif
+    }
+
+    /**
+     * Moves up to `kReadBudgetPerTick` bytes and returns how many it moved.
+     *
+     * Returns -1 when the peer closed. The budget is what keeps the GUI fair: a
+     * peer that never stops writing would otherwise keep this loop (and the
+     * event loop) busy indefinitely.
+     */
+    qint64 readOnce_()
+    {
+        char chunk[4096];
+        qint64 moved = 0;
+        while (moved < kReadBudgetPerTick) {
+            if (!legacyBlockingRead_) {
+                const StdinReadiness readiness = stdinReadiness_();
+                if (readiness == StdinReadiness::Broken)
+                    return moved > 0 ? moved : -1;
+                if (readiness != StdinReadiness::Ready)
+                    return moved;
+            }
+            qint64 got = 0;
+#if defined(Q_OS_WIN)
+            got = ::_read(0, chunk, static_cast<unsigned int>(sizeof(chunk)));
+            if (got < 0)
+                return moved;
+#else
+            got = ::read(0, chunk, sizeof(chunk));
+            if (got < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                    return moved;
+                emit failed(QStringLiteral("stdin read failed: ")
+                            + QString::fromLocal8Bit(std::strerror(errno)));
+                stop();
+                return moved;
+            }
+#endif
+            if (got == 0)
+                return moved > 0 ? moved : -1;
+            moved += got;
+            bytesIn_ += got;
+            inbound_.append(chunk, static_cast<int>(got));
+            if (legacyBlockingRead_) {
+                // The fixture has to keep the pre-fix shape exactly: one
+                // blocking read per tick, then back to the event loop.
+                return moved;
+            }
+        }
+        return moved;
     }
 
     void readAvailable()
@@ -651,33 +896,25 @@ private:
         // Never enter ::read without proof that it cannot block. The legacy
         // switch exists only so the regression suite can demonstrate the
         // pre-fix behaviour on a silent-but-open pipe.
-        if (!legacyBlockingRead_ && !stdinReadable_())
-            return;
-        char chunk[4096];
-        qint64 got = 0;
-#if defined(Q_OS_WIN)
-        got = ::_read(0, chunk, static_cast<unsigned int>(sizeof(chunk)));
-        if (got < 0)
-            return;
-#else
-        // One read per readiness notification: a single ::read on a readable
-        // descriptor cannot block, while a read-until-EAGAIN loop would.
-        got = ::read(0, chunk, sizeof(chunk));
-        if (got < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+        if (!legacyBlockingRead_) {
+            QString reason;
+            const StdinReadiness readiness = stdinReadiness_(&reason);
+            if (readiness == StdinReadiness::Failed) {
+                emit failed(reason);
+                stop();
                 return;
-            emit failed(QStringLiteral("stdin read failed: ") + QString::fromLocal8Bit(std::strerror(errno)));
-            stop();
-            return;
+            }
+            if (readiness == StdinReadiness::Idle)
+                return;
         }
-#endif
-        if (got == 0) {
+        const qint64 moved = readOnce_();
+        if (moved < 0) {
             emit failed(QStringLiteral("stdin closed"));
             stop();
             return;
         }
-        bytesIn_ += got;
-        inbound_.append(chunk, static_cast<int>(got));
+        if (moved == 0)
+            return;
         if (inbound_.size() > kMaxInboundBytes) {
             inbound_.clear();
             emit failed(QStringLiteral("inbound buffer overflow; dropping partial message"));
@@ -712,23 +949,17 @@ private:
     QSocketNotifier *readNotifier_ = nullptr;
     QTimer *pollTimer_ = nullptr;
     QByteArray inbound_;
-    QList<QByteArray> outbound_;
-    // Bytes still owed to the peer: read on the GUI thread (send/backpressure)
-    // and decremented by the Windows writer thread, so it has to be atomic.
-    std::atomic<qint64> outboundBytes_{0};
-    std::atomic<qint64> bytesOut_{0};
+    // One queue for every byte not yet written, shared with the Windows writer
+    // thread, so the outbound cap sees the writer's backlog as well.
+    std::shared_ptr<WriterState> state_ = std::make_shared<WriterState>();
     qint64 bytesIn_ = 0;
-    int droppedFrames_ = 0;
-    bool overflowReported_ = false;
     bool active_ = false;
     bool polledReads_ = false;
     bool legacyBlockingRead_ = false;
+    bool stdinIsPipe_ = false;
 #if defined(Q_OS_WIN)
     std::thread writer_;
-    std::mutex writerMutex_;
-    std::condition_variable writerWake_;
-    std::deque<QByteArray> pending_;
-    bool writerStop_ = false;
+    std::future<void> writerDone_;
 #endif
 };
 
@@ -1180,6 +1411,18 @@ private:
                                            {QStringLiteral("pending"), pendingRequests()}});
             return;
         }
+        // Test-only echo: lets the regression drive frames of a chosen size in
+        // both directions, which is how the chunked writer and the read budget
+        // are exercised. Registered only when DSH_QT_TEST_HOOKS is set, so the
+        // production method set is unchanged.
+        if (testHooks_ && method == QLatin1String("host.echo")) {
+            const QJsonObject params = frame.value(QStringLiteral("params")).toObject();
+            const int bytes = qBound(0, params.value(QStringLiteral("bytes")).toInt(), 8 * 1024 * 1024);
+            sendRes_(id, true,
+                     QJsonObject{{QStringLiteral("bytes"), bytes},
+                                 {QStringLiteral("payload"), QString(bytes, QLatin1Char('x'))}});
+            return;
+        }
         if (method == QLatin1String("host.quit")) {
             sendRes_(id, true, QJsonObject{{QStringLiteral("accepted"), true}});
             QTimer::singleShot(0, qApp, &QCoreApplication::quit);
@@ -1496,6 +1739,8 @@ private:
     qint64 eventSeq_ = 0;
     bool connecting_ = false;
     bool connected_ = false;
+    // Test-only method set (host.echo); see handleHostRequest_.
+    bool testHooks_ = qEnvironmentVariableIsSet("DSH_QT_TEST_HOOKS");
     bool hadConnected_ = false;
     bool quitScheduled_ = false;
     int handled_ = 0;
@@ -1530,15 +1775,30 @@ static void startGuiHeartbeat(QCoreApplication &app)
     const QString path = qEnvironmentVariable("DSH_QT_HEARTBEAT_FILE");
     if (path.isEmpty())
         return;
+    // Item I: a silent failure here would look exactly like "the GUI thread is
+    // frozen", which is the one thing this channel exists to distinguish. Say why.
     auto *file = new QFile(path, &app);
-    if (!file->open(QIODevice::WriteOnly | QIODevice::Truncate))
+    if (!file->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        std::fprintf(stderr,
+                     "dsh-qt-app: heartbeat file '%s' could not be opened: %s\n",
+                     qPrintable(path),
+                     qPrintable(file->errorString()));
+        std::fflush(stderr);
+        delete file;
         return;
-    auto *elapsed = new QElapsedTimer;
-    elapsed->start();
-    auto *sequence = new int(0);
+    }
+    // The path has to be unique per instance: two processes appending to one file
+    // would interleave their `hb` lines and make the sequence meaningless.
+    struct Beat
+    {
+        QElapsedTimer elapsed;
+        int sequence = 0;
+    };
+    auto beat = QSharedPointer<Beat>::create();
+    beat->elapsed.start();
     auto *timer = new QTimer(&app);
     timer->setInterval(50);
-    QObject::connect(timer, &QTimer::timeout, &app, [file, elapsed, sequence]() {
+    QObject::connect(timer, &QTimer::timeout, &app, [file, beat]() {
         int windows = 0;
         int exposed = 0;
         int visible = 0;
@@ -1553,8 +1813,8 @@ static void startGuiHeartbeat(QCoreApplication &app)
                 ++visible;
         }
         file->write(QStringLiteral("hb %1 %2 %3 %4 %5\n")
-                        .arg(++*sequence)
-                        .arg(elapsed->elapsed())
+                        .arg(++beat->sequence)
+                        .arg(beat->elapsed.elapsed())
                         .arg(windows)
                         .arg(exposed)
                         .arg(visible)
@@ -1564,8 +1824,81 @@ static void startGuiHeartbeat(QCoreApplication &app)
     timer->start();
 }
 
+/**
+ * Replays the outbound accounting without a pipe.
+ *
+ * Item B of the review: the drop policy used to be spread over two lists, so
+ * the cap could not see the frames the Windows writer was holding. That made
+ * the interesting case — a stalled reader plus a live producer — impossible to
+ * test on demand. The queue is now one object, so it can be driven directly.
+ */
+static int runOutboundQueueSelftest()
+{
+    int failures = 0;
+    const auto check = [&failures](bool ok, const char *what) {
+        std::printf("%s %s\n", ok ? "ok" : "not ok", what);
+        if (!ok)
+            ++failures;
+    };
+    {
+        OutboundQueue queue;
+        queue.append(QByteArray(10, 'a'));
+        queue.append(QByteArray(20, 'b'));
+        check(queue.bytes() == 30 && queue.frames() == 2,
+              "counts bytes and frames across the whole queue");
+        check(queue.dropOldestToFit(5, 30) == 1,
+              "drops the oldest frame when the incoming one would exceed the cap");
+        check(queue.bytes() == 20 && queue.frames() == 1, "recounts after a drop");
+        QByteArray frame;
+        check(queue.take(frame) && frame.size() == 20, "take pops the surviving frame");
+        check(queue.bytes() == 0 && queue.isEmpty(), "take leaves nothing owed");
+        queue.requeueFront(frame);
+        check(queue.bytes() == 20 && queue.frames() == 1,
+              "requeueFront puts an unwritten tail back at the head");
+        queue.clear();
+        check(queue.bytes() == 0 && queue.isEmpty(), "clear zeroes the counter");
+    }
+    {
+        OutboundQueue queue;
+        queue.append(QByteArray(10, 'a'));
+        queue.append(QByteArray(20, 'b'));
+        queue.append(QByteArray(30, 'c'));
+        check(queue.dropOldestToFit(45, 60) == 3,
+              "drops as many frames as the incoming one needs");
+    }
+    {
+        OutboundQueue queue;
+        for (int i = 0; i < 5; ++i)
+            queue.append(QByteArray(100, 'x'));
+        check(queue.dropOldestToFit(100, 500) == 1,
+              "frees exactly enough room for the incoming frame");
+        check(queue.frames() == 4, "removes whole frames only");
+    }
+    {
+        // The writer holds one frame while another arrives past the cap. With a
+        // single queue this still drops; the old two-list version could not.
+        OutboundQueue queue;
+        QByteArray inFlight;
+        queue.append(QByteArray(400, 'a'));
+        check(queue.take(inFlight) && inFlight.size() == 400,
+              "take models the writer holding a frame");
+        queue.append(QByteArray(400, 'b'));
+        check(queue.bytes() == 400 && queue.frames() == 1,
+              "the in-flight frame is not counted twice");
+        queue.requeueFront(inFlight);
+        check(queue.dropOldestToFit(400, 800) == 1 && queue.bytes() == 400,
+              "a partially written frame can still be dropped to make room");
+    }
+    std::printf("outbound-queue selftest: %s\n", failures == 0 ? "pass" : "FAIL");
+    std::fflush(stdout);
+    return failures == 0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[])
 {
+    // Test hook for the outbound accounting; nothing else sets this.
+    if (qEnvironmentVariableIsSet("DSH_QT_OUTBOUND_QUEUE_SELFTEST"))
+        return runOutboundQueueSelftest();
 #if defined(DSH_QT_HAS_WEBENGINE) && DSH_QT_HAS_WEBENGINE
     // Must run before QGuiApplication is constructed (Qt WebEngine contract).
     QtWebEngineQuick::initialize();

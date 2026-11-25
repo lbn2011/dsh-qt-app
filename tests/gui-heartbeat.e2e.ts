@@ -38,7 +38,7 @@
  * observation on the user's own machine is still a separate piece of evidence.
  */
 import assert from 'node:assert/strict'
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -99,7 +99,12 @@ interface Session {
   stop(): Promise<{ code: number | null; signal: NodeJS.Signals | null }>
 }
 
-function launch(options: { polled?: boolean; legacyRead?: boolean; label: string }): Session {
+function launch(options: {
+  polled?: boolean
+  legacyRead?: boolean
+  testHooks?: boolean
+  label: string
+}): Session {
   const beats = join(tmpdir(), `dsh-qt-heartbeat-${process.pid}-${options.label}.txt`)
   rmSync(beats, { force: true })
   const child = spawn(binary, [], {
@@ -110,6 +115,7 @@ function launch(options: { polled?: boolean; legacyRead?: boolean; label: string
       QT_QPA_PLATFORM: process.platform === 'win32' ? 'windows' : 'offscreen',
       ...(options.polled === true ? { DSH_QT_STDIO_POLL: '1' } : {}),
       ...(options.legacyRead === true ? { DSH_QT_STDIO_TEST_LEGACY_READ: '1' } : {}),
+      ...(options.testHooks === true ? { DSH_QT_TEST_HOOKS: '1' } : {}),
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
@@ -177,6 +183,7 @@ test(
       // Nothing is written from here on: an idle-but-open pipe is exactly the
       // condition that used to freeze the window.
       await delay(2_000)
+      assert.equal(session.child.exitCode, null, 'the child must still be running while we sample')
       const beats = readBeats(session.beats)
       assert.ok(
         beats.length >= 20,
@@ -197,6 +204,7 @@ test(
           `the window was created but never exposed; beats: ${JSON.stringify(beats)}`,
         )
       }
+      assert.equal(session.child.exitCode, null, 'the child must still be running after the assertions')
     } finally {
       await session.stop()
     }
@@ -234,13 +242,20 @@ test(
         resumed.length <= 3,
         `the GUI thread ran at full rate after a frame (${stalled.length} → ${resumed.length} beats)`,
       )
-      // 2.5 s have passed and the last tick is still from the first 100 ms: the
-      // thread is parked, and the missing ticks (not a long gap between two of
-      // them) are the evidence.
-      const lastTick = resumed[resumed.length - 1]
+      // The durable invariant is the *rate after* the frame, not the absolute
+      // elapsed time of the last tick: answering the ping is what unblocks the
+      // read, so one further tick is expected however the two timers interleave.
+      // What must not happen is the thread returning to a normal rate — the fixed
+      // path adds about ten ticks over the same 500 ms.
+      const added = resumed.length - stalled.length
       assert.ok(
-        lastTick !== undefined && lastTick.elapsed <= 500,
-        `the GUI thread kept ticking long after the idle window (last tick at ${String(lastTick?.elapsed)} ms)`,
+        added <= 2,
+        `the GUI thread resumed a normal rate after one frame (${stalled.length} → ${resumed.length} beats)`,
+      )
+      assert.equal(
+        session.child.exitCode,
+        null,
+        'the parked process is still alive after answering, which is the symptom',
       )
     } finally {
       await session.stop()
@@ -276,3 +291,118 @@ test(
     }
   },
 )
+
+test(
+  'a stalled reader never freezes the GUI, and the large reply arrives intact',
+  { skip: skipReason, timeout: 90_000 },
+  async () => {
+    // Item C of the review: the POSIX writer used to hand a whole frame to
+    // `::write`, which blocks once the pipe is full — the same freeze as the
+    // read side, one direction over. The Windows writer thread can block, but
+    // only itself. This case covers both: the reader stops draining, the Qt side
+    // is asked for a 200 KB reply (far past any pipe buffer), and the GUI thread
+    // has to keep ticking while that reply waits.
+    const session = launch({ polled: true, testHooks: true, label: 'stalled-reader' })
+    try {
+      await session.waitConnected()
+      const before = readBeats(session.beats).length
+      session.child.stdout.pause()
+      const pending = session.host.invoke('host.echo', { bytes: 200_000 })
+      await delay(1_000)
+      const during = readBeats(session.beats)
+      assert.ok(
+        during.length - before >= 15,
+        `the GUI thread stalled while its reader was not draining (${before} → ${during.length} beats)`,
+      )
+      session.child.stdout.resume()
+      const reply = (await pending) as { bytes: number; payload: string }
+      assert.equal(reply.bytes, 200_000, 'the reply frame lost bytes across the stalled window')
+      assert.equal(reply.payload.length, 200_000, 'the reply payload was truncated or interleaved')
+    } finally {
+      await session.stop()
+    }
+  },
+)
+
+test(
+  'a 1 MB inbound frame is consumed at MB/s without starving the GUI thread',
+  { skip: skipReason, timeout: 90_000 },
+  async () => {
+    // Item D: one 4 KB read per 25 ms tick capped inbound throughput at ~160 KB/s
+    // and made a large frame take many seconds. The read budget moves 64 KB per
+    // tick, so a megabyte should land in well under a second while the heartbeat
+    // keeps its cadence.
+    const session = launch({ polled: true, testHooks: true, label: 'inbound' })
+    try {
+      await session.waitConnected()
+      const before = readBeats(session.beats).length
+      const started = Date.now()
+      const reply = (await session.host.invoke('host.echo', { bytes: 1, pad: 'x'.repeat(1_000_000) })) as {
+        bytes: number
+      }
+      const elapsed = Date.now() - started
+      assert.equal(reply.bytes, 1, 'the request did not survive a megabyte frame')
+      assert.ok(elapsed < 2_000, `a 1 MB frame took ${elapsed} ms to reach the GUI thread`)
+      const during = readBeats(session.beats)
+      assert.ok(
+        during.length - before >= 8,
+        `the GUI thread starved while a large frame was read (${before} → ${during.length} beats)`,
+      )
+    } finally {
+      await session.stop()
+    }
+  },
+)
+
+test(
+  'quitting while the reader is stalled is bounded and exits with a definite code',
+  { skip: skipReason, timeout: 90_000 },
+  async () => {
+    // Item A: `stop()` used to `join()` a writer parked inside `WriteFile` on a
+    // full pipe, so the process never exited. Fill the pipe, ask the app to
+    // quit, and require a real exit inside five seconds.
+    const session = launch({ polled: true, testHooks: true, label: 'bounded-exit' })
+    try {
+      await session.waitConnected()
+      session.child.stdout.pause()
+      // Two 200 KB replies overflow any pipe buffer, so the writer is parked.
+      void session.host.invoke('host.echo', { bytes: 200_000 }).catch(() => {})
+      void session.host.invoke('host.echo', { bytes: 200_000 }).catch(() => {})
+      await delay(750)
+      assert.equal(session.child.exitCode, null, 'the app should still be running before it is asked to quit')
+      const quitAt = Date.now()
+      void session.host.invoke('host.quit').catch(() => {})
+      const result = await session.waitExit(5_000)
+      const waited = Date.now() - quitAt
+      assert.notEqual(result, null, 'the app hung instead of exiting with a stalled reader')
+      assert.equal(result!.code, 0, `the app exited with ${String(result!.code)} instead of 0`)
+      assert.ok(waited < 5_000, `the exit took ${waited} ms`)
+    } finally {
+      await session.stop()
+    }
+  },
+)
+
+test('the outbound queue keeps one byte count and drops the oldest frames', { skip: skipReason }, () => {
+  // Review item B. The queue used to be split in two — a list on the GUI side
+  // and a deque inside the Windows writer thread — so the cap only saw half the
+  // backlog and a stalled reader plus a live producer could not be reproduced.
+  // The accounting is now one OutboundQueue, and the binary replays a scripted
+  // sequence through that same code: no pipe, no window, no peer.
+  const result = spawnSync(binary, [], {
+    cwd: root,
+    env: { ...process.env, DSH_QT_OUTBOUND_QUEUE_SELFTEST: '1' },
+    encoding: 'utf8',
+    timeout: 30_000,
+  })
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`
+  assert.equal(result.status, 0, `the queue selftest failed:\n${output}`)
+  const checks = output.split('\n').filter((line) => line.startsWith('ok ') || line.startsWith('not ok '))
+  assert.ok(checks.length >= 12, `expected the full table, got:\n${output}`)
+  assert.deepEqual(
+    checks.filter((line) => line.startsWith('not ok ')),
+    [],
+    `failing queue checks:\n${output}`,
+  )
+  assert.match(output, /outbound-queue selftest: pass/)
+})

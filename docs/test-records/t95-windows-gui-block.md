@@ -40,10 +40,15 @@ readable, which is exactly why no test caught it.
 ## 2. The fix (minimal, in `native/main.cpp`)
 
 * **Readiness before read.** `readAvailable()` returns early unless
-  `stdinReadable_()` says the descriptor has data or has reached EOF/error.
-  Windows uses `PeekNamedPipe`; POSIX uses `::poll` with `POLLIN|POLLHUP|POLLERR|POLLNVAL`.
-  A `PeekNamedPipe` failure is treated as EOF only for `ERROR_BROKEN_PIPE`, so a
-  real error still reaches the existing failure path.
+  `stdinReadiness_()` reports `Ready` (a read cannot block) or `Broken` (the peer
+  closed). Windows asks `PeekNamedPipe`; POSIX uses `::poll` with
+  `POLLIN|POLLHUP|POLLERR|POLLNVAL`. The handle is classified once at startup with
+  `GetFileType`: only `FILE_TYPE_PIPE` gets the peek, because a redirected file or
+  a console has no byte count to peek at and a read there returns 0 at EOF rather
+  than blocking — those keep the plain read path. `ERROR_BROKEN_PIPE` and
+  `ERROR_PIPE_NOT_CONNECTED` mean EOF; **any other** `PeekNamedPipe` failure emits
+  `failed("stdin peek failed (error N)")` and stops the transport through the
+  existing failure path instead of being swallowed as "nothing to read".
 * **Writes never block the GUI thread on Windows.** `flush_()` moves the queued
   frames into a `pending_` deque and wakes a dedicated writer thread
   (`writerLoop_`), which performs the blocking `::_write` outside the GUI
@@ -63,6 +68,15 @@ readable, which is exactly why no test caught it.
   are set.
 
 ## 3. The regression (`tests/gui-heartbeat.e2e.ts`)
+
+`pnpm test` does **not** run this file: its pattern is `tests/*.test.ts` and this
+one is `*.e2e.ts` because it needs a built binary. Run it explicitly:
+
+```bash
+DSH_QT_APP_BINARY=build/dsh-qt-app pnpm exec tsx --test tests/gui-heartbeat.e2e.ts
+```
+
+Seven cases as of the repair round in §7 (three in the first revision).
 
 Real binary, real Node pipe, production `HostBridgeService` + `HostTransport`:
 
@@ -145,3 +159,104 @@ Full suite and typecheck (unchanged by this work):
 | `tests/gui-heartbeat.e2e.ts` | new regression, three cases, real binary + real pipe |
 | `.github/workflows/test.yml` | new `qt-gui-heartbeat` job, `ubuntu-22.04` + `windows-2022` |
 | `docs/test-records/t95-windows-gui-block.md` | this record |
+
+## 7. Repair round (independent review, round 2)
+
+The first revision fixed the read side but left four holes the review named:
+a writer parked in `WriteFile` could hang `stop()` forever, the outbound cap
+only saw half the queue, the POSIX writer still handed whole frames to `::write`,
+and inbound throughput was one 4 KB read per tick. All four are fixed here, each
+with a case that fails on the previous revision.
+
+### 7.1 What changed in `native/main.cpp`
+
+* **One queue, one byte count.** `class OutboundQueue` holds every frame that has
+  not been written yet — the ones waiting for the writer and the one the writer
+  is chewing on. `send()` drops whole frames from its head until the incoming
+  frame fits under `kMaxOutboundBytes`; `queuedFrames()`/`queuedBytes()` report
+  the same numbers the cap uses. `stop()` clears the queue and resets the
+  overflow flag, so a reconnect starts from zero.
+* **Bounded shutdown.** `stop()` sets `stop`, clears the queue, wakes the writer,
+  calls `CancelSynchronousIo(writer_.native_handle())` and waits
+  `kWriterJoinTimeoutMs` (2 s) on a `std::future`; a writer that still has not
+  returned is detached after `orphaned` is set, so the detached thread may only
+  touch the shared `WriterState` (held by `shared_ptr`) and never the transport.
+* **Never-blocking writes on both platforms.** POSIX `flush_()` takes one frame,
+  `poll(POLLOUT, 0)`, then writes at most `kWriteChunkBytes` (4096 = `PIPE_BUF`)
+  per call, requeueing the tail on `EAGAIN`; Windows hands the frame to the writer
+  thread, which may block but only on its own thread.
+* **Read budget.** `readOnce_()` moves up to `kReadBudgetPerTick` (64 KB) per
+  tick, looping while the pipe still has data, so a megabyte lands in a few ticks
+  instead of ~6 s while the GUI keeps its cadence.
+* **Handle classification.** `GetFileType` decides whether stdin is a pipe; a
+  non-pipe keeps the plain read. Unexpected `PeekNamedPipe` errors are reported.
+* **Heartbeat diagnostics.** A heartbeat file that cannot be opened now prints the
+  path and `errorString()` to stderr instead of failing silently — the one failure
+  mode that would otherwise look exactly like a frozen GUI thread. The path must be
+  unique per instance: two processes appending to one file interleave their `hb`
+  lines and the sequence stops meaning anything.
+* **Test hooks, inert in production.** `DSH_QT_OUTBOUND_QUEUE_SELFTEST=1` replays
+  the queue table and exits; `DSH_QT_TEST_HOOKS=1` adds a `host.echo` method that
+  answers with a payload of a requested size, which is how large frames are driven
+  in both directions.
+
+### 7.2 Red on the previous revision, green here
+
+Red was taken with the **same test file** against a binary built from the
+reviewed revision `4ac11ac` plus *only* the `host.echo` test hook, so the single
+difference between the two runs is the transport itself:
+
+```bash
+git -C ../base archive 4ac11ac | tar -x -C /tmp/t97-old-hooks   # + the echo hook only
+cmake -S /tmp/t97-old-hooks -B /tmp/t97-old-hooks/build -DCMAKE_BUILD_TYPE=Release -DDSH_QT_WEBENGINE=OFF
+cmake --build /tmp/t97-old-hooks/build --parallel 2
+DSH_QT_APP_BINARY=/tmp/t97-old-hooks/build/dsh-qt-app pnpm exec tsx --test tests/gui-heartbeat.e2e.ts
+```
+
+| Case | `4ac11ac` (pre-repair) | this revision |
+| --- | --- | --- |
+| silent stdin, GUI keeps ticking | pass | pass |
+| pre-fix read shape parks the thread | pass | pass |
+| EOF keeps ticking, then exits 0 | pass | pass |
+| stalled reader + 200 KB reply | **fail** — `the GUI thread stalled while its reader was not draining (0 → 0 beats)` | pass |
+| 1 MB inbound frame | **fail** — the app died before the frame landed (`write EPIPE`) | pass, well under 2 s |
+| quit while the reader is stalled | **fail** — `the app hung instead of exiting with a stalled reader` (no exit in 5 s) | pass, exit code 0 |
+| outbound queue table (no pipe) | **fail** — the selftest entry does not exist there | pass, 13 `ok` lines |
+
+Totals: `4ac11ac` **tests 7 / pass 3 / fail 4**; this revision **tests 7 / pass 7 /
+fail 0**.
+
+Queue accounting, no pipe involved:
+
+```bash
+DSH_QT_OUTBOUND_QUEUE_SELFTEST=1 build/dsh-qt-app      # 13 ok lines, exit 0
+```
+
+The seventh case in `tests/gui-heartbeat.e2e.ts` runs exactly that command and
+asserts the whole table is `ok`, so the accounting is covered wherever the
+regression runs.
+
+### 7.3 CI entry
+
+`.github/workflows/test.yml` job `qt-gui-heartbeat` runs the same file on
+`ubuntu-22.04` and `windows-2022`, requires `pass 7` and `fail 0`, rejects a
+skipped run, and records in the job summary whether window exposure was asserted
+(a hosted Windows runner has no interactive desktop, so `DSH_QT_EXPECT_NO_DESKTOP=1`
+is set there and the summary says exposure was not asserted).
+
+### 7.4 What is still not verified
+
+* **The Windows code paths have not been executed.** This machine is Linux: the
+  `PeekNamedPipe`, `CancelSynchronousIo`, writer-thread and `GetFileType` branches
+  compile and were reviewed, but no Windows run exists. The `qt-gui-heartbeat` job
+  has never run on a hosted runner. Nothing here is a Windows result.
+* **Everything above is local simulation on Linux**, with `DSH_QT_STDIO_POLL=1`
+  selecting the same read shape Windows uses and `QT_QPA_PLATFORM=offscreen`
+  replacing the real desktop. Exposure reported under offscreen is not a
+  first-window observation on a real machine.
+* **The user's machine is not diagnosed.** A live snapshot showed several
+  `dsh-qt-app` processes with `MainWindowHandle=0`; that is consistent with "the
+  process is alive but no top-level window is mapped", and it does not distinguish
+  this defect from any other cause. The delivered binary (`43d15d59`) has no
+  heartbeat channel, so that evidence can only come from a build that includes
+  this change.
