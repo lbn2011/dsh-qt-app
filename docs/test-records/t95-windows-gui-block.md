@@ -284,12 +284,21 @@ installer, no delivered artifact was touched.
   the wire always finishes, so a peer never sees half a line.
 * When only started frames are left, the **new** frame is dropped instead of
   tearing the session down. Both paths increment `droppedFrames`, and the
-  transport emits one `warn` per episode (`outbound queue overflow; dropped N
-  stale frame(s)` / `outbound queue is full of frames already on the wire; …`).
+  transport emits one `warn` per episode carrying the **cumulative** count, not
+  the per-episode delta: `outbound queue overflow; N frame(s) dropped so far` /
+  `outbound queue is full of frames already on the wire; N frame(s) dropped so
+  far, new replies are dropped until the peer reads again`.
+* Once the queue drains back under a quarter of the cap, `maybeReportDrain_()`
+  emits `outbound queue drained; N frame(s) were dropped in total` and re-arms
+  the latch, so a second episode reports again and its number is larger than the
+  first. The quarter-cap threshold is deliberate: at the limit itself the latch
+  would flap and turn the channel into a warning storm.
 * `warn` is a separate signal from `failed`: it never reaches a disconnect path.
   `DshQtBridge` turns it into a `transport.warn` event carrying `reason`,
-  `droppedFrames` and `queuedBytes`, sent **uncapped and pinned** so the report
-  of a loss cannot itself be the frame the loss drops.
+  cumulative `droppedFrames`, `queuedBytes`, `oversizedInbound` and
+  `malformedInbound`, sent **uncapped and pinned** so the report of a loss cannot
+  itself be the frame the loss drops. A 4 KB control reserve keeps those frames
+  inside the same 8 MB budget as everything else.
 * `stop()` clears the queue, adds the discarded frames to `droppedFrames` and
   reports them (`dropped N unsent frame(s) while stopping the transport`).
 * `rejectProtocol_()` now answers with a nack plus a `transport.warn` instead of
@@ -345,7 +354,26 @@ still parses whatever a previous read left buffered.
 | queue selftest | 17 checks | 17 checks, now including started/pinned protection |
 | resync: 4 MB line + request in one write (R1) | request never answered until more bytes arrived | answered in the same pass |
 | resync: late newline (R1) | answered | answered |
-| full e2e file | 7 cases | 11 cases, all passing |
+| parser selftest: cap tripped with the newline already buffered (R1) | shape unreachable through a pipe in this test | 8 checks pass in-process, same pass parses the frame behind the line |
+| overflow episodes ×2 (R2) | no drain summary at all, so the host cannot tell how much it lost | episode 1 reports `dropped so far`, drain reports the total, episode 2 reports a **larger** cumulative number, `queuedBytes <= 8_388_608`, payload carries `oversizedInbound`/`malformedInbound` |
+| full e2e file | 7 cases | 13 cases, all passing |
+
+The "before" column for the R1/R2 rows is measured, not assumed: this exact test
+file was run against a binary built from `58b2a5e` in a separate worktree
+(`/tmp/t113-base-build/dsh-qt-app`, same CMake flags) and reported
+`tests 13 / pass 10 / fail 3` (`/tmp/t113-before13.log`). The three failures are
+exactly the cases this round adds or fixes:
+
+| Pre-fix failure | Message |
+| --- | --- |
+| `two overflow episodes are reported separately and the totals accumulate` | `the drained queue never produced a summary warn` — the pre-fix build has no drain summary, so the host can never learn the cumulative loss |
+| `an oversized line is dropped through its newline without losing the frame behind it` | `a valid frame behind an oversized line in the same write was never answered` (t103 R1) |
+| `the parser selftest covers the cap-tripped-with-newline-buffered shape deterministically` | the pre-fix binary has no `DSH_QT_INBOUND_RESYNC_SELFTEST` entry, so the selftest run does not produce its report |
+
+The review note that produced this round described the pre-fix outcome as "4 of 5
+failing, 1 of 5 passing". That framing did not reproduce: the failures are whole
+tests (not sub-checks of five), and the other ten cases pass on the same binary.
+The measured numbers above are what this record stands on.
 
 Commands (Linux, this machine):
 
@@ -374,3 +402,16 @@ git diff --check
   point and asserts `pass 11`, `fail 0`, no skips.
 * `QT_QPA_PLATFORM=offscreen` exposes a top-level window here, but that is not a
   visible first window on a user's desktop.
+* **The intermittent file-level abort is still unexplained.** Symptom: node:test
+  cancels the whole file with `'Promise resolution is still pending but the event
+  loop has already resolved'` while individual cases are still running — it is
+  not an assertion failure, and re-running the same command turns green. Last
+  observed 2026-11-26 ~01:0x +08:00 on this machine under shared load (other
+  agents building at the same time), 3 of 10 runs, logs `/tmp/t95-e2e*.log` and
+  `/tmp/t108-*.log`. Two real leaks were fixed along the way (`waitExit()` used
+  to leave a timer behind; the bounded-exit case used `host.invoke` where the
+  host's own bookkeeping could stay pending, now it writes raw NDJSON frames),
+  and the current round ran the full file three times on the fixed SHA with
+  `0 cancelled / 0 fail` each time — but that is evidence of absence over three
+  runs, **not** proof that the root cause is gone. Treat a future abort as this
+  known symptom, not as a regression in the transport.

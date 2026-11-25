@@ -1152,54 +1152,165 @@ private:
      * stall t103 R1 found. The loop therefore keeps cutting until the buffer is
      * inside the cap or inside a discarded line, then parses what is left.
      */
-    void parseInbound_()
+    /**
+     * Splits complete lines out of `buffer`, dropping an oversized line through
+     * its newline.
+     *
+     * Pure on purpose: no I/O, no signals, no members. The pipe decides how the
+     * bytes arrive, so the shape "the cap trips while the newline is already in
+     * the buffer" cannot be produced reliably from a test that writes to a pipe
+     * (the kernel hands over 64 KB at a time). The selftest drives this function
+     * with that shape instead, which makes the case deterministic.
+     */
+    static QList<QByteArray> takeLines_(QByteArray *buffer, int cap, bool *discarding,
+                                        int *oversized)
     {
-        if (inbound_.isEmpty())
-            return;
+        QList<QByteArray> lines;
         for (;;) {
-            if (discardingLine_) {
+            if (*discarding) {
                 // The rest of an oversized line: throw bytes away until its
                 // newline, then resume normal parsing with whatever follows it.
-                const int newline = inbound_.indexOf('\n');
+                const int newline = buffer->indexOf('\n');
                 if (newline < 0) {
-                    inbound_.clear();
-                    return;
+                    buffer->clear();
+                    return lines;
                 }
-                inbound_.remove(0, newline + 1);
-                discardingLine_ = false;
+                buffer->remove(0, newline + 1);
+                *discarding = false;
             }
-            if (inbound_.size() <= kMaxInboundBytes)
+            if (buffer->size() <= cap)
                 break;
             // A frame longer than the cap cannot be reassembled, so drop through
             // to the next newline and keep going with what follows it. Parsing
             // the tail as a fresh frame is what used to turn one hostile length
             // into a stream of malformed frames.
-            const int newline = inbound_.indexOf('\n');
-            ++oversizedInbound_;
+            const int newline = buffer->indexOf('\n');
+            if (oversized != nullptr)
+                ++(*oversized);
             if (newline < 0) {
-                inbound_.clear();
-                discardingLine_ = true;
-                reportOversizedInbound_();
-                return;
+                buffer->clear();
+                *discarding = true;
+                return lines;
             }
-            inbound_.remove(0, newline + 1);
-            reportOversizedInbound_();
+            buffer->remove(0, newline + 1);
+            // Deliberately no return: the frames behind the dropped line are
+            // already buffered and belong to this same pass (t103 R1).
         }
         int start = 0;
-        bool parsedAny = false;
         for (;;) {
-            const int newline = inbound_.indexOf('\n', start);
+            const int newline = buffer->indexOf('\n', start);
             if (newline < 0)
                 break;
-            const QByteArray line = inbound_.mid(start, newline - start).trimmed();
+            const QByteArray line = buffer->mid(start, newline - start).trimmed();
             start = newline + 1;
-            if (!line.isEmpty()) {
-                parsedAny = true;
-                handleLine_(line);
-            }
+            if (!line.isEmpty())
+                lines.append(line);
         }
         if (start > 0)
-            inbound_.remove(0, start);
+            buffer->remove(0, start);
+        return lines;
+    }
+
+public:
+    /**
+     * Replays the inbound resynchronisation table.
+     *
+     * `DSH_QT_INBOUND_RESYNC_SELFTEST=1` runs it before any Qt object exists.
+     * A pipe hands over at most one buffer per read, so "the cap trips while the
+     * newline is already buffered" cannot be produced reliably from a writer
+     * test; this table drives takeLines_() with that exact shape instead.
+     */
+    static int runInboundResyncSelftest_()
+    {
+        int failures = 0;
+        const auto check = [&failures](bool ok, const char *what) {
+            std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
+            if (!ok)
+                ++failures;
+        };
+        const int cap = kMaxInboundBytes;
+        const QByteArray first = QByteArrayLiteral("{\"id\":\"behind-1\"}");
+        const QByteArray second = QByteArrayLiteral("{\"id\":\"behind-2\"}");
+
+        {
+            // The shape a pipe only produces by luck: filler, its newline and a
+            // whole frame in one buffer when the cap trips.
+            QByteArray buffer(cap + 8192, 'x');
+            buffer.append('\n');
+            buffer.append(first);
+            buffer.append('\n');
+            bool discarding = false;
+            int oversized = 0;
+            const QList<QByteArray> lines = takeLines_(&buffer, cap, &discarding, &oversized);
+            check(lines.size() == 1 && lines.first() == first,
+                  "cap trips with the newline buffered: the frame behind it is parsed in the same pass");
+            check(!discarding && buffer.isEmpty(),
+                  "cap trips with the newline buffered: the buffer is empty afterwards");
+            check(oversized == 1, "cap trips with the newline buffered: the oversized line counts once");
+        }
+        {
+            // Same drop, but the newline has not arrived yet.
+            QByteArray buffer(cap + 4096, 'y');
+            bool discarding = false;
+            int oversized = 0;
+            QList<QByteArray> lines = takeLines_(&buffer, cap, &discarding, &oversized);
+            check(lines.isEmpty() && discarding && buffer.isEmpty(),
+                  "cap trips mid-line: the bytes are dropped and the line is marked as discarded");
+            buffer.append('\n');
+            buffer.append(first);
+            buffer.append('\n');
+            lines = takeLines_(&buffer, cap, &discarding, &oversized);
+            check(lines.size() == 1 && lines.first() == first && !discarding,
+                  "the late newline ends the discarded line and the next frame parses");
+        }
+        {
+            // Two frames behind one dropped line: both belong to the same pass.
+            QByteArray buffer(cap + 1, 'z');
+            buffer.append('\n');
+            buffer.append(first);
+            buffer.append('\n');
+            buffer.append(second);
+            buffer.append('\n');
+            bool discarding = false;
+            int oversized = 0;
+            const QList<QByteArray> lines = takeLines_(&buffer, cap, &discarding, &oversized);
+            check(lines.size() == 2 && lines.at(0) == first && lines.at(1) == second,
+                  "both frames behind a dropped line are parsed in the same pass");
+        }
+        {
+            // A line that simply arrives in two reads is not a drop.
+            QByteArray buffer = first.left(5);
+            bool discarding = false;
+            int oversized = 0;
+            QList<QByteArray> lines = takeLines_(&buffer, cap, &discarding, &oversized);
+            check(lines.isEmpty() && buffer.size() == 5,
+                  "an incomplete line stays buffered instead of being dropped");
+            buffer.append(first.mid(5));
+            buffer.append('\n');
+            lines = takeLines_(&buffer, cap, &discarding, &oversized);
+            check(lines.size() == 1 && lines.first() == first && oversized == 0,
+                  "the completed line parses and is not counted as oversized");
+        }
+        std::printf("inbound-resync selftest: %s\n", failures == 0 ? "pass" : "FAIL");
+        std::fflush(stdout);
+        return failures == 0 ? 0 : 1;
+    }
+
+private:
+    void parseInbound_()
+    {
+        if (inbound_.isEmpty())
+            return;
+        const int before = oversizedInbound_;
+        const QList<QByteArray> lines =
+            takeLines_(&inbound_, kMaxInboundBytes, &discardingLine_, &oversizedInbound_);
+        if (oversizedInbound_ != before)
+            reportOversizedInbound_();
+        bool parsedAny = false;
+        for (const QByteArray &line : lines) {
+            parsedAny = true;
+            handleLine_(line);
+        }
         if (parsedAny && !discardingLine_ && inbound_.isEmpty()) {
             // The burst is fully consumed and parsing is healthy again, so the
             // next hostile line reports on its own instead of staying silent for
@@ -2273,6 +2384,8 @@ int main(int argc, char *argv[])
     // Test hook for the outbound accounting; nothing else sets this.
     if (qEnvironmentVariableIsSet("DSH_QT_OUTBOUND_QUEUE_SELFTEST"))
         return runOutboundQueueSelftest();
+    if (qEnvironmentVariableIsSet("DSH_QT_INBOUND_RESYNC_SELFTEST"))
+        return StdioTransport::runInboundResyncSelftest_();
 #if defined(DSH_QT_HAS_WEBENGINE) && DSH_QT_HAS_WEBENGINE
     // Must run before QGuiApplication is constructed (Qt WebEngine contract).
     QtWebEngineQuick::initialize();

@@ -525,6 +525,119 @@ test(
 )
 
 test(
+  'two overflow episodes are reported separately and the totals accumulate',
+  { skip: skipReason, timeout: 180_000 },
+  async () => {
+    // t103 R2: one warn per episode is only useful if the numbers reconcile.
+    // Episode one must report a drop, then a drain summary with the running
+    // total; episode two must report a *larger* cumulative total, and every
+    // report must stay inside the 8 MB cap and carry the inbound counters.
+    const session = launch({ polled: true, testHooks: true, label: 'overflow-episodes' })
+    interface Warn {
+      reason: string
+      droppedFrames: number
+      queuedBytes: number
+      oversizedInbound: unknown
+      malformedInbound: unknown
+    }
+    const warns: Warn[] = []
+    session.host.onEvent((event) => {
+      if (event.name !== 'transport.warn')
+        return
+      const payload = (event.payload ?? {}) as Record<string, unknown>
+      warns.push({
+        reason: String(payload.reason ?? ''),
+        droppedFrames: Number(payload.droppedFrames ?? 0),
+        queuedBytes: Number(payload.queuedBytes ?? 0),
+        oversizedInbound: payload.oversizedInbound,
+        malformedInbound: payload.malformedInbound,
+      })
+    })
+    const isOverflow = (warn: Warn): boolean => /outbound queue overflow|full of frames/.test(warn.reason)
+    const waitFor = async (predicate: () => boolean, ms: number): Promise<void> => {
+      const deadline = Date.now() + ms
+      while (!predicate() && Date.now() < deadline)
+        await delay(50)
+    }
+    const flood = (): Promise<unknown>[] =>
+      Array.from({ length: 10 }, () =>
+        session.host.invoke('host.echo', { bytes: 1_000_000 }).then(
+          () => undefined,
+          () => undefined,
+        ),
+      )
+    try {
+      await session.waitConnected()
+
+      // Episode one: pause the reader, queue ten 1 MB replies, then drain.
+      session.child.stdout.pause()
+      const episode1 = flood()
+      await delay(4_000)
+      session.child.stdout.resume()
+      await Promise.all(episode1)
+      await waitFor(() => warns.some(isOverflow), 20_000)
+      const overflow1 = warns.find(isOverflow)
+      assert.ok(overflow1 !== undefined, 'the first overflow produced no transport.warn')
+      assert.ok(overflow1!.droppedFrames > 0, `the first overflow reported no drop: ${JSON.stringify(overflow1)}`)
+      assert.ok(
+        overflow1!.queuedBytes <= 8_388_608,
+        `a warn reported more queued bytes than the cap: ${overflow1!.queuedBytes}`,
+      )
+
+      await waitFor(() => warns.some((warn) => /drained/.test(warn.reason)), 20_000)
+      const drain = warns.find((warn) => /drained/.test(warn.reason))
+      assert.ok(drain !== undefined, 'the drained queue never produced a summary warn')
+      assert.match(
+        drain!.reason,
+        /drained; \d+ frame\(s\) were dropped in total/,
+        `the drain summary does not report a cumulative total: ${drain!.reason}`,
+      )
+      const totalAfterFirst = drain!.droppedFrames
+      assert.ok(
+        totalAfterFirst >= overflow1!.droppedFrames,
+        `the drain summary (${totalAfterFirst}) is smaller than the first report (${overflow1!.droppedFrames})`,
+      )
+      assert.ok(drain!.queuedBytes <= 8_388_608, 'the drain summary reports more bytes than the cap')
+
+      // Episode two: the latch was re-armed by the drain, so this must report
+      // again, with a larger running total.
+      session.child.stdout.pause()
+      const episode2 = flood()
+      await delay(4_000)
+      session.child.stdout.resume()
+      await Promise.all(episode2)
+      await waitFor(() => warns.filter(isOverflow).length >= 2, 20_000)
+      const overflow2 = warns.filter(isOverflow)[1]
+      assert.ok(overflow2 !== undefined, 'the second overflow produced no transport.warn')
+      assert.ok(
+        overflow2!.droppedFrames > totalAfterFirst,
+        `the second episode did not report a larger cumulative total ` +
+          `(${overflow2!.droppedFrames} <= ${totalAfterFirst})`,
+      )
+      assert.ok(
+        overflow2!.queuedBytes <= 8_388_608,
+        `the second warn reports more bytes than the cap: ${overflow2!.queuedBytes}`,
+      )
+      assert.equal(
+        typeof overflow2!.oversizedInbound,
+        'number',
+        'the warn payload does not carry the oversized-inbound counter',
+      )
+      assert.equal(
+        typeof overflow2!.malformedInbound,
+        'number',
+        'the warn payload does not carry the malformed-inbound counter',
+      )
+      assert.equal(session.child.exitCode, null, 'the second overflow killed the session')
+      const ping = (await settleWithin(session.host.invoke('host.ping'), 5_000)) as { state: unknown }
+      assert.equal(ping.state, 'connected', 'the session did not survive two overflow episodes')
+    } finally {
+      await session.stop()
+    }
+  },
+)
+
+test(
   'an oversized inbound frame is dropped and the next frame still parses',
   { skip: skipReason, timeout: 120_000 },
   async () => {
@@ -587,7 +700,13 @@ test(
       const first = (await settleWithin(session.host.invoke('host.ping'), 3_000)) as {
         state: unknown
         pending: unknown
-      }
+      } | null
+      // A missing answer must read as "the frame behind the oversized line was
+      // never parsed", not as a TypeError on a null field.
+      assert.ok(
+        first !== null,
+        'a valid frame behind an oversized line in the same write was never answered',
+      )
       // `pending` is the Qt side's own outstanding-request count, not a verdict
       // on this frame: the assertion is that the ping was answered at all while
       // the session is still connected.
@@ -606,7 +725,11 @@ test(
       const second = (await settleWithin(session.host.invoke('host.ping'), 3_000)) as {
         state: unknown
         pending: unknown
-      }
+      } | null
+      assert.ok(
+        second !== null,
+        'a frame after a late newline was never answered',
+      )
       assert.equal(second.state, 'connected', 'a frame after a late newline was never answered')
       assert.equal(typeof second.pending, 'number', 'host.ping did not answer with a payload')
       assert.equal(session.child.exitCode, null, 'the session died on an oversized line')
@@ -652,5 +775,29 @@ test(
       child.kill()
       rmSync(input, { force: true })
     }
+  },
+)
+
+test(
+  'the parser selftest covers the cap-tripped-with-newline-buffered shape deterministically',
+  { skip: skipReason, timeout: 60_000 },
+  () => {
+    // A pipe delivers at most 64 KB per read, so the e2e case above cannot
+    // guarantee that the newline is already in the buffer on the very pass that
+    // trips the 4 MB cap — it depends on how the kernel coalesces the writes.
+    // This drives the same parser directly (no I/O, no timers) so the shape is
+    // covered on every run instead of only when the timing happens to line up.
+    const result = spawnSync(binary, [], {
+      env: { ...process.env, DSH_QT_INBOUND_RESYNC_SELFTEST: '1' },
+      encoding: 'utf8',
+      timeout: 30_000,
+    })
+    assert.equal(result.status, 0, `the parser selftest exited ${result.status}: ${result.stderr}`)
+    assert.doesNotMatch(result.stdout, /^not ok/m, 'a parser selftest check failed')
+    assert.match(result.stdout, /inbound-resync selftest: pass/)
+    assert.match(
+      result.stdout,
+      /cap trips with the newline buffered: the frame behind it is parsed in the same pass/,
+    )
   },
 )
