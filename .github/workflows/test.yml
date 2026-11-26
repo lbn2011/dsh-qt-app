@@ -609,18 +609,33 @@ jobs:
           #   - `tr -d '\r'`: a log written or carried through Windows keeps a
           #     CRLF tail, which leaves `$3` as `17\r`; no numeric test accepts
           #     that, so a legitimate green run was rejected.
-          #   - `^# \# ` -> `^# `: when its output is a pipe — here it goes
-          #     through `tee` — Node's TAP reporter escapes the leading `#` of a
+          #   - `# \# ` -> `# `: when its output is a pipe — here it goes through
+          #     `tee` — Node's TAP reporter escapes the leading `#` of a
           #     diagnostic line, so the suite's own `# stages ...` and
           #     `# park: ...` arrive as `# \# stages ...`. That is the same
           #     line, and matching only the unescaped form rejected a real 17/17
           #     run on Node 22.19, the version actions/setup-node installs.
           #
+          # One backslash, never two: this step is shell inside YAML, but the
+          # same text is also handed to a shell as one command-line argument
+          # (that is what the gate's own test file does). On Windows the
+          # argument goes through an MSYS command line, which collapses `\\`
+          # into `\`, so a `sed 's/^# \\# /# /'` arrives as a pattern matching a
+          # literal `# # ` and never fires — a real TAP log was then rejected on
+          # the Windows runner while every synthetic log still passed. The escape
+          # is therefore built from the character code instead of written out.
+          #
           # The test step is deliberately not pinned to `--test-reporter=spec`:
           # accepting either dialect here keeps the gate independent of it.
           normalized=$(mktemp)
           trap 'rm -f "$normalized"' EXIT
-          tr -d '\r' < "$log" | sed 's/^# \\# /# /' > "$normalized"
+          tr -d '\r' < "$log" | awk '
+            BEGIN { backslash = sprintf("%c", 92); escaped = "# " backslash "# " }
+            {
+              if (substr($0, 1, length(escaped)) == escaped) print "# " substr($0, length(escaped) + 1)
+              else print $0
+            }
+          ' > "$normalized"
 
           # Node's test reporter prints exactly one summary block, each count on
           # its own line as `ℹ <field> <number>`. Unanchored greps cannot read it

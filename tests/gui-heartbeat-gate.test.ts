@@ -99,11 +99,38 @@ function heartbeatLog(counts: Counts, options: { stages?: boolean; park?: boolea
   return `${lines.join('\n')}\n`
 }
 
-/** Run the gate step exactly as CI runs it, inside a throwaway directory. */
-function runGate(log: string | null): { status: number; stdout: string; stderr: string } {
+/**
+ * Reproduce what a Windows command line does to one argument.
+ *
+ * The workflow's `shell: bash` writes the step to a temporary file and runs it,
+ * so on a runner this never matters. Here the same script travels as a single
+ * argv entry instead, and on Windows that entry passes through an MSYS command
+ * line, which collapses a doubled backslash into one. The gate must hold whether
+ * or not that happens, because it cannot tell which path delivered it.
+ */
+function collapseDoubledBackslashes(script: string): string {
+  return script.split('\\\\').join('\\')
+}
+
+/**
+ * Run the gate step as CI runs it, inside a throwaway directory.
+ *
+ * The script goes to a file and bash is pointed at it — that is what the runner
+ * does with a `run:` block. Passing it as `bash -c <script>` instead put the
+ * whole step through one argv entry, where a Windows command line rewrites
+ * backslashes and the TAP-escape pattern silently stopped matching.
+ */
+function runGate(
+  log: string | null,
+  options: { collapseBackslashes?: boolean } = {},
+): { status: number; stdout: string; stderr: string } {
   const dir = mkdtempSync(join(tmpdir(), 't130-gate-'))
   if (log !== null) writeFileSync(join(dir, 'gui-heartbeat.log'), log)
-  const result = spawnSync('bash', ['-c', stepScript('Assert the regression really ran')], {
+  let script = stepScript('Assert the regression really ran')
+  if (options.collapseBackslashes === true) script = collapseDoubledBackslashes(script)
+  const scriptPath = join(dir, 'gate.sh')
+  writeFileSync(scriptPath, script)
+  const result = spawnSync('bash', [scriptPath], {
     cwd: dir,
     encoding: 'utf8',
     env: { ...process.env, GITHUB_STEP_SUMMARY: join(dir, 'summary.md') },
@@ -315,7 +342,43 @@ test('the gate normalises line endings and the TAP escape before matching', () =
   // escape both the sed delimiters and the TAP escape's own backslash.
   assert.ok(script.includes("tr -d '\\r'"), 'the gate no longer strips CR from each line')
   assert.ok(
-    script.includes("sed 's/^# \\\\# /# /'"),
+    script.includes('backslash = sprintf("%c", 92)'),
     'the gate no longer unescapes the TAP diagnostic prefix',
   )
+})
+
+// The escape is built from the character code, not written out, because the
+// same script text is also handed to a shell as a single command-line argument.
+// On Windows that argument goes through an MSYS command line, which collapses
+// `\\` into `\`: a written-out `sed 's/^# \\# /# /'` then matches a literal
+// `# # ` and the TAP log is rejected. A doubled backslash in this step is
+// therefore a defect on its own, whatever it currently means to sed.
+test('the gate step carries no doubled backslash outside its comments', () => {
+  const script = stepScript('Assert the regression really ran')
+  const offender = script
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('#'))
+    .find((line) => line.includes('\\\\'))
+  assert.equal(offender, undefined, `this line loses a backslash on a Windows command line: ${offender ?? ''}`)
+})
+
+// The Windows runner failure in full: a real TAP log, a gate whose backslashes
+// went through a command line. Every other gate case passed there, which is why
+// this one has to be checked with the collapse applied.
+test('real TAP output is accepted even when a command line collapses backslashes', () => {
+  const log = realTapLog()
+  assert.ok(log.includes('# \\# stages '), 'this Node did not escape the diagnostic line')
+  const run = runGate(log, { collapseBackslashes: true })
+  assert.equal(run.status, 0, `a real TAP run was rejected after the argv round trip: ${run.status}\n${run.stdout}${run.stderr}`)
+})
+
+test('a collapsed gate still rejects real TAP output without the start-up stages', () => {
+  const run = runGate(realTapLog({ stages: false }), { collapseBackslashes: true })
+  assert.notEqual(run.status, 0, 'TAP output without "# stages " was accepted after the argv round trip')
+})
+
+test('a collapsed gate still rejects real TAP output with a cancelled case', () => {
+  const log = realTapLog().replace('# tests 17', '# tests 18').replace('# cancelled 0', '# cancelled 1')
+  const run = runGate(log, { collapseBackslashes: true })
+  assert.notEqual(run.status, 0, 'TAP output with a cancelled case was accepted after the argv round trip')
 })

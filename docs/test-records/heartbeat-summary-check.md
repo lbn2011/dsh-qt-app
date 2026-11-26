@@ -268,3 +268,118 @@ attempt 4 重跑结果（本机 Node v22.19.0，日志写入复核日志目录�
 可推送候选分支从**已发布的 `094d520`** 起，按顺序重放 `42591fb`、`89d87dc`、`493121e` 与代码提交 `3ef4d1c`（重放后 SHA 会变：`1a7ad53`、`b00fe34`、`f08b796`，代码提交对应 `caa8588`，内容与被审版本逐字节相同），再以最终版记录作为一次提交。其最终树与被审版本 `0a3fec5` 的差异**只限本文件**（`git diff --stat 0a3fec5 <候选分支头>` 只列本文件，`git diff 0a3fec5 <候选分支头> -- .github tests` 为空）。这样公开历史的祖先链里不会出现带私有路径的记录提交。
 
 路径口径：本文档不记录隔离工作树、私有复核材料与内部构建缓存的位置，统一用「本机 Node 22.19」「隔离工作树 artifact 目录」「复核日志目录」等中性描述，日志里的临时心跳路径以 `<heartbeat path>` 占位。
+
+## 9. Windows 托管 runner 上的门禁自测失败（第四轮）
+
+### 9.1 现象与原始证据
+
+托管 Windows runner（`windows-2022`，Node `v22.19.0`）的单元测试作业里，全量 **546** 个用例只有一条失败：
+
+```
+not ok 56 - real TAP output from this Node is accepted
+  error: a real TAP run was rejected: 1
+  ##[error]gui-heartbeat.log carries no measured start-up stages
+1..544
+# tests 546 / # suites 1 / # pass 539 / # fail 1 / # cancelled 0 / # skipped 6
+```
+
+计数自洽：`539 + 1 + 0 + 6 = 546`，`skipped 6` 是该作业既有的平台跳过，与门禁无关。
+
+**关键对照**：同一次运行里，凡是用合成日志的门禁用例全部通过——
+
+| 用例 | Windows 结果 |
+| --- | --- |
+| `a real seventeen-case run is accepted`（合成绿色日志） | ok 41 |
+| `a 170-case run is rejected` | ok 42 |
+| `a run with a cancelled case is rejected` | ok 43 |
+| `a log without the measured start-up stages is rejected`（合成） | ok 53 |
+| `a CRLF log is accepted` | ok 60 |
+| `a CRLF log with a cancelled case is still rejected` | ok 61 |
+| `real TAP output without the start-up stages is still rejected` | ok 57 |
+| `real TAP output with a cancelled case is still rejected` | ok 59 |
+| **`real TAP output from this Node is accepted`** | **not ok 56** |
+
+这条分布本身就是诊断：摘要解析、CRLF 剥离、缺证据拒绝、cancelled 拒绝在 Windows 上全部正常，**唯独需要「把 `# \# ` 还原成 `# `」的那一条失败**。
+
+### 9.2 被否证的假设：YAML 经 Windows checkout 变成 CRLF
+
+第一个怀疑对象是 `.github/workflows/test.yml` 经 Windows checkout 后的换行。实测否证：
+
+- 仓库里的 workflow 是纯 LF（CR 计数 0），且没有 `.gitattributes`、没有 `core.autocrlf` 设置。
+- 人为把整份 YAML 转成 CRLF 再按同样规则抽取 run 脚本，抽出来的脚本每一行都带 `\r`，第一行立刻 `bash: line 1: set: pipefail: invalid option name`，**所有**门禁用例一起失败——与「546 里只挂 56」的分布不符，故排除。
+
+同时确认 `tr -d '\r'` 在 Windows 上有效（CRLF 用例 ok 60 通过），所以 CRLF 不是本次的失败点。
+
+### 9.3 根因：脚本作为单个命令行参数时，`\\` 被折叠成 `\`
+
+门禁的归一化原本写作：
+
+```sh
+tr -d '\r' < "$log" | sed 's/^# \\# /# /' > "$normalized"
+```
+
+`sed` 的正则里必须写 `\\` 才表示一个反斜杠。但**同一段脚本文本还有第二条到达 shell 的路径**：测试文件把它整段取出来，作为一个 argv 元素交给 `bash -c`。在 Windows 上，这个 argv 元素要经过 MSYS 命令行解析，**双反斜杠会被折叠成单反斜杠**。于是 `sed` 实际收到 `'s/^# \# /# /'`，正则退化为匹配字面 `# # `，一条 TAP 转义行都匹配不上。
+
+这解释了分布：合成日志用未转义拼写，不经过这一步也照样匹配；真实 TAP 日志必须去转义，于是只有它被拒。也解释了为什么 Ubuntu 上一直是绿的——POSIX 路径不做这次折叠。
+
+**Actions 自身不受影响**：`shell: bash` 是把 `run:` 块写进临时文件再执行，不经过单参数传递。所以生产门禁没有失效，失效的是「用 `bash -c <整段脚本>` 复现门禁」这个测试装置——而它恰恰是本文件存在的意义，它必须和真实路径一致。
+
+### 9.4 修法
+
+两处，各修一层：
+
+1. **门禁不再写出双反斜杠**：归一化改用 `awk`，反斜杠由字符码构造，源码里不出现 `\\`：
+
+```sh
+tr -d '\r' < "$log" | awk '
+  BEGIN { backslash = sprintf("%c", 92); escaped = "# " backslash "# " }
+  {
+    if (substr($0, 1, length(escaped)) == escaped) print "# " substr($0, length(escaped) + 1)
+    else print $0
+  }
+' > "$normalized"
+```
+
+这样无论脚本以文件还是以单个参数到达 shell，语义都不变——门禁不再依赖「两个反斜杠在运输中活下来」。
+
+2. **测试装置按真实方式执行**：`runGate()` 把脚本写进临时文件，再 `bash <script>`，与 runner 对 `run:` 块的做法一致。原来的 `bash -c <script>` 是自造的第二条传输路径，它把 Windows 的参数解析规则带进了被测对象。
+
+保留并新增负控：`runGate(log, { collapseBackslashes: true })` 显式模拟折叠，断言修后的门禁在折叠下仍接受真实 TAP、仍拒绝缺 stages 与 cancelled。另加一条静态检查：门禁脚本的非注释行不得出现 `\\`。
+
+### 9.5 红绿
+
+全部经共享验证锁 + `CPUQuota=200%` / `MemoryMax=4G` 串行，Node `v22.19.0`，同一份真实 TAP 日志：
+
+| 门禁版本 | 折叠前 | 折叠后 |
+| --- | --- | --- |
+| 旧（`2c78b8c`，`sed 's/^# \\# /# /'`） | exit 0 | **exit 1**，`::error::gui-heartbeat.log carries no measured start-up stages` |
+| 新（`awk` + 字符码构造） | exit 0 | exit 0 |
+
+修后「折叠后 exit 1」的错误文本与 Windows 日志里 case 56 的报错**逐字相同**，基线红因此是这条失败的可复现替身，而不是相近现象的猜测。
+
+### 9.6 自测与验证命令
+
+`tests/gui-heartbeat-gate.test.ts` 由 23 例增至 **27** 例，新增四例：
+
+| 用例 | 断言 |
+| --- | --- |
+| `the gate step carries no doubled backslash outside its comments` | 非注释行不含 `\\` |
+| `real TAP output is accepted even when a command line collapses backslashes` | 折叠后真实 TAP 仍 exit 0 |
+| `a collapsed gate still rejects real TAP output without the start-up stages` | 折叠后缺 stages 仍被拒 |
+| `a collapsed gate still rejects real TAP output with a cancelled case` | 折叠后 cancelled 仍被拒 |
+
+验证结果：
+
+```text
+pnpm exec tsx --test tests/gui-heartbeat-gate.test.ts   → exit 0，tests 27 / pass 27 / fail 0 / cancelled 0 / skipped 0
+git diff --check                                        → exit 0
+```
+
+原先 23 例的覆盖面未动：真实 Node 22 TAP 输入、严格五字段唯一、`pass+fail+cancelled+skipped == tests` 自洽、缺证据拒绝、合成与 CRLF 正反例全部保留。
+
+### 9.7 未验证边界
+
+- **未在托管 Windows runner 上复跑**：本次结论的证据是「Windows 日志的失败分布 + Ubuntu 上复现出的逐字相同错误文本」，等价的强证据是下一次 Windows 作业转绿；本次未触发远程运行。
+- **折叠本身是模拟**：`collapseDoubledBackslashes()` 精确复刻「`\\` → `\`」，但没有经过真实的 MSYS 命令行。若 Windows 侧对反斜杠还有别的改写（例如引号内的其它转义），本次未覆盖；修法选择「源码里不写 `\\`」正是为了不依赖对那套细节的判断。
+- **`awk` 的字符码构造**：`sprintf("%c", 92)` 依赖 awk 把 92 当字节/码点处理，在 gawk、mawk、BWK awk 与 Windows Git Bash 自带的 awk 上语义一致，但**只在 Linux 的 gawk 上实测过**；Windows 侧的实际 awk 未运行。
+- **其余平台跳过项**：该作业 `skipped 6` 是既有平台跳过，本轮未改变其数量，也未逐一核对每一项。
