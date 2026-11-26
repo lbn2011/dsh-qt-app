@@ -534,33 +534,46 @@ jobs:
       - name: Build TypeScript
         run: pnpm build
 
+      # -DCMAKE_BUILD_TYPE only drives single-config generators (Makefiles/Ninja on
+      # Linux). MSVC is a multi-config generator: it ignores the cache variable and
+      # writes to a per-configuration directory, so the configuration has to be
+      # chosen on the build command as well.
       - name: Configure
         shell: bash
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDSH_QT_WEBENGINE=OFF
 
       - name: Build
         shell: bash
-        run: cmake --build build --parallel 2
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake --build build --config Release --parallel 2
+          else
+            cmake --build build --parallel 2
+          fi
 
-      # MSVC is a multi-config generator: the executable lands in build/Release.
-      # Resolve it once here so the test step cannot silently skip itself on a
-      # path that does not exist (the e2e skips when the binary is missing).
+      # MSVC is a multi-config generator: this run's executable is the one under
+      # build/Release. Resolve it once here so the test step cannot silently skip
+      # itself on a path that does not exist (the e2e skips when the binary is
+      # missing), and fail loudly instead of falling back to a Debug build.
       - name: Resolve the binary under test
         shell: bash
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = "Windows" ]; then
             candidate="build/Release/dsh-qt-app.exe"
-            [ -f "$candidate" ] || candidate="build/dsh-qt-app.exe"
           else
             candidate="build/dsh-qt-app"
           fi
           if [ ! -f "$candidate" ]; then
-            echo "::error::no dsh-qt-app binary was built; build/ contains:"
-            ls -R build | head -50 || true
+            echo "::error::the Release binary was not produced at $candidate; build/ contains:"
+            ls -R build | head -80 || true
             exit 1
           fi
-          echo "binary=$candidate"
+          # Echo the path so a failure and a pass both say which file was used.
+          # DSH_QT_APP_BINARY stays rooted at GITHUB_WORKSPACE: Git Bash would
+          # print a /d/a/... MSYS path that native Node on Windows cannot open.
+          echo "binary under test: $GITHUB_WORKSPACE/$candidate"
           echo "DSH_QT_APP_BINARY=$GITHUB_WORKSPACE/$candidate" >> "$GITHUB_ENV"
 
       - name: Run the GUI heartbeat regression
