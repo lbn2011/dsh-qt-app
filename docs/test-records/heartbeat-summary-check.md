@@ -385,6 +385,7 @@ git diff --check                                        → exit 0
 - **折叠本身是模拟**：`collapseDoubledBackslashes()` 精确复刻「`\\` → `\`」，但没有经过真实的 MSYS 命令行。若 Windows 侧对反斜杠还有别的改写（例如引号内的其它转义），本次未覆盖；修法选择「源码里不写 `\\`」正是为了不依赖对那套细节的判断。
 - **`awk` 的字符码构造**：`sprintf("%c", 92)` 依赖 awk 把 92 当字节/码点处理，在 gawk、mawk、BWK awk 与 Windows Git Bash 自带的 awk 上语义一致，但**只在 Linux 的 gawk 上实测过**；Windows 侧的实际 awk 未运行。
 - **其余平台跳过项**：该作业 `skipped 6` 是既有平台跳过，本轮未改变其数量，也未逐一核对每一项。
+- **生产门禁在 Windows 上的实际判定未观察**：可用证据只有 `typescript (windows-2022)` 单元测试作业的日志，`qt-gui-heartbeat` 作业的 Windows 日志不在证据集内。§9.3 的推演（Actions 写文件执行，不做单参数折叠）解释了生产门禁为何应当一直是绿的，但这是推理而非观测；下一次 Windows 心跳作业的运行才是该结论的检验。
 
 ### 9.8 提交口径
 
