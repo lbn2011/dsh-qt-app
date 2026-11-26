@@ -383,3 +383,15 @@ git diff --check                                        → exit 0
 - **折叠本身是模拟**：`collapseDoubledBackslashes()` 精确复刻「`\\` → `\`」，但没有经过真实的 MSYS 命令行。若 Windows 侧对反斜杠还有别的改写（例如引号内的其它转义），本次未覆盖；修法选择「源码里不写 `\\`」正是为了不依赖对那套细节的判断。
 - **`awk` 的字符码构造**：`sprintf("%c", 92)` 依赖 awk 把 92 当字节/码点处理，在 gawk、mawk、BWK awk 与 Windows Git Bash 自带的 awk 上语义一致，但**只在 Linux 的 gawk 上实测过**；Windows 侧的实际 awk 未运行。
 - **其余平台跳过项**：该作业 `skipped 6` 是既有平台跳过，本轮未改变其数量，也未逐一核对每一项。
+
+### 9.8 提交口径
+
+第四轮的代码改动是一个提交，SHA 为 `703db1f`（`ci(heartbeat): build the TAP escape from a character code, not a literal`），该提交本身相对基线 `2c78b8c` 改 3 个文件 +200/−7（其中本文件占 +115）：
+
+| 文件 | 改动 | 作用 |
+| --- | --- | --- |
+| `.github/workflows/test.yml` | +18/−3 | 归一化改用 awk 与字符码构造反斜杠 |
+| `tests/gui-heartbeat-gate.test.ts` | +67/−4 | 脚本改为按文件执行、反斜杠折叠负控、静态检查 |
+| `docs/test-records/heartbeat-summary-check.md` | +115/−0 | §9.1–§9.7（§9.8 随其后的仅记录提交） |
+
+本节文字随一次**仅记录**提交入库，与被审的代码提交分开。与前几轮一致，本文档不写「最后一次记录提交」的 SHA，以免写下即过期；被审版本与可推送候选的准确 SHA 由复核回执标记，回执保存在团队私有目录，不随仓库提交。生产心跳产品代码、17 例用例与其它作业均未改动。
