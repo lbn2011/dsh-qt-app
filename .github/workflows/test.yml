@@ -597,32 +597,75 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if grep -qE '^# SKIP|skipped [1-9]' gui-heartbeat.log; then
-            echo '::error::the GUI heartbeat regression skipped itself — see gui-heartbeat.log'
+          log=gui-heartbeat.log
+          if [ ! -f "$log" ]; then
+            echo '::error::gui-heartbeat.log was not produced'
             exit 1
           fi
-          if ! grep -qE 'pass 17' gui-heartbeat.log; then
-            echo '::error::expected seventeen passing cases in gui-heartbeat.log'
-            tail -60 gui-heartbeat.log
+          # Node's test reporter prints exactly one summary block, each count on
+          # its own line as `ℹ <field> <number>`. Unanchored greps cannot read it
+          # correctly: `pass 17` also matches `pass 170`, and `fail 0` says
+          # nothing about a `cancelled 1` sitting next to it, so a run that
+          # cancelled a case and a run ten times the expected size both looked
+          # green. Parse whole lines into field/value pairs instead.
+          #
+          # The decoration is not stripped by character class: `ℹ` is
+          # U+2139 INFORMATION SOURCE, a *letter* in Unicode, so in a UTF-8
+          # locale it survives `s/^[^[:alnum:]]*//` and the match fails. Split on
+          # whitespace and compare the field name instead, which behaves the same
+          # in every locale and in Git Bash on Windows.
+          fields=$(awk '
+            {
+              if (NF == 3 && $3 ~ /^[0-9]+$/ && $2 ~ /^(tests|pass|fail|cancelled|skipped)$/) print $2, $3
+              else if (NF == 2 && $2 ~ /^[0-9]+$/ && $1 ~ /^(tests|pass|fail|cancelled|skipped)$/) print $1, $2
+            }
+          ' "$log")
+
+          field_value() {
+            field=$1
+            occurrences=$(printf '%s\n' "$fields" | awk -v f="$field" '$1 == f' | wc -l | tr -d ' ')
+            if [ "$occurrences" -ne 1 ]; then
+              echo "::error::gui-heartbeat.log carries $occurrences '$field' summary lines; one run reports one summary"
+              tail -60 "$log"
+              return 1
+            fi
+            printf '%s\n' "$fields" | awk -v f="$field" '$1 == f {print $2}'
+          }
+
+          tests=$(field_value tests) || exit 1
+          pass=$(field_value pass) || exit 1
+          fail=$(field_value fail) || exit 1
+          cancelled=$(field_value cancelled) || exit 1
+          skipped=$(field_value skipped) || exit 1
+
+          # A summary whose parts do not add up to its total is not evidence.
+          accounted=$((pass + fail + cancelled + skipped))
+          if [ "$accounted" -ne "$tests" ]; then
+            echo "::error::gui-heartbeat summary contradicts itself: tests $tests, but pass $pass + fail $fail + cancelled $cancelled + skipped $skipped = $accounted"
+            tail -60 "$log"
             exit 1
           fi
-          if ! grep -qE 'fail 0' gui-heartbeat.log; then
-            echo '::error::a GUI heartbeat case failed — see gui-heartbeat.log'
-            tail -60 gui-heartbeat.log
+          if [ "$tests" -ne 17 ] || [ "$pass" -ne 17 ] || [ "$fail" -ne 0 ] || [ "$cancelled" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "::error::expected 17 passing cases and nothing else; got tests $tests, pass $pass, fail $fail, cancelled $cancelled, skipped $skipped"
+            tail -60 "$log"
+            exit 1
+          fi
+          if grep -q '# SKIP' "$log"; then
+            echo '::error::a GUI heartbeat case skipped itself — see gui-heartbeat.log'
             exit 1
           fi
           # The measured start-up legs and the parked-GUI control are printed as
           # `# stages <label>: {...}` and `# park: ...`. They are the evidence that
           # the suite separated start-up, observation channel and steady state, so
           # a run without them is not the run this job claims to have made.
-          if ! grep -qE '^# stages ' gui-heartbeat.log; then
+          if ! grep -qE '^# stages ' "$log"; then
             echo '::error::gui-heartbeat.log carries no measured start-up stages'
-            tail -60 gui-heartbeat.log
+            tail -60 "$log"
             exit 1
           fi
-          if ! grep -qE '^# park: ' gui-heartbeat.log; then
+          if ! grep -qE '^# park: ' "$log"; then
             echo '::error::gui-heartbeat.log carries no parked-GUI negative control record'
-            tail -60 gui-heartbeat.log
+            tail -60 "$log"
             exit 1
           fi
 
