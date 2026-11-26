@@ -273,7 +273,7 @@ attempt 4 重跑结果（本机 Node v22.19.0，日志写入复核日志目录�
 
 ### 9.1 现象与原始证据
 
-托管 Windows runner（`windows-2022`，Node `v22.19.0`）的单元测试作业里，全量 **546** 个用例只有一条失败：
+托管 Windows runner（`windows-2022`，Node `v22.19.0`）上，作业 `typescript (windows-2022)` —— 即跑 `pnpm test` 的**单元测试作业**，不是 `qt-gui-heartbeat` —— 全量 **546** 个用例只有一条失败：
 
 ```
 not ok 56 - real TAP output from this Node is accepted
@@ -283,7 +283,9 @@ not ok 56 - real TAP output from this Node is accepted
 # tests 546 / # suites 1 / # pass 539 / # fail 1 / # cancelled 0 / # skipped 6
 ```
 
-计数自洽：`539 + 1 + 0 + 6 = 546`，`skipped 6` 是该作业既有的平台跳过，与门禁无关。
+计数自洽：`539 + 1 + 0 + 6 = 546`，`skipped 6` 是该作业既有的平台跳过（日志里写明原因 `installed DSH host not prepared (set DSH_HOST_ROOT; the webui-real-host CI job does)`），与门禁无关。
+
+**两个作业要分开看**：失败出在**单元测试作业里的门禁自测**，不是生产门禁在 Windows 上的判定结果。同一次运行中 `qt-gui-heartbeat` 作业的日志不在本次可用的证据集里，因此「生产门禁在 Windows runner 上到底绿不绿」这一点没有被观察到，只被推演过（见 §9.3：Actions 把 `run:` 块写进文件执行，不经过单参数传递）。这个区别是本轮修法的前提：修的是测试装置与门禁的转义写法，不是生产判定逻辑，生产判定逻辑的行为没有证据表明它错过。
 
 **关键对照**：同一次运行里，凡是用合成日志的门禁用例全部通过——
 
