@@ -481,15 +481,91 @@ function launch(options: {
     return { windowMs: steady.windowMs, before, after, fresh, gap: longestGap(fresh) }
   }
 
+  /**
+   * What happened to one heartbeat channel when it was archived.
+   *
+   * `exists` alone cannot describe the unopenable case: the channel path there
+   * is a real directory, so it exists and has a size while having no readable
+   * contents. `isFile` separates the two, and `readError`/`copyError` keep the
+   * reason the copy produced no file.
+   */
+  interface ChannelArchive {
+    readonly path: string
+    readonly exists: boolean
+    readonly isFile: boolean
+    readonly size: number
+    readonly mtimeMs: number | null
+    readonly readError: string | null
+    readonly archived: boolean
+    readonly copyError: string | null
+  }
+
+  const copyChannel = (
+    source: string,
+    targetName: string,
+    read: FileRead,
+    directory: string,
+  ): ChannelArchive => {
+    const entry = {
+      path: source,
+      exists: read.exists,
+      isFile: false,
+      size: read.size,
+      mtimeMs: read.mtimeMs,
+      readError: read.readError,
+      archived: false,
+      copyError: null as string | null,
+    }
+    try {
+      entry.isFile = statSync(source).isFile()
+    } catch (error) {
+      entry.copyError = `stat failed: ${(error as Error).message}`
+      return entry
+    }
+    if (!entry.isFile) {
+      // copyFileSync on a directory throws EISDIR; that is not a reason to drop
+      // the summary, it is a fact to record next to the read error.
+      entry.copyError = 'skipped: the heartbeat path is not a regular file'
+      return entry
+    }
+    try {
+      copyFileSync(source, join(directory, targetName))
+      entry.archived = true
+    } catch (error) {
+      entry.copyError = `${(error as Error).message}`
+    }
+    return entry
+  }
+
   const archive = (): void => {
-    const directory = process.env['DSH_QT_HB_ARTIFACT_DIR']
-    if (directory === undefined || directory === '') return
+    const target = process.env['DSH_QT_HB_ARTIFACT_DIR']
+    if (target === undefined || target === '') return
+    const directory = target
     try {
       mkdirSync(directory, { recursive: true })
-      const final = sample()
-      if (final.exists) copyFileSync(beats, join(directory, `${options.label}-hb.txt`))
-      if (final.observerExists)
-        copyFileSync(observerFile, join(directory, `${options.label}-observer.txt`))
+    } catch (error) {
+      // Without the directory there is nowhere to write the summary either.
+      console.log(`# could not create the artifact directory: ${(error as Error).message}`)
+      return
+    }
+    const final = sample()
+    const heartbeat = copyChannel(beats, `${options.label}-hb.txt`, {
+      exists: final.exists,
+      size: final.size,
+      mtimeMs: final.mtimeMs,
+      readError: final.readError,
+      text: '',
+    }, directory)
+    const observerChannel = copyChannel(observerFile, `${options.label}-observer.txt`, {
+      exists: final.observerExists,
+      size: final.observerSize,
+      mtimeMs: null,
+      readError: final.observerError,
+      text: '',
+    }, directory)
+    // The summary is written whatever the copies did: a failed copy is the
+    // evidence, and losing the summary with it was the whole defect.
+    try {
       writeFileSync(
         join(directory, `${options.label}-summary.json`),
         `${JSON.stringify(
@@ -502,6 +578,8 @@ function launch(options: {
             blocks: final.blocks,
             bytesIn: final.bytesIn,
             bytesOut: final.bytesOut,
+            heartbeat,
+            observerChannel,
             stderr: stderr.join(''),
           },
           null,
@@ -509,8 +587,10 @@ function launch(options: {
         )}\n`,
       )
     } catch (error) {
-      // Archiving is evidence collection; it never fails a run.
-      console.log(`# could not archive the samples: ${(error as Error).message}`)
+      console.log(`# could not write the heartbeat summary: ${(error as Error).message}`)
+    }
+    for (const channel of [heartbeat, observerChannel]) {
+      if (channel.copyError !== null) console.log(`# archived ${channel.path} with no copy: ${channel.copyError}`)
     }
   }
 
@@ -1393,6 +1473,38 @@ test(
         'a heartbeat path problem must never end the process',
       )
       console.log(`# unopenable heartbeat path: reported on stderr, app still connected`)
+
+      // The archive is the only thing a failed CI run keeps, so the case that
+      // most needs it is the one whose channel cannot be copied. Before this
+      // assertion existed, `copyFileSync` threw EISDIR on the directory, the
+      // catch skipped the rest of archive(), and the run left no
+      // `unopenable-summary.json` at all — the failure it proves was the one
+      // piece of evidence missing from the artifact.
+      const artifactDir = process.env['DSH_QT_HB_ARTIFACT_DIR']
+      if (artifactDir !== undefined && artifactDir !== '') {
+        session.archive()
+        const summaryPath = join(artifactDir, 'unopenable-summary.json')
+        assert.ok(existsSync(summaryPath), `the unopenable run wrote no summary at ${summaryPath}`)
+        const summary = JSON.parse(readFileSync(summaryPath, 'utf8')) as {
+          heartbeat?: { exists?: boolean; isFile?: boolean; readError?: string | null; archived?: boolean; copyError?: string | null }
+        }
+        const heartbeat = summary.heartbeat
+        assert.ok(heartbeat !== undefined, `the unopenable summary carries no heartbeat record: ${JSON.stringify(summary)}`)
+        assert.equal(heartbeat.exists, true, 'a directory heartbeat path exists; the summary should say so')
+        assert.equal(heartbeat.isFile, false, 'the summary mistook a directory for a readable heartbeat file')
+        assert.equal(heartbeat.archived, false, 'a directory was reported as archived')
+        assert.match(
+          String(heartbeat.copyError),
+          /not a regular file/,
+          `the summary did not explain the missing copy: ${JSON.stringify(heartbeat)}`,
+        )
+        assert.equal(
+          existsSync(join(artifactDir, 'unopenable-hb.txt')),
+          false,
+          'a directory was copied as if it were a heartbeat file',
+        )
+        console.log(`# unopenable summary: exists=true isFile=false archived=false, copyError recorded`)
+      }
     } finally {
       await session.stop()
       rmSync(blocker, { recursive: true, force: true })

@@ -79,13 +79,17 @@ type Counts = {
 }
 
 /** A log shaped like the node test reporter's real output. */
-function heartbeatLog(counts: Counts, options: { stages?: boolean; park?: boolean; skipMarkers?: boolean } = {}): string {
+function heartbeatLog(counts: Counts, options: { stages?: boolean; park?: boolean; skipMarkers?: boolean; tap?: boolean } = {}): string {
+  // The TAP reporter escapes a leading `#` on a diagnostic line when its output
+  // is not a TTY: `# stages ...` becomes `# \# stages ...`. The gate has to read
+  // both spellings, so both are produced here.
+  const escape = (line: string): string => (options.tap === true ? line.replace(/^# /, '# \\# ') : line)
   const lines: string[] = ['✔ the heartbeat keeps ticking while stdin is idle (812ms)']
   if (options.skipMarkers === true) lines.push('﹣ a case that skipped itself (1ms) # SKIP')
   if (options.stages !== false) {
-    lines.push('# stages silent: {"connectedMs":89,"firstTickMs":170,"firstWindowMs":170,"firstTickElapsedMs":78,"observerBeforeFirstTick":1}')
+    lines.push(escape('# stages silent: {"connectedMs":89,"firstTickMs":170,"firstWindowMs":170,"firstTickElapsedMs":78,"observerBeforeFirstTick":1}'))
   }
-  if (options.park !== false) lines.push('# park: 1200 ms parked, 0 GUI ticks inside the park, 24 observer ticks meanwhile')
+  if (options.park !== false) lines.push(escape('# park: 1200 ms parked, 0 GUI ticks inside the park, 24 observer ticks meanwhile'))
   lines.push('ℹ suites 0')
   for (const field of ['tests', 'pass', 'fail', 'cancelled', 'skipped'] as const) {
     const value = counts[field]
@@ -200,4 +204,118 @@ test('the test step still pipes with pipefail so a non-zero exit fails the job',
   const script = stepScript('Run the GUI heartbeat regression')
   assert.match(script, /set -o pipefail/, 'the test step lost its pipefail')
   assert.match(script, /tests\/gui-heartbeat\.e2e\.ts/, 'the test step no longer runs the heartbeat suite')
+})
+
+// ---------------------------------------------------------------------------
+// The reporter's own spelling (F1 of the t131 review).
+//
+// CI runs the suite as `... | tee gui-heartbeat.log`, so the reporter sees a
+// pipe, not a TTY, and Node 22.19's TAP reporter escapes the leading `#` of a
+// diagnostic line: the suite's `# stages ...` arrives as `# \# stages ...`. A
+// gate that matched only the unescaped form rejected a real 17/17 run on
+// exactly the Node version the workflow installs. The cases below are fed real
+// reporter output, not a hand-written imitation of it.
+// ---------------------------------------------------------------------------
+
+/**
+ * Real TAP output from this Node, for a fixture that prints the two evidence
+ * lines and registers `cases` passing tests.
+ *
+ * The output comes back through a pipe, which is what makes the reporter
+ * escape its diagnostics — stdout captured by `spawnSync` is not a TTY, the
+ * same condition `| tee` creates in CI.
+ */
+function realTapLog(options: { stages?: boolean; park?: boolean; cases?: number } = {}): string {
+  const dir = mkdtempSync(join(tmpdir(), 't132-tap-'))
+  const cases = options.cases ?? 17
+  const diagnostics = [
+    ...(options.stages === false ? [] : ['# stages silent: {"connectedMs":89,"firstTickMs":170,"firstWindowMs":170,"firstTickElapsedMs":78,"observerBeforeFirstTick":1}']),
+    ...(options.park === false ? [] : ['# park: 1200 ms parked, 0 GUI ticks inside the park, 24 observer ticks meanwhile']),
+  ]
+  const fixture = join(dir, 'fixture.test.mjs')
+  writeFileSync(
+    fixture,
+    [
+      "import test from 'node:test'",
+      'test("the heartbeat keeps ticking", () => {',
+      ...diagnostics.map((line) => `  console.log(${JSON.stringify(line)})`),
+      '})',
+      ...Array.from({ length: Math.max(0, cases - 1) }, (_, index) => `test("case ${index + 2}", () => {})`),
+      '',
+    ].join('\n'),
+  )
+  // NODE_TEST_CONTEXT is set in the child of a running test runner, and it tells
+  // the child it is a reporter child: with it inherited, stdout is swallowed and
+  // the fixture produces no TAP at all. Drop it so the fixture runs as an
+  // ordinary top-level run, which is what CI does.
+  const env = { ...process.env }
+  delete env['NODE_TEST_CONTEXT']
+  delete env['NODE_OPTIONS']
+  const result = spawnSync(process.execPath, ['--test', '--test-reporter=tap', fixture], {
+    encoding: 'utf8',
+    env,
+  })
+  assert.equal(result.status, 0, `the TAP fixture did not pass: ${result.stderr}`)
+  return result.stdout
+}
+
+test('real TAP output from this Node is accepted', () => {
+  const log = realTapLog()
+  // Guard the fixture itself: if a future Node stops escaping, this case would
+  // otherwise pass for the wrong reason.
+  assert.ok(
+    log.includes('# \\# stages '),
+    `this Node did not escape the diagnostic line, so the case proves nothing:\n${log.slice(0, 400)}`,
+  )
+  const run = runGate(log)
+  assert.equal(run.status, 0, `a real TAP run was rejected: ${run.status}\n${run.stdout}${run.stderr}`)
+})
+
+test('real TAP output without the start-up stages is still rejected', () => {
+  const run = runGate(realTapLog({ stages: false }))
+  assert.notEqual(run.status, 0, 'TAP output without "# stages " was accepted')
+})
+
+test('real TAP output without the parked control is still rejected', () => {
+  const run = runGate(realTapLog({ park: false }))
+  assert.notEqual(run.status, 0, 'TAP output without "# park: " was accepted')
+})
+
+test('real TAP output with a cancelled case is still rejected', () => {
+  // Same 17 passing cases, but one extra that got cancelled: TAP writes
+  // `# cancelled 1` and `# tests 18`, which the summary check must refuse.
+  const log = realTapLog().replace('# tests 17', '# tests 18').replace('# cancelled 0', '# cancelled 1')
+  const run = runGate(log)
+  assert.notEqual(run.status, 0, 'TAP output with a cancelled case was accepted')
+})
+
+// A log carried through Windows arrives with CRLF. The counts then end in `\r`,
+// no numeric comparison accepts them, and a legitimate green run was rejected.
+test('a CRLF log is accepted', () => {
+  const run = runGate(heartbeatLog(GREEN).replace(/\n/g, '\r\n'))
+  assert.equal(run.status, 0, `a CRLF log was rejected: ${run.status}\n${run.stdout}${run.stderr}`)
+})
+
+test('a CRLF log with a cancelled case is still rejected', () => {
+  const log = heartbeatLog({ tests: 18, pass: 17, fail: 0, cancelled: 1, skipped: 0 }).replace(/\n/g, '\r\n')
+  const run = runGate(log)
+  assert.notEqual(run.status, 0, 'a CRLF log with a cancelled case was accepted')
+})
+
+test('a CRLF log without the parked control is still rejected', () => {
+  const run = runGate(heartbeatLog(GREEN, { park: false }).replace(/\n/g, '\r\n'))
+  assert.notEqual(run.status, 0, 'a CRLF log without "# park: " was accepted')
+})
+
+// One constant per gate spelling, so a workflow edit that drops the
+// normalisation pass fails here instead of on a runner.
+test('the gate normalises line endings and the TAP escape before matching', () => {
+  const script = stepScript('Assert the regression really ran')
+  // Plain substring checks: these literals are shell, and a regex would have to
+  // escape both the sed delimiters and the TAP escape's own backslash.
+  assert.ok(script.includes("tr -d '\\r'"), 'the gate no longer strips CR from each line')
+  assert.ok(
+    script.includes("sed 's/^# \\\\# /# /'"),
+    'the gate no longer unescapes the TAP diagnostic prefix',
+  )
 })

@@ -602,6 +602,26 @@ jobs:
             echo '::error::gui-heartbeat.log was not produced'
             exit 1
           fi
+          # Read the log through one normalisation pass, so every check below has
+          # a single spelling to match instead of each guessing the reporter's
+          # dialect:
+          #
+          #   - `tr -d '\r'`: a log written or carried through Windows keeps a
+          #     CRLF tail, which leaves `$3` as `17\r`; no numeric test accepts
+          #     that, so a legitimate green run was rejected.
+          #   - `^# \# ` -> `^# `: when its output is a pipe — here it goes
+          #     through `tee` — Node's TAP reporter escapes the leading `#` of a
+          #     diagnostic line, so the suite's own `# stages ...` and
+          #     `# park: ...` arrive as `# \# stages ...`. That is the same
+          #     line, and matching only the unescaped form rejected a real 17/17
+          #     run on Node 22.19, the version actions/setup-node installs.
+          #
+          # The test step is deliberately not pinned to `--test-reporter=spec`:
+          # accepting either dialect here keeps the gate independent of it.
+          normalized=$(mktemp)
+          trap 'rm -f "$normalized"' EXIT
+          tr -d '\r' < "$log" | sed 's/^# \\# /# /' > "$normalized"
+
           # Node's test reporter prints exactly one summary block, each count on
           # its own line as `ℹ <field> <number>`. Unanchored greps cannot read it
           # correctly: `pass 17` also matches `pass 170`, and `fail 0` says
@@ -619,7 +639,7 @@ jobs:
               if (NF == 3 && $3 ~ /^[0-9]+$/ && $2 ~ /^(tests|pass|fail|cancelled|skipped)$/) print $2, $3
               else if (NF == 2 && $2 ~ /^[0-9]+$/ && $1 ~ /^(tests|pass|fail|cancelled|skipped)$/) print $1, $2
             }
-          ' "$log")
+          ' "$normalized")
 
           field_value() {
             field=$1
@@ -650,20 +670,22 @@ jobs:
             tail -60 "$log"
             exit 1
           fi
-          if grep -q '# SKIP' "$log"; then
+          if grep -q '# SKIP' "$normalized"; then
             echo '::error::a GUI heartbeat case skipped itself — see gui-heartbeat.log'
             exit 1
           fi
           # The measured start-up legs and the parked-GUI control are printed as
           # `# stages <label>: {...}` and `# park: ...`. They are the evidence that
           # the suite separated start-up, observation channel and steady state, so
-          # a run without them is not the run this job claims to have made.
-          if ! grep -qE '^# stages ' "$log"; then
+          # a run without them is not the run this job claims to have made. These
+          # read the normalised copy: under Node's TAP reporter they arrive as
+          # `# \# stages ...`, which is the same line once unescaped.
+          if ! grep -qE '^# stages ' "$normalized"; then
             echo '::error::gui-heartbeat.log carries no measured start-up stages'
             tail -60 "$log"
             exit 1
           fi
-          if ! grep -qE '^# park: ' "$log"; then
+          if ! grep -qE '^# park: ' "$normalized"; then
             echo '::error::gui-heartbeat.log carries no parked-GUI negative control record'
             tail -60 "$log"
             exit 1
