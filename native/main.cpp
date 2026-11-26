@@ -46,6 +46,7 @@
 #include <QString>
 #include <QStringList>
 #include <QStyleHints>
+#include <QThread>
 #include <QTimer>
 #include <QUuid>
 #include <QUrl>
@@ -1836,8 +1837,24 @@ private:
             return;
         }
         if (method == QLatin1String("host.ping")) {
-            sendRes_(id, true, QJsonObject{{QStringLiteral("state"), transportState()},
-                                           {QStringLiteral("pending"), pendingRequests()}});
+            QJsonObject result{{QStringLiteral("state"), transportState()},
+                               {QStringLiteral("pending"), pendingRequests()}};
+            // Test-only (DSH_QT_TEST_HOOKS): the count alone cannot distinguish
+            // "the GUI is stuck" from "this process still owes the host N
+            // answers", so the book itself travels with the answer. Production
+            // keeps the two-field reply.
+            if (testHooks_) {
+                QJsonArray details;
+                for (auto it = pending_.cbegin(); it != pending_.cend(); ++it) {
+                    details.append(QJsonObject{
+                        {QStringLiteral("id"), it.key()},
+                        {QStringLiteral("method"), it.value().method},
+                        {QStringLiteral("ageMs"), elapsed_.elapsed() - it.value().startedMs},
+                        {QStringLiteral("sent"), it.value().sent}});
+                }
+                result.insert(QStringLiteral("pendingDetails"), details);
+            }
+            sendRes_(id, true, result);
             return;
         }
         // Test-only echo: lets the regression drive frames of a chosen size in
@@ -2241,11 +2258,127 @@ private:
  * see as "the window never appears".
  *
  *   hb <sequence> <elapsed-ms> <top-level-windows> <exposed> <visible>
+ *   blk <elapsed-ms> <block-ms>   test-only: the GUI thread is about to park
+ *   blk-end <elapsed-ms>          test-only: it came back
  *
- * Off unless DSH_QT_HEARTBEAT_FILE is set, so production runs pay nothing.
+ * Two channels, because one file cannot tell three stories apart. `hb` comes
+ * from the GUI thread, so it is silent both while the event loop is parked and
+ * while the process has not started that loop yet. A second file
+ * (`DSH_QT_HEARTBEAT_OBSERVER_FILE`) is written by a plain std::thread that
+ * never touches Qt: it keeps ticking while the GUI thread is parked, which turns
+ * "no beats" into an answerable question — machine stalled, or loop parked?
+ *
+ * Off unless the matching variable is set, so production runs pay nothing.
  */
+static void flushHeartbeat(QFile &file)
+{
+    file.flush();
+#ifdef Q_OS_WIN
+    // QFile::flush() only hands the bytes to the CRT: a poller sampling the file
+    // from another process can still read a stale file while they sit in that
+    // buffer. This channel exists to separate "the loop is parked" from "the
+    // line is not on disk yet", so on Windows every line is pushed to the OS.
+    const qintptr fd = file.handle();
+    if (fd >= 0) {
+        const intptr_t osHandle = _get_osfhandle(static_cast<int>(fd));
+        if (osHandle != -1)
+            ::FlushFileBuffers(reinterpret_cast<HANDLE>(osHandle));
+    }
+#endif
+}
+
+/**
+ * The independent observer channel.
+ *
+ * Deliberately Qt-free — a std::thread, C stdio and FlushFileBuffers — so it
+ * cannot be starved by anything that parks the Qt event loop: a blocking read, a
+ * mutex the GUI thread holds, a paint loop. It records the steady clock rather
+ * than wall time, so a suspended machine also shows up as a gap.
+ *
+ *   ob <sequence> <steady-ms>
+ *
+ * Every allocation happens in start(), before the thread runs, so a parked GUI
+ * thread never waits on this thread's heap.
+ */
+class GuiHeartbeatObserver
+{
+public:
+    explicit GuiHeartbeatObserver(QString path) : path_(std::move(path)) {}
+
+    ~GuiHeartbeatObserver() { stop(); }
+
+    void start()
+    {
+        if (file_ != nullptr)
+            return;
+        file_ = std::fopen(path_.toUtf8().constData(), "wb");
+        if (file_ == nullptr) {
+            // A silent failure here would look exactly like a stalled GUI thread.
+            std::fprintf(stderr,
+                         "dsh-qt-app: observer file '%s' could not be opened: %s\n",
+                         path_.toUtf8().constData(),
+                         std::strerror(errno));
+            std::fflush(stderr);
+            return;
+        }
+        started_ = std::chrono::steady_clock::now();
+        running_.store(true);
+        thread_ = std::thread([this]() { run_(); });
+    }
+
+    void stop()
+    {
+        if (!running_.exchange(false))
+            return;
+        if (thread_.joinable())
+            thread_.join();
+        if (file_ != nullptr) {
+            std::fclose(file_);
+            file_ = nullptr;
+        }
+    }
+
+private:
+    void run_()
+    {
+        while (running_.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            const qint64 steadyMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - started_).count();
+            std::fprintf(file_, "ob %d %lld\n", ++sequence, static_cast<long long>(steadyMs));
+            std::fflush(file_);
+#ifdef Q_OS_WIN
+            const intptr_t osHandle = _get_osfhandle(_fileno(file_));
+            if (osHandle != -1)
+                ::FlushFileBuffers(reinterpret_cast<HANDLE>(osHandle));
+#endif
+            // 50 ms, the same cadence as the GUI timer, so the two channels can
+            // be compared line for line over the same window.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    QString path_;
+    std::FILE *file_ = nullptr;
+    std::thread thread_;
+    std::atomic<bool> running_{false};
+    std::atomic<int> sequence{0};
+    std::chrono::steady_clock::time_point started_{};
+};
+
 static void startGuiHeartbeat(QCoreApplication &app)
 {
+    // The observer starts first: it has to cover the window between process
+    // start and the creation of the GUI timer, which is exactly where the
+    // pre-fix Windows failure hid itself.
+    const QString observerPath = qEnvironmentVariable("DSH_QT_HEARTBEAT_OBSERVER_FILE");
+    if (!observerPath.isEmpty()) {
+        auto observer = std::make_shared<GuiHeartbeatObserver>(observerPath);
+        observer->start();
+        QObject::connect(&app, &QCoreApplication::aboutToQuit, &app,
+                         [observer]() { observer->stop(); });
+    }
+
     const QString path = qEnvironmentVariable("DSH_QT_HEARTBEAT_FILE");
     if (path.isEmpty())
         return;
@@ -2268,11 +2401,24 @@ static void startGuiHeartbeat(QCoreApplication &app)
         QElapsedTimer elapsed;
         int sequence = 0;
     };
+    // Test-only negative control (DSH_QT_TEST_BLOCK_GUI_MS). Parking the GUI
+    // thread on purpose is the only way to show that this channel reports a
+    // stalled loop rather than merely reporting that the process is alive; the
+    // harness asserts both sides — a gap in `hb`, no gap in `ob`.
+    struct BlockProbe
+    {
+        qint64 ms = 0;
+        bool fired = false;
+    };
     auto beat = QSharedPointer<Beat>::create();
     beat->elapsed.start();
+    auto probe = QSharedPointer<BlockProbe>::create();
+    const int blockMs = qEnvironmentVariableIntValue("DSH_QT_TEST_BLOCK_GUI_MS");
+    if (blockMs > 0)
+        probe->ms = blockMs;
     auto *timer = new QTimer(&app);
     timer->setInterval(50);
-    QObject::connect(timer, &QTimer::timeout, &app, [file, beat]() {
+    QObject::connect(timer, &QTimer::timeout, &app, [file, beat, probe]() {
         int windows = 0;
         int exposed = 0;
         int visible = 0;
@@ -2286,6 +2432,21 @@ static void startGuiHeartbeat(QCoreApplication &app)
             if (window->isVisible())
                 ++visible;
         }
+        // Park once a real window exists: blocking before that is
+        // indistinguishable from slow startup, which is the confusion this task
+        // exists to remove.
+        if (probe->ms > 0 && !probe->fired && windows >= 1) {
+            probe->fired = true;
+            file->write(QStringLiteral("blk %1 %2\n")
+                            .arg(beat->elapsed.elapsed())
+                            .arg(probe->ms)
+                            .toUtf8());
+            flushHeartbeat(*file);
+            QThread::msleep(static_cast<unsigned long>(probe->ms));
+            file->write(QStringLiteral("blk-end %1\n").arg(beat->elapsed.elapsed()).toUtf8());
+            flushHeartbeat(*file);
+            return;
+        }
         file->write(QStringLiteral("hb %1 %2 %3 %4 %5\n")
                         .arg(++beat->sequence)
                         .arg(beat->elapsed.elapsed())
@@ -2293,7 +2454,7 @@ static void startGuiHeartbeat(QCoreApplication &app)
                         .arg(exposed)
                         .arg(visible)
                         .toUtf8());
-        file->flush();
+        flushHeartbeat(*file);
     });
     timer->start();
 }

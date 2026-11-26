@@ -584,6 +584,9 @@ jobs:
           # be false; the job summary records that it was not asserted. Linux runs
           # under the offscreen QPA, which does report exposure, so it asserts it.
           DSH_QT_EXPECT_NO_DESKTOP: ${{ matrix.os == 'windows-2022' && '1' || '0' }}
+          # The suite copies both heartbeat channels and a JSON summary here on
+          # exit; a failed run is then diagnosable from the artifact alone.
+          DSH_QT_HB_ARTIFACT_DIR: ${{ github.workspace }}/gui-heartbeat-samples
         run: |
           set -o pipefail
           pnpm exec tsx --test tests/gui-heartbeat.e2e.ts 2>&1 | tee gui-heartbeat.log
@@ -598,13 +601,27 @@ jobs:
             echo '::error::the GUI heartbeat regression skipped itself — see gui-heartbeat.log'
             exit 1
           fi
-          if ! grep -qE 'pass 13' gui-heartbeat.log; then
-            echo '::error::expected thirteen passing cases in gui-heartbeat.log'
+          if ! grep -qE 'pass 17' gui-heartbeat.log; then
+            echo '::error::expected seventeen passing cases in gui-heartbeat.log'
             tail -60 gui-heartbeat.log
             exit 1
           fi
           if ! grep -qE 'fail 0' gui-heartbeat.log; then
             echo '::error::a GUI heartbeat case failed — see gui-heartbeat.log'
+            tail -60 gui-heartbeat.log
+            exit 1
+          fi
+          # The measured start-up legs and the parked-GUI control are printed as
+          # `# stages <label>: {...}` and `# park: ...`. They are the evidence that
+          # the suite separated start-up, observation channel and steady state, so
+          # a run without them is not the run this job claims to have made.
+          if ! grep -qE '^# stages ' gui-heartbeat.log; then
+            echo '::error::gui-heartbeat.log carries no measured start-up stages'
+            tail -60 gui-heartbeat.log
+            exit 1
+          fi
+          if ! grep -qE '^# park: ' gui-heartbeat.log; then
+            echo '::error::gui-heartbeat.log carries no parked-GUI negative control record'
             tail -60 gui-heartbeat.log
             exit 1
           fi
@@ -636,7 +653,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gui-heartbeat-log-${{ matrix.os }}
-          path: gui-heartbeat.log
+          path: |
+            gui-heartbeat.log
+            gui-heartbeat-samples/
           if-no-files-found: warn
           retention-days: 7
 

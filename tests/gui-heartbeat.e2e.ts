@@ -39,7 +39,17 @@
  */
 import assert from 'node:assert/strict'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  closeSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -65,24 +75,166 @@ interface Beat {
   readonly visible: number
 }
 
-function readBeats(path: string): Beat[] {
-  if (!existsSync(path)) return []
-  return readFileSync(path, 'utf8')
-    .split('\n')
-    .filter((line) => line.startsWith('hb '))
-    .map((line) => {
-      const [, sequence, elapsed, windows, exposed, visible] = line.trim().split(/\s+/)
-      return {
-        sequence: Number(sequence),
-        elapsed: Number(elapsed),
-        windows: Number(windows),
-        exposed: Number(exposed),
-        visible: Number(visible),
-      }
-    })
+/** One `ob` line: a tick from the Qt-free observer thread, on its own clock. */
+interface ObserverBeat {
+  readonly sequence: number
+  readonly steady: number
 }
 
-/** Longest stretch between two consecutive ticks, in ms. */
+/** One `blk`/`blk-end` pair, written by the test-only GUI park. */
+interface BlockProbe {
+  readonly startedAt: number
+  readonly ms: number
+  readonly endedAt: number | null
+}
+
+/** One `host.ping` answer, as documented in the host protocol. */
+interface PingAnswer {
+  readonly state: string
+  readonly pending: number
+  readonly details: readonly PendingDetail[] | null
+}
+
+/** One entry of the Qt→Node request book, exposed only under test hooks. */
+interface PendingDetail {
+  readonly id: string
+  readonly method: string
+  readonly ageMs: number
+  readonly sent: boolean
+}
+
+interface FileRead {
+  readonly exists: boolean
+  readonly size: number
+  readonly mtimeMs: number | null
+  readonly readError: string | null
+  readonly text: string
+}
+
+/**
+ * One sampling instant of both heartbeat channels.
+ *
+ * The file's contents alone cannot explain a failure: an empty beat list means
+ * "the GUI thread never ticked", "the file was never created" or "the file could
+ * not be read", and those want different answers. Every assertion that depends
+ * on a sample therefore reports the whole thing through `describeSample`.
+ */
+interface HeartbeatSample {
+  readonly path: string
+  readonly exists: boolean
+  readonly size: number
+  readonly mtimeMs: number | null
+  readonly readError: string | null
+  readonly beats: readonly Beat[]
+  readonly blocks: readonly BlockProbe[]
+  readonly observerPath: string
+  readonly observerExists: boolean
+  readonly observerSize: number
+  readonly observerError: string | null
+  readonly observer: readonly ObserverBeat[]
+  /** Bytes the host has received from / sent to the Qt side so far. */
+  readonly bytesIn: number
+  readonly bytesOut: number
+  readonly collectedAt: number
+}
+
+function readTextFile(path: string): FileRead {
+  let size = 0
+  let mtimeMs: number | null = null
+  try {
+    const stat = statSync(path)
+    size = stat.size
+    mtimeMs = stat.mtimeMs
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? 'EUNKNOWN'
+    if (code === 'ENOENT')
+      return { exists: false, size: 0, mtimeMs: null, readError: null, text: '' }
+    return {
+      exists: false,
+      size: 0,
+      mtimeMs: null,
+      readError: `${code}: ${(error as Error).message}`,
+      text: '',
+    }
+  }
+  try {
+    return { exists: true, size, mtimeMs, readError: null, text: readFileSync(path, 'utf8') }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? 'EUNKNOWN'
+    return {
+      exists: true,
+      size,
+      mtimeMs,
+      readError: `${code}: ${(error as Error).message}`,
+      text: '',
+    }
+  }
+}
+
+function parseBeats(text: string): Beat[] {
+  const beats: Beat[] = []
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('hb ')) continue
+    const [, sequence, elapsed, windows, exposed, visible] = line.trim().split(/\s+/)
+    beats.push({
+      sequence: Number(sequence),
+      elapsed: Number(elapsed),
+      windows: Number(windows),
+      exposed: Number(exposed),
+      visible: Number(visible),
+    })
+  }
+  return beats
+}
+
+function parseObserver(text: string): ObserverBeat[] {
+  const ticks: ObserverBeat[] = []
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('ob ')) continue
+    const [, sequence, steady] = line.trim().split(/\s+/)
+    ticks.push({ sequence: Number(sequence), steady: Number(steady) })
+  }
+  return ticks
+}
+
+function parseBlocks(text: string): BlockProbe[] {
+  const blocks: BlockProbe[] = []
+  for (const line of text.split('\n')) {
+    const fields = line.trim().split(/\s+/)
+    if (fields[0] === 'blk') {
+      blocks.push({ startedAt: Number(fields[1]), ms: Number(fields[2]), endedAt: null })
+      continue
+    }
+    if (fields[0] === 'blk-end') {
+      const last = blocks[blocks.length - 1]
+      if (last !== undefined && last.endedAt === null)
+        blocks[blocks.length - 1] = { ...last, endedAt: Number(fields[1]) }
+    }
+  }
+  return blocks
+}
+
+/** Beats only, without the rest of the sample. Kept for the byte-level tests. */
+function readBeats(path: string): Beat[] {
+  return parseBeats(readTextFile(path).text)
+}
+
+/** Longest stretch between two consecutive GUI ticks, in ms. */
+function longestGap(beats: readonly Beat[]): number {
+  let gap = 0
+  for (let index = 1; index < beats.length; index += 1)
+    gap = Math.max(gap, beats[index]!.elapsed - beats[index - 1]!.elapsed)
+  return gap
+}
+
+/** Longest stretch between two consecutive observer ticks, in ms. */
+function longestObserverGap(ticks: readonly ObserverBeat[]): number {
+  let gap = 0
+  for (let index = 1; index < ticks.length; index += 1)
+    gap = Math.max(gap, ticks[index]!.steady - ticks[index - 1]!.steady)
+  return gap
+}
+
 function settleWithin<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   // A request to a process that died without answering would otherwise keep the
   // file-level promise pending and turn a clear failure into a runner timeout.
@@ -101,18 +253,89 @@ function settleWithin<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   })
 }
 
-function longestGap(beats: readonly Beat[]): number {
-  let gap = 0
-  for (let index = 1; index < beats.length; index += 1)
-    gap = Math.max(gap, beats[index]!.elapsed - beats[index - 1]!.elapsed)
-  return gap
+function readPingAnswer(reply: unknown): PingAnswer | null {
+  if (typeof reply !== 'object' || reply === null || Array.isArray(reply)) return null
+  const answer = reply as Record<string, unknown>
+  const state = answer['state']
+  const pending = answer['pending']
+  if (typeof state !== 'string' || typeof pending !== 'number') return null
+  const rawDetails = answer['pendingDetails']
+  let details: PendingDetail[] | null = null
+  if (Array.isArray(rawDetails)) {
+    details = []
+    for (const entry of rawDetails) {
+      if (typeof entry !== 'object' || entry === null) continue
+      const record = entry as Record<string, unknown>
+      details.push({
+        id: typeof record['id'] === 'string' ? record['id'] : '',
+        method: typeof record['method'] === 'string' ? record['method'] : '',
+        ageMs: typeof record['ageMs'] === 'number' ? record['ageMs'] : -1,
+        sent: record['sent'] === true,
+      })
+    }
+  }
+  return { state, pending, details }
+}
+
+/** Everything one sample knows, on one line: the failure message, not a guess. */
+function describeSample(sample: HeartbeatSample): string {
+  const first = sample.beats[0]
+  const last = sample.beats[sample.beats.length - 1]
+  const parts = [
+    `beats=${sample.beats.length}`,
+    first === undefined ? 'first=none' : `first=#${first.sequence}@${first.elapsed}ms`,
+    last === undefined
+      ? 'last=none'
+      : `last=#${last.sequence}@${last.elapsed}ms windows=${last.windows} exposed=${last.exposed} visible=${last.visible}`,
+    `longestGap=${longestGap(sample.beats)}ms`,
+    `blocks=${JSON.stringify(sample.blocks)}`,
+    `observer=${sample.observer.length}`,
+    `observerGap=${longestObserverGap(sample.observer)}ms`,
+    `bytesIn=${sample.bytesIn} bytesOut=${sample.bytesOut}`,
+    `beatFile=${sample.path} exists=${sample.exists} size=${sample.size}`,
+    `mtime=${sample.mtimeMs === null ? 'none' : new Date(sample.mtimeMs).toISOString()}`,
+    `readError=${sample.readError === null ? 'none' : sample.readError}`,
+    `observerFile exists=${sample.observerExists} size=${sample.observerSize}`,
+    `observerReadError=${sample.observerError === null ? 'none' : sample.observerError}`,
+    `collectedAt=${new Date(sample.collectedAt).toISOString()}`,
+  ]
+  return parts.join(' ')
+}
+
+/** The four start-up legs, each measured against the same spawn instant. */
+interface Stages {
+  readonly connectedMs: number
+  readonly firstTickMs: number | null
+  readonly firstWindowMs: number | null
+  readonly firstTickElapsedMs: number | null
+  readonly observerBeforeFirstTick: number
+}
+
+interface SteadyWindow {
+  readonly windowMs: number
+  readonly before: HeartbeatSample
+  readonly after: HeartbeatSample
+  readonly fresh: readonly Beat[]
+  readonly gap: number
 }
 
 interface Session {
   readonly child: ChildProcessWithoutNullStreams
   readonly host: HostBridgeService
   readonly beats: string
+  readonly observerFile: string
+  readonly label: string
+  readonly startedAt: number
+  /** What the child wrote to stderr so far; drained, not interpreted. */
+  readonly stderr: readonly string[]
+  sample(): HeartbeatSample
   waitConnected(): Promise<void>
+  /** First GUI tick, or null when the deadline passes without one. */
+  waitFirstBeat(timeoutMs?: number): Promise<Beat | null>
+  waitFirstWindow(timeoutMs?: number): Promise<Beat | null>
+  measureStartup(): Promise<Stages>
+  sampleSteady(options: { minimumBeats?: number; windowMs: number }): Promise<SteadyWindow>
+  archive(): void
   waitExit(ms: number): Promise<{ code: number | null; signal: NodeJS.Signals | null } | null>
   stop(): Promise<{ code: number | null; signal: NodeJS.Signals | null }>
 }
@@ -122,24 +345,40 @@ function launch(options: {
   legacyRead?: boolean
   testHooks?: boolean
   label: string
+  /** Test-only negative control: park the GUI thread for this many ms. */
+  blockGuiMs?: number
+  /** Use this path as the beat file (a directory makes the open fail). */
+  heartbeatFile?: string
+  /** Set to false to run without the independent observer channel. */
+  observer?: boolean
 }): Session {
-  const beats = join(tmpdir(), `dsh-qt-heartbeat-${process.pid}-${options.label}.txt`)
-  rmSync(beats, { force: true })
+  const beats = options.heartbeatFile ?? join(tmpdir(), `dsh-qt-heartbeat-${process.pid}-${options.label}.txt`)
+  if (options.heartbeatFile === undefined) rmSync(beats, { force: true })
+  const observerFile = join(tmpdir(), `dsh-qt-heartbeat-observer-${process.pid}-${options.label}.txt`)
+  rmSync(observerFile, { force: true })
+  const startedAt = Date.now()
   const child = spawn(binary, [], {
     cwd: root,
     env: {
       ...process.env,
       DSH_QT_HEARTBEAT_FILE: beats,
+      ...(options.observer === false ? {} : { DSH_QT_HEARTBEAT_OBSERVER_FILE: observerFile }),
       QT_QPA_PLATFORM: process.platform === 'win32' ? 'windows' : 'offscreen',
       ...(options.polled === true ? { DSH_QT_STDIO_POLL: '1' } : {}),
       ...(options.legacyRead === true ? { DSH_QT_STDIO_TEST_LEGACY_READ: '1' } : {}),
       ...(options.testHooks === true ? { DSH_QT_TEST_HOOKS: '1' } : {}),
+      ...(options.blockGuiMs === undefined ? {} : { DSH_QT_TEST_BLOCK_GUI_MS: String(options.blockGuiMs) }),
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   })
+  const stderr: string[] = []
   child.stderr.setEncoding('utf8')
-  child.stderr.on('data', () => {})
+  // Kept, not dropped: a heartbeat channel that cannot be opened has to be
+  // reportable, and silence there looks exactly like a frozen GUI thread.
+  child.stderr.on('data', (chunk: string) => {
+    if (stderr.length < 200) stderr.push(chunk)
+  })
   child.stdout.setEncoding('utf8')
 
   const transport = new HostTransport({ input: child.stdout, output: child.stdin })
@@ -152,12 +391,126 @@ function launch(options: {
   host.register('ping', () => ({ pong: true, host: 'gui-heartbeat-e2e' }))
   host.attach({ transport, child })
 
+  const sample = (): HeartbeatSample => {
+    const beatFile = readTextFile(beats)
+    const observerRead = readTextFile(observerFile)
+    const stats = host.stats.transport
+    return {
+      path: beats,
+      exists: beatFile.exists,
+      size: beatFile.size,
+      mtimeMs: beatFile.mtimeMs,
+      readError: beatFile.readError,
+      beats: parseBeats(beatFile.text),
+      blocks: parseBlocks(beatFile.text),
+      observerPath: observerFile,
+      observerExists: observerRead.exists,
+      observerSize: observerRead.size,
+      observerError: observerRead.readError,
+      observer: parseObserver(observerRead.text),
+      bytesIn: stats === null ? 0 : stats.bytesIn,
+      bytesOut: stats === null ? 0 : stats.bytesOut,
+      collectedAt: Date.now(),
+    }
+  }
+
   const waitConnected = async (): Promise<void> => {
     const deadline = Date.now() + 15_000
     while (!host.connected) {
       if (Date.now() > deadline)
         throw new Error(`the Qt host never completed the handshake (state: ${host.state})`)
       await delay(25)
+    }
+  }
+
+  const waitFirstBeat = async (timeoutMs = 20_000): Promise<Beat | null> => {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const current = sample()
+      const beat = current.beats[0]
+      if (beat !== undefined) return beat
+      if (Date.now() > deadline) return null
+      await delay(25)
+    }
+  }
+
+  const waitFirstWindow = async (timeoutMs = 25_000): Promise<Beat | null> => {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const beat = sample().beats.find((entry) => entry.windows >= 1)
+      if (beat !== undefined) return beat
+      if (Date.now() > deadline) return null
+      await delay(25)
+    }
+  }
+
+  const measureStartup = async (): Promise<Stages> => {
+    await waitConnected()
+    const connectedMs = Date.now() - startedAt
+    // The observer has to be running before the GUI timer is: sample it while the
+    // beat file is still empty, which is the window the pre-fix bug hid in.
+    const early = sample()
+    const tick = await waitFirstBeat()
+    const firstTickMs = tick === null ? null : Date.now() - startedAt
+    const window = await waitFirstWindow()
+    const stages: Stages = {
+      connectedMs,
+      firstTickMs,
+      firstWindowMs: window === null ? null : Date.now() - startedAt,
+      firstTickElapsedMs: tick === null ? null : tick.elapsed,
+      observerBeforeFirstTick: early.observer.length,
+    }
+    console.log(`# stages ${options.label}: ${JSON.stringify(stages)}`)
+    return stages
+  }
+
+  const sampleSteady = async (steady: {
+    minimumBeats?: number
+    windowMs: number
+  }): Promise<SteadyWindow> => {
+    const minimum = steady.minimumBeats ?? 10
+    const deadline = Date.now() + 20_000
+    while (sample().beats.length < minimum) {
+      if (Date.now() > deadline) break
+      await delay(25)
+    }
+    const before = sample()
+    await delay(steady.windowMs)
+    const after = sample()
+    const fresh = after.beats.slice(before.beats.length)
+    return { windowMs: steady.windowMs, before, after, fresh, gap: longestGap(fresh) }
+  }
+
+  const archive = (): void => {
+    const directory = process.env['DSH_QT_HB_ARTIFACT_DIR']
+    if (directory === undefined || directory === '') return
+    try {
+      mkdirSync(directory, { recursive: true })
+      const final = sample()
+      if (final.exists) copyFileSync(beats, join(directory, `${options.label}-hb.txt`))
+      if (final.observerExists)
+        copyFileSync(observerFile, join(directory, `${options.label}-observer.txt`))
+      writeFileSync(
+        join(directory, `${options.label}-summary.json`),
+        `${JSON.stringify(
+          {
+            label: options.label,
+            platform: process.platform,
+            binary,
+            beats: final.beats.length,
+            observer: final.observer.length,
+            blocks: final.blocks,
+            bytesIn: final.bytesIn,
+            bytesOut: final.bytesOut,
+            stderr: stderr.join(''),
+          },
+          null,
+          2,
+        )}\n`,
+      )
+    } catch (error) {
+      // Archiving is evidence collection; it never fails a run.
+      console.log(`# could not archive the samples: ${(error as Error).message}`)
     }
   }
 
@@ -184,17 +537,36 @@ function launch(options: {
 
   const stop = async (): Promise<{ code: number | null; signal: NodeJS.Signals | null }> => {
     if (child.exitCode !== null || child.signalCode !== null) {
+      archive()
       host.dispose()
       return { code: child.exitCode, signal: child.signalCode }
     }
     child.kill()
     const result = await waitExit(5_000)
     if (result === null) child.kill('SIGKILL')
+    archive()
     host.dispose()
     return result ?? { code: null, signal: 'SIGKILL' }
   }
 
-  return { child, host, beats, waitConnected, waitExit, stop }
+  return {
+    child,
+    host,
+    beats,
+    observerFile,
+    label: options.label,
+    startedAt,
+    stderr,
+    sample,
+    waitConnected,
+    waitFirstBeat,
+    waitFirstWindow,
+    measureStartup,
+    sampleSteady,
+    archive,
+    waitExit,
+    stop,
+  }
 }
 
 function delay(ms: number): Promise<void> {
@@ -207,31 +579,52 @@ test(
   async () => {
     const session = launch({ polled: true, label: 'silent' })
     try {
-      await session.waitConnected()
-      // Nothing is written from here on: an idle-but-open pipe is exactly the
-      // condition that used to freeze the window.
-      await delay(2_000)
+      // Item A of the review: the start-up legs are measured one by one and each
+      // one is bounded, so "the GUI never ticked" can no longer be mistaken for
+      // "the process was merely slow to start".
+      const stages = await session.measureStartup()
+      assert.ok(
+        stages.connectedMs <= 15_000,
+        `the handshake took ${stages.connectedMs} ms: ${describeSample(session.sample())}`,
+      )
+      assert.ok(
+        stages.firstTickMs !== null && stages.firstTickMs <= 20_000,
+        `the GUI thread produced no first tick within 20 s: ${describeSample(session.sample())}`,
+      )
+      assert.ok(
+        stages.firstWindowMs !== null && stages.firstWindowMs <= 25_000,
+        `no top-level QWindow appeared within 25 s: ${describeSample(session.sample())}`,
+      )
+      // Steady state is measured from the first tick on, never from the handshake:
+      // on a cold runner the event loop turns long after the frame arrives.
+      await delay(0)
+      const steady = await session.sampleSteady({ minimumBeats: 10, windowMs: 2_000 })
       assert.equal(session.child.exitCode, null, 'the child must still be running while we sample')
-      const beats = readBeats(session.beats)
       assert.ok(
-        beats.length >= 20,
-        `the GUI thread ticked only ${beats.length} times in 2 s of silence; beats: ${JSON.stringify(beats)}`,
+        steady.fresh.length >= 20,
+        `the GUI thread ticked ${steady.fresh.length} times in ${steady.windowMs} ms of silence after its first tick: ${describeSample(steady.after)}`,
       )
       assert.ok(
-        longestGap(beats) <= 250,
-        `the GUI thread stalled for ${longestGap(beats)} ms while stdin was silent; beats: ${JSON.stringify(beats)}`,
+        steady.gap <= 250,
+        `the GUI thread stalled for ${steady.gap} ms while stdin was silent: ${describeSample(steady.after)}`,
       )
-      const last = beats[beats.length - 1]!
-      assert.ok(last.windows >= 1, `no top-level QWindow was ever created; beats: ${JSON.stringify(beats)}`)
+      const last = steady.after.beats[steady.after.beats.length - 1]
+      assert.ok(
+        last !== undefined && last.windows >= 1,
+        `no top-level QWindow was ever created: ${describeSample(steady.after)}`,
+      )
       if (expectNoDesktop) {
         assert.ok(last.visible >= 1, 'the window was never shown, even though this runner reports a desktop')
         console.log('# window exposure is not asserted here: DSH_QT_EXPECT_NO_DESKTOP=1 (no visible desktop)')
       } else {
         assert.ok(
-          beats.some((beat) => beat.exposed >= 1),
-          `the window was created but never exposed; beats: ${JSON.stringify(beats)}`,
+          steady.after.beats.some((beat) => beat.exposed >= 1),
+          `the window was created but never exposed: ${describeSample(steady.after)}`,
         )
       }
+      console.log(
+        `# steady: ${steady.fresh.length} ticks in ${steady.windowMs} ms, longest gap ${steady.gap} ms, bytes in/out ${steady.after.bytesIn}/${steady.after.bytesOut}`,
+      )
       assert.equal(session.child.exitCode, null, 'the child must still be running after the assertions')
     } finally {
       await session.stop()
@@ -246,39 +639,68 @@ test(
     const session = launch({ polled: true, legacyRead: true, label: 'legacy' })
     try {
       await session.waitConnected()
-      await delay(2_000)
-      const stalled = readBeats(session.beats)
+      // The pre-fix loop parks inside its very first read, so the heartbeat file
+      // may never get a tick at all. Wait for one *bounded* window instead of
+      // sleeping past it, so a slow runner cannot be mistaken for a parked GUI.
+      const firstTick = await session.waitFirstBeat(3_000)
+      const stalled = session.sample()
+      console.log(
+        `# legacy: first tick ${firstTick === null ? 'never observed within 3 s' : `at ${firstTick.elapsed} ms`}; ${describeSample(stalled)}`,
+      )
       // The old loop blocks inside the very first read, so the heartbeat file
       // barely moves while the process stays alive — the user-visible symptom.
       assert.ok(
-        stalled.length <= 3,
-        `the legacy read loop kept ticking (${stalled.length} beats); it no longer reproduces the freeze: ${JSON.stringify(stalled)}`,
+        stalled.beats.length <= 3,
+        `the legacy read loop kept ticking (${stalled.beats.length} beats); it no longer reproduces the freeze: ${describeSample(stalled)}`,
       )
       assert.equal(session.child.exitCode, null, 'the frozen process is still alive, which is the point')
       // A frame unblocks the read and the protocol advances — the app answers —
       // yet the GUI thread only turns for that one frame and parks again. That
       // combination is the defect: the pipe works, the window does not.
+      // The observer runs on its own 50 ms cadence and starts with the process, so
+      // give it a bounded window rather than sampling the instant the handshake
+      // lands: what matters is that it keeps writing while the GUI cannot.
+      const observerDeadline = Date.now() + 3_000
+      let observerAtFrame = stalled.observer.length
+      while (session.sample().observer.length < 5 && Date.now() < observerDeadline)
+        await delay(25)
+      observerAtFrame = session.sample().observer.length
+      assert.ok(
+        observerAtFrame >= 5,
+        `the observer channel never ticked while the GUI was parked: ${describeSample(session.sample())}`,
+      )
       const reply = await settleWithin(session.host.invoke('host.ping'), 6_000)
-      assert.deepEqual(reply, { pending: 0, state: 'connected' }, 'the frozen app still answered a frame')
+      // The ping reply is checked field by field (item C): `pending` is this
+      // process's outstanding Qt→Node request count, not a verdict on the GUI, so
+      // the assertion is about the book being empty and the transport being up.
+      const answer = readPingAnswer(reply)
+      assert.ok(answer !== null, `the frozen app did not answer host.ping: ${JSON.stringify(reply)}`)
+      assert.equal(answer.pending, 0, `the parked app reported ${answer.pending} outstanding requests: ${JSON.stringify(reply)}`)
+      assert.equal(answer.state, 'connected', `the parked app reported state ${answer.state}: ${JSON.stringify(reply)}`)
       await delay(500)
+      const observerAfterFrame = session.sample().observer.length
+      assert.ok(
+        observerAfterFrame - observerAtFrame >= 5,
+        `the independent observer wrote ${observerAfterFrame - observerAtFrame} ticks in 500 ms while the GUI was parked: ${describeSample(session.sample())}`,
+      )
       // Whether the parked loop turns once more depends on which of the two
       // timers Qt dispatches first, so the durable invariant is the *rate*: over
       // 2.5 s the thread must stay at a couple of ticks with a gap of a second or
       // more, against >= 20 ticks and <= 250 ms gaps on the fixed path.
-      const resumed = readBeats(session.beats)
+      const resumed = session.sample()
       assert.ok(
-        resumed.length <= 3,
-        `the GUI thread ran at full rate after a frame (${stalled.length} → ${resumed.length} beats)`,
+        resumed.beats.length <= 3,
+        `the GUI thread ran at full rate after a frame (${stalled.beats.length} → ${resumed.beats.length} beats): ${describeSample(resumed)}`,
       )
       // The durable invariant is the *rate after* the frame, not the absolute
       // elapsed time of the last tick: answering the ping is what unblocks the
       // read, so one further tick is expected however the two timers interleave.
       // What must not happen is the thread returning to a normal rate — the fixed
       // path adds about ten ticks over the same 500 ms.
-      const added = resumed.length - stalled.length
+      const added = resumed.beats.length - stalled.beats.length
       assert.ok(
         added <= 2,
-        `the GUI thread resumed a normal rate after one frame (${stalled.length} → ${resumed.length} beats)`,
+        `the GUI thread resumed a normal rate after one frame (${stalled.beats.length} → ${resumed.beats.length} beats): ${describeSample(resumed)}`,
       )
       assert.equal(
         session.child.exitCode,
@@ -333,7 +755,18 @@ test(
     const session = launch({ polled: true, testHooks: true, label: 'stalled-reader' })
     try {
       await session.waitConnected()
-      const before = readBeats(session.beats).length
+      // Back-pressure is a steady-state property, so the baseline has to start
+      // from a first tick, not from the handshake: otherwise "no tick yet" and
+      // "the thread stalled" are the same observation.
+      const firstTick = await session.waitFirstBeat()
+      assert.ok(
+        firstTick !== null,
+        `the GUI thread never ticked before the back-pressure window: ${describeSample(session.sample())}`,
+      )
+      const baseline = session.sample()
+      const before = baseline.beats.length
+      const bytesInBefore = baseline.bytesIn
+      const bytesOutBefore = baseline.bytesOut
       session.child.stdout.pause()
       const pending = session.host.invoke('host.echo', { bytes: 200_000 })
       await delay(1_000)
@@ -346,6 +779,14 @@ test(
       const reply = (await pending) as { bytes: number; payload: string }
       assert.equal(reply.bytes, 200_000, 'the reply frame lost bytes across the stalled window')
       assert.equal(reply.payload.length, 200_000, 'the reply payload was truncated or interleaved')
+      const settled = session.sample()
+      assert.ok(
+        settled.bytesIn - bytesInBefore >= 200_000,
+        `the transport counted only ${settled.bytesIn - bytesInBefore} inbound bytes for a 200 KB reply: ${describeSample(settled)}`,
+      )
+      console.log(
+        `# back-pressure: ${during.length - before} ticks during the stalled second, bytes in ${settled.bytesIn - bytesInBefore} / out ${settled.bytesOut - bytesOutBefore}`,
+      )
     } finally {
       await session.stop()
     }
@@ -515,8 +956,11 @@ test(
         stats.handled >= 1,
         `no reply was handled at all (timeouts ${stats.timeouts}, dropped ${dropped})`,
       )
-      const ping = await session.host.invoke('host.ping')
-      assert.deepEqual(ping, { pending: 0, state: 'connected' }, 'the session did not survive the overflow')
+      const ping = readPingAnswer(await session.host.invoke('host.ping'))
+      // Field by field: `pending` is the Qt→Node request book, `state` the
+      // transport's, and under the test hooks the book travels with it.
+      assert.equal(ping?.state, 'connected', 'the session did not survive the overflow')
+      assert.equal(ping?.pending, 0, 'the overflow left requests outstanding')
       assert.equal(session.child.exitCode, null, 'the process is still running after the overflow')
     } finally {
       await session.stop()
@@ -661,8 +1105,9 @@ test(
       session.child.stdin.write(`${oversized}\n`)
       await delay(1_000)
       assert.equal(session.child.exitCode, null, 'the app exited on an oversized inbound frame')
-      const ping = await settleWithin(session.host.invoke('host.ping'), 5_000)
-      assert.deepEqual(ping, { pending: 0, state: 'connected' }, 'the session died on an oversized frame')
+      const ping = readPingAnswer(await settleWithin(session.host.invoke('host.ping'), 5_000))
+      assert.equal(ping?.state, 'connected', 'the session died on an oversized frame')
+      assert.equal(ping?.pending, 0, 'the oversized frame left requests outstanding')
       const warn = events.find((event) => event.name === 'transport.warn')
       assert.ok(warn !== undefined, 'the oversized frame was dropped without telling the host')
       assert.match(String(warn!.payload.reason ?? ''), /inbound frame exceeded/)
@@ -799,5 +1244,223 @@ test(
       result.stdout,
       /cap trips with the newline buffered: the frame behind it is parsed in the same pass/,
     )
+  },
+)
+
+/*
+ * The next three cases exist because the earlier suite could not tell three
+ * different things apart: a GUI thread that is slow to start, a GUI thread that
+ * is genuinely parked, and a measurement channel that is itself dead. Each one
+ * uses only harness-side facilities (no new production behaviour), so they run
+ * unchanged on a Windows runner.
+ */
+
+test(
+  'a deliberately parked GUI thread is visible to the observer and stops the heartbeat',
+  { skip: skipReason, timeout: 90_000 },
+  async () => {
+    // The negative control for the whole exercise. `DSH_QT_TEST_BLOCK_GUI_MS`
+    // parks the GUI thread on the first tick that has a window, which is what a
+    // blocking read would do by accident. If this cannot be detected, a green
+    // Windows run would prove nothing.
+    const session = launch({ polled: true, testHooks: true, blockGuiMs: 1_200, label: 'parked' })
+    try {
+      await session.waitConnected()
+      const deadline = Date.now() + 25_000
+      let sample = session.sample()
+      let observerAtPark = -1
+      while (sample.blocks.length === 0 || sample.blocks[0]!.endedAt === null) {
+        if (observerAtPark < 0 && sample.blocks.length > 0) observerAtPark = sample.observer.length
+        if (Date.now() > deadline) break
+        await delay(25)
+        sample = session.sample()
+      }
+      const block = sample.blocks[0]
+      assert.ok(
+        block !== undefined && block.endedAt !== null,
+        `the test-only GUI park never ran to completion: ${describeSample(sample)}`,
+      )
+      // Pin the narrowing where the closure can see it: the assertion above
+      // proves both, but a callback body does not inherit that proof.
+      const startedAt = block.startedAt
+      const endedAt = block.endedAt
+      assert.equal(block.ms, 1_200, `the park was asked for 1200 ms, not ${block.ms}`)
+      assert.ok(
+        endedAt - startedAt >= 1_200,
+        `the GUI thread was parked for only ${endedAt - startedAt} ms: ${describeSample(sample)}`,
+      )
+      // A parked GUI thread cannot tick, and that is a sharper statement than a
+      // gap width: no tick may carry an elapsed time inside the parked window.
+      const ticksDuringPark = sample.beats.filter(
+        (beat) => beat.elapsed > startedAt && beat.elapsed < endedAt,
+      )
+      assert.equal(
+        ticksDuringPark.length,
+        0,
+        `the GUI thread ticked while it was supposedly parked: ${JSON.stringify(ticksDuringPark)} — ${describeSample(sample)}`,
+      )
+      // ...and the observer thread must not: it is the channel that separates
+      // "the GUI is stuck" from "the whole process is wedged".
+      const observerAtEnd = session.sample().observer.length
+      assert.ok(
+        observerAtPark >= 0,
+        `the park marker was seen only after it had already ended: ${describeSample(sample)}`,
+      )
+      assert.ok(
+        observerAtEnd - observerAtPark >= 10,
+        `the observer wrote ${observerAtEnd - observerAtPark} ticks during a 1200 ms GUI park: ${describeSample(sample)}`,
+      )
+      // Once the park ends the GUI thread returns to its normal rate, so the gap
+      // above is the park and not a corrupted sampling channel.
+      const steady = await session.sampleSteady({ minimumBeats: 10, windowMs: 1_000 })
+      assert.ok(
+        steady.fresh.length >= 10,
+        `the GUI thread did not recover after the park (${steady.fresh.length} ticks in ${steady.windowMs} ms): ${describeSample(steady.after)}`,
+      )
+      assert.ok(
+        steady.gap <= 250,
+        `the GUI thread never returned to its steady rate after the park (gap ${steady.gap} ms): ${describeSample(steady.after)}`,
+      )
+      console.log(
+        `# park: ${block.endedAt - block.startedAt} ms parked, ${ticksDuringPark.length} GUI ticks inside the park, ${observerAtEnd - observerAtPark} observer ticks meanwhile`,
+      )
+    } finally {
+      await session.stop()
+    }
+  },
+)
+
+test(
+  'the observer channel ticks before the GUI thread has ever ticked',
+  { skip: skipReason, timeout: 90_000 },
+  async () => {
+    // The start-up hole item A is about: the handshake completes long before the
+    // event loop runs, and everything the old harness measured inside that window
+    // was measuring the wrong thread.
+    const session = launch({ polled: true, label: 'startup' })
+    try {
+      await session.waitConnected()
+      const early = session.sample()
+      const tick = await session.waitFirstBeat()
+      assert.ok(tick !== null, `the GUI thread never produced a first tick: ${describeSample(session.sample())}`)
+      const after = session.sample()
+      assert.ok(
+        after.observer.length >= 1,
+        `the observer channel never ticked: ${describeSample(after)}`,
+      )
+      assert.ok(
+        after.observer.length > after.beats.length,
+        `the observer did not lead the GUI thread (${after.observer.length} observer ticks vs ${after.beats.length} GUI ticks): ${describeSample(after)}`,
+      )
+      assert.ok(
+        tick.elapsed >= 0,
+        `the first tick carried a negative elapsed time: ${JSON.stringify(tick)}`,
+      )
+      console.log(
+        `# startup: ${after.observer.length} observer ticks before the first GUI tick (elapsed ${tick.elapsed} ms); early sample: ${describeSample(early)}`,
+      )
+    } finally {
+      await session.stop()
+    }
+  },
+)
+
+test(
+  'a heartbeat file that cannot be opened is reported and never stops the app',
+  { skip: skipReason, timeout: 90_000 },
+  async () => {
+    // A silent failure here is indistinguishable from a frozen GUI thread, which
+    // is the one thing this channel exists to rule out. The path below is a
+    // directory, so the open fails for a reason that is not "not yet created".
+    const blocker = join(tmpdir(), `dsh-qt-heartbeat-blocked-${process.pid}-${Date.now()}`)
+    mkdirSync(blocker)
+    const session = launch({ polled: true, label: 'unopenable', heartbeatFile: blocker })
+    try {
+      await session.waitConnected()
+      const reply = await settleWithin(session.host.invoke('host.ping'), 6_000)
+      const answer = readPingAnswer(reply)
+      assert.ok(answer !== null, `the app did not answer a frame after the heartbeat path failed: ${JSON.stringify(reply)}`)
+      assert.equal(answer.state, 'connected', `the transport did not stay connected: ${JSON.stringify(reply)}`)
+      const stderr = session.stderr.join('')
+      assert.match(
+        stderr,
+        /heartbeat file .* could not be opened/,
+        `the heartbeat failure was silent on stderr: ${JSON.stringify(stderr)}`,
+      )
+      assert.equal(
+        session.child.exitCode,
+        null,
+        'a heartbeat path problem must never end the process',
+      )
+      console.log(`# unopenable heartbeat path: reported on stderr, app still connected`)
+    } finally {
+      await session.stop()
+      rmSync(blocker, { recursive: true, force: true })
+    }
+  },
+)
+
+test(
+  'the ping answer names the requests the Qt side still owes it',
+  { skip: skipReason, timeout: 90_000 },
+  async () => {
+    // Item B of the review: `pending` used to be read as "the GUI is alive". It
+    // is this process's outstanding Qt→Node request count. With the test hooks on,
+    // the book travels with the answer, so the two meanings cannot be confused.
+    const session = launch({ polled: true, testHooks: true, label: 'pending-book' })
+    try {
+      await session.waitConnected()
+      const reply = await settleWithin(session.host.invoke('host.ping'), 6_000)
+      const answer = readPingAnswer(reply)
+      assert.ok(answer !== null, `host.ping did not answer with the documented fields: ${JSON.stringify(reply)}`)
+      assert.ok(
+        answer.details !== null,
+        `the test hook did not expose the request book: ${JSON.stringify(reply)}`,
+      )
+      assert.equal(
+        answer.details.length,
+        answer.pending,
+        `the book holds ${answer.details.length} entries while the count says ${answer.pending}`,
+      )
+      for (const detail of answer.details) {
+        assert.ok(detail.id.length > 0, `a request book entry has no id: ${JSON.stringify(detail)}`)
+        assert.ok(
+          detail.method.length > 0,
+          `a request book entry has no method: ${JSON.stringify(detail)}`,
+        )
+        assert.ok(
+          !detail.method.startsWith('host.'),
+          `the Qt-side book contains a request this host issued: ${JSON.stringify(detail)}`,
+        )
+        assert.ok(detail.ageMs >= 0, `a request book entry has a negative age: ${JSON.stringify(detail)}`)
+      }
+      // The start-up requests do get answered; once they are, the book empties.
+      // That is the assertion the old test tried to make with a bare `pending: 0`
+      // in the middle of a blocked read.
+      const deadline = Date.now() + 5_000
+      let drained = session.sample()
+      let settledAnswer = answer
+      while (settledAnswer.pending > 0 && Date.now() < deadline) {
+        await delay(50)
+        const next = readPingAnswer(await settleWithin(session.host.invoke('host.ping'), 6_000))
+        if (next !== null) settledAnswer = next
+      }
+      drained = session.sample()
+      assert.equal(
+        settledAnswer.pending,
+        0,
+        `the request book never drained within 5 s: ${JSON.stringify(settledAnswer)}`,
+      )
+      assert.equal(
+        settledAnswer.details?.length ?? -1,
+        0,
+        `the drained book still lists entries: ${JSON.stringify(settledAnswer)}`,
+      )
+      console.log(
+        `# request book: ${answer.pending} outstanding at the handshake, 0 after settling; ${describeSample(drained)}`,
+      )
+    } finally {
+      await session.stop()
+    }
   },
 )
