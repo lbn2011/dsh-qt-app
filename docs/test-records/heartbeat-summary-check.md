@@ -69,6 +69,8 @@ flock -w 900 <shared-lock> systemd-run --scope -p CPUQuota=200% -p MemoryMax=4G 
 
 真实日志格式验证（不是合成件）：把 t124 实跑产出的 17 项心跳日志（含 `# stages silent: {...}`、`# park: ...` 与节点报告器摘要）交给抽取出的门禁脚本——exit 0；在其后追加一段摘要 → exit 1；把该日志的 `cancelled 0` 改成 `cancelled 1` → exit 1，报 `summary contradicts itself: tests 17, but pass 17 + fail 0 + cancelled 1 + skipped 0 = 18`。
 
+**证据口径更正（t132）**：上段的「真实日志」是**本机默认 Node（v26.13.1）的 spec 报告器**输出——`ℹ tests 17` 前缀、`# stages` 未转义。CI 装的不是这个组合：工作流用 Node 22.19，且管道 `| tee` 让报告器走 TAP，诊断行会转义成 `# \# stages ...`（见 §8.1）。因此上段只能证明「未转义的 spec 形日志」被正确判定，**不能**作为 CI 形态的证据；CI 形态的证据在 §8.2。
+
 合成日志的字段取值矩阵（当前门禁的判定）：
 
 | tests | pass | fail | cancelled | skipped | 退出 | 说明 |
@@ -104,3 +106,165 @@ flock -w 900 <shared-lock> systemd-run --scope -p CPUQuota=200% -p MemoryMax=4G 
 - `.github/workflows/test.yml`
 - `tests/gui-heartbeat-gate.test.ts`
 - `docs/test-records/heartbeat-summary-check.md`
+
+## 8. 第二轮修复（t132）：TAP 转义、CRLF、归档目录
+
+上一轮复核报告（团队私有复核材料，未随本仓库提交）在 §3 的门禁上找到四处问题。本节记录修复、证据与口径。
+
+### 8.1 F1（blocker）：TAP 转义让真实绿跑被判红
+
+CI 用 Node 22.19 执行 `node ... --test tests/gui-heartbeat.e2e.ts 2>&1 | tee gui-heartbeat.log`。stdout 是管道、不是 TTY，Node 的 TAP 报告器因此把诊断行的前导 `#` 再转义一次：
+
+```
+# \# stages silent: {"connectedMs":434,"firstTickMs":789,...}
+# \# park: 1200 ms parked, 0 GUI ticks inside the park, 24 observer ticks meanwhile
+```
+
+而门禁只认 `^# stages ` / `^# park: `，于是 `tests 17 / pass 17 / fail 0 / cancelled 0 / skipped 0` 的一次全绿运行被判红，报 `::error::gui-heartbeat.log carries no measured start-up stages`。
+
+修法：**在门禁内归一化**，而不是把工作流钉死到 `--test-reporter=spec`。钉死报告器会让门禁与报告器选择绑在一起，换报告器就得改门禁；归一化让门禁对两种拼写都成立，报告器仍可自由选择。
+
+```sh
+normalized=$(mktemp)
+trap 'rm -f "$normalized"' EXIT
+tr -d '\r' < "$log" | sed 's/^# \\# /# /' > "$normalized"
+```
+
+摘要解析、`# SKIP`、`^# stages `、`^# park: ` 四处检查全部改读 `$normalized`。
+
+踩坑：首版只把摘要解析指向归一化副本，两条 `grep` 仍读原日志，于是修复后依旧 exit 1。归一化是整段检查的前置，不是某一处的前置。
+
+### 8.2 F2（medium）：CRLF 日志被拒
+
+日志若经 Windows 落盘或搬运，每行尾带 `\r`，`awk` 拿到的 `$3` 是 `17\r`，任何数值比较都不成立——一次合法的绿跑被判红。修法即上面的 `tr -d '\r'`。
+
+### 8.3 F3（medium）：归档只判 exists，目录路径丢掉整份 summary
+
+`tests/gui-heartbeat.e2e.ts` 的 `archive()` 原先对每个通道只判 `exists` 就 `copyFileSync`。`unopenable` 用例的心跳路径本身是**目录**（存在的意义就是让 open 失败），于是 `copyFileSync` 抛 `EISDIR`，异常被最外层 catch 吞掉，`unopenable-summary.json` 根本没写——而这恰恰是最需要证据的一例。
+
+修法：
+
+1. 新增 `ChannelArchive` 记录 `path / exists / isFile / size / mtimeMs / readError / archived / copyError`；
+2. 先 `statSync(source).isFile()` 区分普通文件与目录/特殊文件，非普通文件记 `copyError = 'skipped: the heartbeat path is not a regular file'`，不尝试 copy；
+3. 目录创建是唯一的前置失败点（无目录无处写 summary），创建失败才提前返回；
+4. **summary 无论 copy 成败都写**，并把两个通道的归档记录写进 summary 的 `heartbeat` / `observerChannel` 字段；
+5. copy 失败在 stdout 打 `# archived <path> with no copy: <reason>`。
+
+`unopenable` 用例新增归档断言（仅当 `DSH_QT_HB_ARTIFACT_DIR` 非空时执行）：`unopenable-summary.json` 存在、`heartbeat.exists === true`、`isFile === false`、`archived === false`、`copyError` 匹配 `/not a regular file/`、`unopenable-hb.txt` 不存在。
+
+### 8.4 F4（low）：把本机 Node 26 spec 日志当 CI 证据
+
+已在 §4 就地标注更正：那份日志是本机 Node v26.13.1 的 spec 输出，不是 CI 的 Node 22.19 + TAP 形态；CI 形态证据见本节 §8.5。
+
+### 8.5 真实日志结果（Node 22.19 + tee）
+
+环境：本机 Node **v22.19.0**（独立下载的 Node 22.19 二进制，非系统默认版本），报告器为 Node 内置 **TAP**（未显式指定，管道导致默认转义），入口 `node_modules/tsx/dist/cli.mjs --test`，`QT_QPA_PLATFORM=offscreen`，二进制取 t131 构建产物。
+
+改前（`42591fb` 门禁 + 未改归档）：
+
+```
+# \# stages silent: {"connectedMs":434,"firstTickMs":789,"firstWindowMs":789,"firstTickElapsedMs":360,"observerBeforeFirstTick":1}
+# tests 17 / # pass 17 / # fail 0 / # cancelled 0 / # skipped 0
+PIPE_EXIT=0
+门禁（旧）→ exit 1：::error::gui-heartbeat.log carries no measured start-up stages
+日志内：# \# could not archive the samples: EISDIR: illegal operation on a directory, copyfile ...
+产物目录：有 20+ 个 *-hb.txt / *-observer.txt / *-summary.json，但没有 unopenable-*
+```
+
+改后（同一份改前日志喂给新门禁 `gate-fixed.sh`）：
+
+```
+新门禁 → exit 0
+旧门禁 → exit 1
+CRLF 化（121 行每行补 \r）后新门禁 → exit 0；旧门禁 → exit 1
+```
+
+改后重跑整套用例（本机 Node 22.19 + tee，`DSH_QT_HB_ARTIFACT_DIR` 指向隔离工作树内的 artifact 目录）：
+
+```
+# \# stages silent: {"connectedMs":305,"firstTickMs":558,"firstWindowMs":559,"firstTickElapsedMs":265,"observerBeforeFirstTick":1}
+# \# park: 1200 ms parked, 0 GUI ticks inside the park, 24 observer ticks meanwhile
+# \# archived <heartbeat path> with no copy: skipped: the heartbeat path is not a regular file
+# \# unopenable summary: exists=true isFile=false archived=false, copyError recorded
+# tests 17 / # pass 17 / # fail 0 / # cancelled 0 / # skipped 0
+PIPE_EXIT=0
+新门禁 → exit 0；旧门禁 → exit 1；该日志 CRLF 化后新门禁 → exit 0
+```
+
+`fixed-hb/unopenable-summary.json` 实际内容（节选）：
+
+```json
+"heartbeat": {
+  "exists": true, "isFile": false, "size": 40,
+  "readError": "EISDIR: EISDIR: illegal operation on a directory, read",
+  "archived": false,
+  "copyError": "skipped: the heartbeat path is not a regular file"
+},
+"observerChannel": { "exists": true, "isFile": true, "archived": true, "copyError": null }
+```
+
+即：目录型通道留下 exists/readError/copyError 三项记录，同例的普通文件通道照常归档，summary 本身没有丢。
+
+### 8.6 门禁自测（`tests/gui-heartbeat-gate.test.ts`）
+
+从 15 例扩到 23 例，新增：
+
+- **真实 TAP 输入**：用 `process.execPath --test --test-reporter=tap` 现场生成 TAP 日志（写临时 `.test.mjs` 夹具，打印两条证据行 + N 个通过用例），不用手写仿件。断言夹具确实含 `# \# stages `——若将来的 Node 不再转义，该用例会因为「证明不了什么」而失败，而不是静默变绿。
+- 真实 TAP 缺 stages / 缺 park / 带 cancelled 三例仍必须被拒。
+- **CRLF**：绿跑日志 CRLF 化后被接受；CRLF + cancelled 被拒；CRLF 缺 park 被拒。
+- 脚本常量检查改为子串：`tr -d '\r'` 与 `sed 's/^# \\# /# /'` 必须在步骤脚本里。
+
+踩坑：第一版用正则断言这两条常量，`sed` 的定界符与 TAP 转义自身的反斜杠要双重转义，写出的模式与被测文本并不等价，实测失败。改为 `includes` 子串后语义直白。
+
+踩坑：`spawnSync` 起子 Node 时若不清理环境，被测子进程会继承 `NODE_TEST_CONTEXT=child-v8`（在测试运行器子进程里存在），于是它按「报告器子进程」行事、stdout 被吞，夹具一份 TAP 都不产，用例以「没有转义」的形式失败。修法是在 `env` 里删除 `NODE_TEST_CONTEXT`（同时删 `NODE_OPTIONS`）。
+
+### 8.7 未验证 / 边界（本轮）
+
+- **Windows 与托管 runner 仍未实际跑过**：本轮全部证据来自本地 Linux（Node 22.19 二进制 + offscreen）。`windows-2022` 上 Git Bash 的 `tr` / `sed` / `awk` 行为、以及 CRLF 日志在 Windows 上的真实产生方式，均未实测。
+- **报告器版本边界**：结论基于 Node 22.19（TAP，管道下转义）与本机 Node 26.13.1（默认 spec，不转义；显式 `--test-reporter=tap` 时同样转义）。其他 Node 版本是否改变转义策略未测；门禁同时接受两种拼写，因此对该变化不敏感，但「未测」仍是事实。
+- **未制造真实的 `cancelled` 运行**：仍按字段语义构造输入。
+- `unopenable` 用例的归档断言只在 `DSH_QT_HB_ARTIFACT_DIR` 非空时执行；CI 里该变量由工作流注入，本地不设时该分支跳过（不产生 skip 计数，是条件块而非 skip）。
+- 未修改心跳产品代码（`native/main.cpp`）与用例的 17 项判定逻辑；未推送；未触碰 EAC。
+
+### 8.8 本轮变更路径
+
+- `.github/workflows/test.yml`
+- `tests/gui-heartbeat.e2e.ts`
+- `tests/gui-heartbeat-gate.test.ts`
+- `docs/test-records/heartbeat-summary-check.md`
+
+### 8.9 过程偏差记录（attempt 3 → attempt 4）
+
+本轮修复在 attempt 3 里已全部落地（代码提交 `3ef4d1c`，记录提交 `79331cc`），但当次提交 `completed` 时被 validator 拒绝，原因是当时的合同 inScope 未列出 `tests/gui-heartbeat-gate.test.ts`——而 Acceptance 1/2 要求新增的门禁用例（真实 TAP 输入、CRLF 绿/红）只能落在该文件；写进 `tests/gui-heartbeat.e2e.ts` 会改变该文件用例数，与该门禁强制的 `tests=17` 直接冲突。这属于合同自相矛盾，实现本身没有问题。
+
+**偏差**：当时选择先按 acceptance 完成实现与验证，再在提交 `completed` 时才发现 inScope 缺口，导致同一份工作占用两轮 attempt。正确顺序应是动手前先比对 inScope 与 acceptance 的落点文件，发现不一致立即上报 captain 改合同，而不是先改后报。
+
+合同随后修订（基线 `493121e`，inScope 含该四个文件），attempt 4 按修订后的合同重新取证，代码零改动。
+
+attempt 4 重跑结果（本机 Node v22.19.0，日志写入复核日志目录）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `pnpm exec tsx --test tests/gui-heartbeat-gate.test.ts` | exit 0，`# tests 23 / # pass 23 / # fail 0 / # cancelled 0 / # skipped 0`（复核日志 `verify-a4.log`） |
+| `git diff --check` | exit 0，无空白问题 |
+| 17 例心跳套件（`node node_modules/tsx/dist/cli.mjs --test` + tee） | `# tests 17 / # pass 17 / # fail 0 / # cancelled 0 / # skipped 0`，PIPE_EXIT=0（复核日志 `heartbeat-e2e-a4.log`） |
+| 新门禁对上述日志 | exit 0；旧门禁（`42591fb` 版本）exit 1 |
+| `unopenable-summary.json` | `heartbeat.isFile=false / archived=false / readError=EISDIR / copyError="skipped: the heartbeat path is not a regular file"`；`observerChannel.archived=true`；目录无 `unopenable-hb.txt` |
+
+### 8.10 版本核对口径（提交性质与可推送 SHA）
+
+本轮修复的提交按性质分两类，不应混为一谈：
+
+| 提交 | 性质 | 改动 |
+| --- | --- | --- |
+| `3ef4d1c` | **代码提交**，本轮唯一的代码改动 | `.github/workflows/test.yml`、`tests/gui-heartbeat.e2e.ts`、`tests/gui-heartbeat-gate.test.ts` |
+| `79331cc` | 仅记录 | §8.1–§8.8 |
+| `0a3fec51f5d7591c6d92a19daa9da5e8c2a055a1` | 仅记录 | §8.9 过程偏差记录 |
+
+**被审版本是 `0a3fec51f5d7591c6d92a19daa9da5e8c2a055a1`**，本轮绿色结论对应它的代码树；外部复核回执即针对该 SHA。上一版记录曾把「代码零改动的重跑 HEAD」写成 `79331cc`，那是把记录提交误当代码提交——代码提交只有 `3ef4d1c`。
+
+被测版本之后若继续修订本文件，只会产生**仅记录**的新提交，代码树不变。因此本文档刻意不写「最后一次记录提交」的 SHA 与「可推送 SHA」：写出哪一个都会随本次提交改变而立即过期，形成自引用。可推送候选的准确 SHA 由复核回执标记，回执与日志本体保存在团队私有目录，不随仓库提交。
+
+可推送候选分支从**已发布的 `094d520`** 起，按顺序重放 `42591fb`、`89d87dc`、`493121e` 与代码提交 `3ef4d1c`（重放后 SHA 会变：`1a7ad53`、`b00fe34`、`f08b796`，代码提交对应 `caa8588`，内容与被审版本逐字节相同），再以最终版记录作为一次提交。其最终树与被审版本 `0a3fec5` 的差异**只限本文件**（`git diff --stat 0a3fec5 <候选分支头>` 只列本文件，`git diff 0a3fec5 <候选分支头> -- .github tests` 为空）。这样公开历史的祖先链里不会出现带私有路径的记录提交。
+
+路径口径：本文档不记录隔离工作树、私有复核材料与内部构建缓存的位置，统一用「本机 Node 22.19」「隔离工作树 artifact 目录」「复核日志目录」等中性描述，日志里的临时心跳路径以 `<heartbeat path>` 占位。
